@@ -41,26 +41,36 @@ impl Default for Config {
 pub struct TestConfig {
     pub enable_write: bool,
     pub write_worker_num: usize,
-    pub segment_duration: ReadableDuration,
     pub write_interval: ReadableDuration,
 }
 
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
-            enable_write: true,
+            enable_write: false,
             write_worker_num: 1,
-            segment_duration: ReadableDuration::hours(12),
             write_interval: ReadableDuration::millis(500),
         }
     }
 }
 
-#[derive(Default, Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricEngineConfig {
+    /// Duration of one segment, data is managed and expired by segments.
+    pub segment_duration: ReadableDuration,
     pub threads: ThreadConfig,
     pub storage: StorageConfig,
+}
+
+impl Default for MetricEngineConfig {
+    fn default() -> Self {
+        Self {
+            segment_duration: ReadableDuration::hours(12),
+            threads: ThreadConfig::default(),
+            storage: StorageConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -79,7 +89,7 @@ impl Default for ThreadConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub object_store: ObjectStorageConfig,

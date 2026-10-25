@@ -17,8 +17,12 @@
 
 port = 5000
 
+[metric_engine]
+# Data is managed and expired by segments of this duration.
+segment_duration = "12h"
+
 [test]
-enable_write = true
+enable_write = false
 write_worker_num = 1
 write_interval = "500ms"
 

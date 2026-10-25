@@ -2475,8 +2475,11 @@ name = "metric_engine"
 version = "2.2.0-alpha"
 dependencies = [
  "anyhow",
+ "arrow",
  "columnar_storage",
  "common",
+ "futures",
+ "object_store",
  "seahash",
  "temp-dir",
  "test-log",
@@ -3404,14 +3407,16 @@ name = "server"
 version = "2.2.0-alpha"
 dependencies = [
  "actix-web",
- "arrow",
+ "bytes",
  "clap",
  "columnar_storage",
  "common",
- "futures",
+ "metric_engine",
  "object_store",
  "rand",
+ "remote_write",
  "serde",
+ "snap",
  "tokio",
  "toml",
  "tracing",

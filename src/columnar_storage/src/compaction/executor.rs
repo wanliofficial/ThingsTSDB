@@ -150,8 +150,8 @@ impl Executor {
         }
     }
 
-    // TODO: Merge input sst files into one new sst file
-    // and delete the expired sst files
+    // Merge input sst files into one new sst file and delete the expired sst
+    // files.
     pub async fn do_compaction(&self, task: &Task) -> Result<()> {
         self.pre_check(task)?;
         self.trigger_more_task();

@@ -27,13 +27,15 @@ description.workspace = true
 
 [dependencies]
 actix-web = "4"
-arrow = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 columnar_storage = { workspace = true }
 common = { workspace = true }
-futures = { workspace = true }
+metric_engine = { workspace = true }
 object_store = { workspace = true }
 rand = "0.8"
+remote_write = { workspace = true }
+snap = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

@@ -17,8 +17,16 @@
 
 //! Metric Engine entry point.
 
-mod metric;
-mod types;
+#![feature(duration_constructors)]
+
+pub mod data;
+pub mod engine;
+pub mod index;
+pub mod metric;
+pub mod types;
+
+pub use engine::{MetricEngine, MetricEngineRef};
+pub use types::{hash, Label, Sample};
 
 // Re-export error types.
 pub type AnyhowError = common::AnyhowError;

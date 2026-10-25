@@ -27,13 +27,16 @@ description.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+arrow = { workspace = true }
 columnar_storage = { workspace = true }
 common = { workspace = true }
+futures = { workspace = true }
 seahash = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+object_store = { workspace = true }
 temp-dir = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
