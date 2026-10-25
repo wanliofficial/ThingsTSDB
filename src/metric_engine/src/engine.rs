@@ -61,9 +61,9 @@ async fn open_table_storage(
 }
 
 pub struct MetricEngine {
-    metric: Arc<MetricManager>,
-    index: Arc<IndexManager>,
-    data: Arc<SampleManager>,
+    pub(crate) metric: Arc<MetricManager>,
+    pub(crate) index: Arc<IndexManager>,
+    pub(crate) data: Arc<SampleManager>,
 }
 
 impl MetricEngine {
@@ -74,6 +74,10 @@ impl MetricEngine {
         storage_opts: StorageConfig,
         runtimes: StorageRuntimes,
     ) -> Result<Self> {
+        // Metadata tables are not TTL-evicted: their rows use write-time
+        // timestamps and must survive data expiry.
+        let mut metadata_opts = storage_opts.clone();
+        metadata_opts.scheduler.ttl = None;
         let metric_storage: ColumnarStorageRef = Arc::new(
             open_table_storage(
                 format!("{root_path}/metrics"),
@@ -81,7 +85,7 @@ impl MetricEngine {
                 store.clone(),
                 crate::metric::schema(),
                 1,
-                storage_opts.clone(),
+                metadata_opts.clone(),
                 runtimes.clone(),
             )
             .await?,
@@ -93,7 +97,7 @@ impl MetricEngine {
                 store.clone(),
                 crate::index::series_schema(),
                 2,
-                storage_opts.clone(),
+                metadata_opts.clone(),
                 runtimes.clone(),
             )
             .await?,
@@ -105,7 +109,7 @@ impl MetricEngine {
                 store.clone(),
                 crate::index::index_schema(),
                 4,
-                storage_opts.clone(),
+                metadata_opts,
                 runtimes.clone(),
             )
             .await?,

@@ -91,7 +91,10 @@ impl Executor {
     }
 
     fn pre_check(&self, task: &Task) -> Result<()> {
-        assert!(!task.inputs.is_empty());
+        ensure!(
+            !task.inputs.is_empty() || !task.expireds.is_empty(),
+            "compaction task has no input and no expired file"
+        );
         for f in &task.inputs {
             assert!(f.is_compaction());
         }
@@ -151,12 +154,43 @@ impl Executor {
     }
 
     // Merge input sst files into one new sst file and delete the expired sst
-    // files.
+    // files. Tasks with no input files are pure expiration tasks.
     pub async fn do_compaction(&self, task: &Task) -> Result<()> {
         self.pre_check(task)?;
         self.trigger_more_task();
 
-        debug!(input_len = task.inputs.len(), "Start do compaction");
+        debug!(
+            input_len = task.inputs.len(),
+            expired_len = task.expireds.len(),
+            "Start do compaction"
+        );
+
+        let to_adds = if task.inputs.is_empty() {
+            Vec::new()
+        } else {
+            self.merge_inputs(task).await?
+        };
+        let to_deletes = task
+            .expireds
+            .iter()
+            .map(|f| f.id())
+            .chain(task.inputs.iter().map(|f| f.id()))
+            .collect::<Vec<_>>();
+        // First add new sst to manifest, then delete expired/old sst
+        self.inner
+            .manifest
+            .update(ManifestUpdate::new(to_adds, to_deletes.clone()))
+            .await?;
+
+        // From now on, no error should be returned!
+        // Because we have already updated manifest.
+        self.delete_ssts(to_deletes.into_iter());
+        Ok(())
+    }
+
+    /// Merge all input sst files into one new sst file, return it as the only
+    /// file to add.
+    async fn merge_inputs(&self, task: &Task) -> Result<Vec<SstFile>> {
         let mut time_range = task.inputs[0].meta().time_range.clone();
         for f in &task.inputs[1..] {
             time_range.merge(&f.meta().time_range);
@@ -202,23 +236,7 @@ impl Executor {
             time_range: time_range.clone(),
         };
         debug!(file_meta = ?file_meta, "Compact output new sst");
-        // First add new sst to manifest, then delete expired/old sst
-        let to_adds = vec![SstFile::new(file_id, file_meta)];
-        let to_deletes = task
-            .expireds
-            .iter()
-            .map(|f| f.id())
-            .chain(task.inputs.iter().map(|f| f.id()))
-            .collect::<Vec<_>>();
-        self.inner
-            .manifest
-            .update(ManifestUpdate::new(to_adds, to_deletes.clone()))
-            .await?;
-
-        // From now on, no error should be returned!
-        // Because we have already updated manifest.
-        self.delete_ssts(to_deletes.into_iter());
-        Ok(())
+        Ok(vec![SstFile::new(file_id, file_meta)])
     }
 
     fn delete_ssts<I>(&self, ids: I)

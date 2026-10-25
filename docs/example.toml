@@ -33,3 +33,8 @@ manifest_thread_num = 2
 [metric_engine.storage.object_store]
 type = "Local"
 data_dir = "/tmp/horaedb-storage"
+
+[metric_engine.storage.time_merge_storage.scheduler]
+# Sample data older than the ttl is evicted during compaction.
+# Metadata tables (metrics/series/index) are never ttl-evicted.
+# ttl = "720h"

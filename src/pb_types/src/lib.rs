@@ -19,9 +19,17 @@ mod pb_types {
     include!(concat!(env!("OUT_DIR"), "/pb_types.sst.rs"));
 }
 
-mod prost_remote_write {
-    include!(concat!(env!("OUT_DIR"), "/pb_types.remote_write.rs"));
+/// Prometheus remote write/read protocol types. Both files must be included
+/// under the same parent module so cross-file references like
+/// `super::remote_write::TimeSeries` resolve.
+pub mod prometheus {
+    pub mod remote_write {
+        include!(concat!(env!("OUT_DIR"), "/pb_types.remote_write.rs"));
+    }
+    pub mod remote_read {
+        include!(concat!(env!("OUT_DIR"), "/pb_types.remote_read.rs"));
+    }
 }
 
 pub use pb_types::*;
-pub use prost_remote_write::*;
+pub use prometheus::{remote_read::*, remote_write::*};

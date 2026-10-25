@@ -54,7 +54,8 @@ impl Picker {
     /// multiple threads(that's why it take a mutable self).
     pub async fn pick_candidate(&mut self) -> Option<Task> {
         let ssts = self.manifest.all_ssts().await;
-        let expire_time = self.ttl.map(|ttl| (now() - ttl.as_micros() as i64).into());
+        // `now()` and file time ranges are both in milliseconds.
+        let expire_time = self.ttl.map(|ttl| (now() - ttl.as_millis() as i64).into());
         self.strategy.pick_candidate(ssts, expire_time)
     }
 }
@@ -91,7 +92,12 @@ impl TimeWindowCompactionStrategy {
         trace!(uncompacted_files = ?uncompacted_files, expired_files = ?expired_files, "Begin pick candidate");
 
         let files_by_segment = self.files_by_segment(uncompacted_files);
-        let compaction_files = self.pick_compaction_files(files_by_segment)?;
+        // No segment may satisfy the compaction thresholds while there are
+        // still expired files to delete, so a missing compaction candidate
+        // must not abort the whole task generation.
+        let compaction_files = self
+            .pick_compaction_files(files_by_segment)
+            .unwrap_or_default();
 
         if compaction_files.is_empty() && expired_files.is_empty() {
             return None;

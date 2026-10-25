@@ -1,0 +1,73 @@
+// Copyright 2016 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// This file is modified from
+// https://github.com/prometheus/prometheus/blob/main/prompb/remote.proto
+
+syntax = "proto3";
+package pb_types.remote_read;
+
+import "remote_write.proto";
+
+message ReadRequest {
+  //_represents a list of selectore specified in the query.
+  repeated Query queries = 1;
+
+  enum ResponseType {
+    //Server will return a limited Snapshot from on-disk chunks conjoined with
+    //in-memory samples if required, and in order.
+    SAMPLES = 0;
+    //Server will return a stream of sorted chunk series.
+    STREAMED_XOR_CHUNKS = 1;
+  }
+  ResponseType response_type = 2;
+}
+
+message ReadResponse {
+  // In same order as the request's queries.
+  repeated QueryResult results = 1;
+}
+
+message Query {
+  int64 start_timestamp_ms = 1;
+  int64 end_timestamp_ms = 2;
+  repeated LabelMatcher matchers = 3;
+  ReadHints read_hints = 4;
+}
+
+message QueryResult {
+  // Same order as sent in the request's queries.
+  repeated pb_types.remote_write.TimeSeries timeseries = 1;
+}
+
+message LabelMatcher {
+  enum Type {
+    EQ  = 0;
+    NEQ = 1;
+    RE  = 2;
+    NRE = 3;
+  }
+  Type type = 1;
+  string name = 2;
+  string value = 3;
+}
+
+message ReadHints {
+  int64 step_ms = 1;
+  string func = 2;
+  int64 start_ms = 3;
+  int64 end_ms = 4;
+  repeated string grouping = 5;
+  bool by = 6;
+  int64 range_ms = 7;
+}

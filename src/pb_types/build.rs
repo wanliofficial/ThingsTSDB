@@ -19,7 +19,11 @@ use std::io::Result;
 
 fn main() -> Result<()> {
     prost_build::compile_protos(
-        &["protos/sst.proto", "protos/remote_write.proto"],
+        &[
+            "protos/sst.proto",
+            "protos/remote_write.proto",
+            "protos/remote_read.proto",
+        ],
         &["protos/"],
     )?;
     Ok(())

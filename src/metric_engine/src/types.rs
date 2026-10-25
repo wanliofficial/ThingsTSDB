@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::Result;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MetricId(pub u64);
 
@@ -84,6 +86,40 @@ fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
+fn take_bytes(buf: &mut &[u8]) -> anyhow::Result<Vec<u8>> {
+    if buf.len() < 4 {
+        anyhow::bail!("truncated series key: no length prefix");
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    *buf = &buf[4..];
+    if buf.len() < len {
+        anyhow::bail!(
+            "truncated series key: expect {len} bytes, {} left",
+            buf.len()
+        );
+    }
+    let bytes = buf[..len].to_vec();
+    *buf = &buf[len..];
+    Ok(bytes)
+}
+
+/// Decode the canonical series key back to metric name and labels, the
+/// counterpart of [`Sample::series_key`].
+pub fn decode_series_key(buf: &[u8]) -> Result<(Vec<u8>, Vec<Label>)> {
+    let mut cursor = buf;
+    let name = take_bytes(&mut cursor)?;
+    let mut labels = Vec::new();
+    while !cursor.is_empty() {
+        let label_name = take_bytes(&mut cursor)?;
+        let label_value = take_bytes(&mut cursor)?;
+        labels.push(Label {
+            name: label_name,
+            value: label_value,
+        });
+    }
+    Ok((name, labels))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +166,23 @@ mod tests {
         // Different metric names always mean different series.
         let s3 = sample("m2", vec![label("a", "bc")]);
         assert_ne!(s1.series_key(), s3.series_key());
+    }
+
+    #[test]
+    fn test_series_key_roundtrip() {
+        let s = sample(
+            "http_requests",
+            vec![label("job", "proxy"), label("code", "200")],
+        );
+        let (name, mut labels) = decode_series_key(&s.series_key()).unwrap();
+        assert_eq!(name, b"http_requests".to_vec());
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(labels[0].name, b"code".to_vec());
+        assert_eq!(labels[0].value, b"200".to_vec());
+        assert_eq!(labels[1].name, b"job".to_vec());
+        assert_eq!(labels[1].value, b"proxy".to_vec());
+
+        // Truncated keys must be rejected instead of panicking.
+        assert!(decode_series_key(&s.series_key()[..5]).is_err());
     }
 }

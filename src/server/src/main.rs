@@ -34,8 +34,14 @@ use actix_web::{
 use bytes::Bytes as BytesBuf;
 use clap::Parser;
 use common::now;
-use metric_engine::{types::Label, MetricEngine, MetricEngineRef, Sample};
+use metric_engine::{
+    types::Label, LabelMatcher, MatcherType, MetricEngine, MetricEngineRef, Sample, SearchRequest,
+};
 use object_store::local::LocalFileSystem;
+use pb_types::prometheus::remote_read::{
+    label_matcher::Type as PbMatcherType, Query as PbQuery, ReadRequest, ReadResponse,
+};
+use prost::Message;
 use remote_write::{pooled_parser::PooledParser, pooled_types::WriteRequest as RemoteWriteRequest};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -106,6 +112,196 @@ async fn prometheus_write(body: Bytes, data: web::Data<AppState>) -> impl Respon
             error!("write failed, err:{e}");
             HttpResponse::InternalServerError().body(format!("write failed: {e}"))
         }
+    }
+}
+
+/// Query endpoint for Prometheus remote read (v1): the body is a
+/// snappy-compressed protobuf `ReadRequest`, and so is the response.
+#[post("/api/v1/read")]
+async fn prometheus_read(body: Bytes, data: web::Data<AppState>) -> impl Responder {
+    let raw = match snap::raw::Decoder::new().decompress_vec(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return HttpResponse::BadRequest().body(format!("decompress failed: {e}"));
+        }
+    };
+    let request = match ReadRequest::decode(raw.as_ref()) {
+        Ok(v) => v,
+        Err(e) => {
+            return HttpResponse::BadRequest().body(format!("decode failed: {e}"));
+        }
+    };
+    if request.response_type
+        == pb_types::prometheus::remote_read::read_request::ResponseType::StreamedXorChunks as i32
+    {
+        return HttpResponse::NotImplemented().body("streamed xor chunks not supported");
+    }
+
+    let mut results = Vec::with_capacity(request.queries.len());
+    for query in &request.queries {
+        match run_read_query(&data.engine, query).await {
+            Ok(timeseries) => {
+                results.push(pb_types::prometheus::remote_read::QueryResult { timeseries })
+            }
+            Err(e) => {
+                return HttpResponse::BadRequest().body(format!("query failed: {e}"));
+            }
+        }
+    }
+    let response = ReadResponse { results };
+    let mut buf = Vec::with_capacity(response.encoded_len());
+    response.encode(&mut buf).expect("encode read response");
+    let compressed = match snap::raw::Encoder::new().compress_vec(&buf) {
+        Ok(v) => v,
+        Err(e) => {
+            return HttpResponse::InternalServerError().body(format!("compress failed: {e}"));
+        }
+    };
+    info!(num_queries = request.queries.len(), "Remote read handled");
+    HttpResponse::Ok()
+        .content_type("application/x-protobuf")
+        .insert_header(("Content-Encoding", "snappy"))
+        .body(compressed)
+}
+
+/// Run one remote read query: matchers are resolved to series, then samples
+/// within `[start_timestamp_ms, end_timestamp_ms]` (inclusive, Prometheus
+/// semantics) are returned.
+async fn run_read_query(
+    engine: &MetricEngineRef,
+    query: &PbQuery,
+) -> metric_engine::Result<Vec<pb_types::prometheus::remote_write::TimeSeries>> {
+    let mut metric_name: Option<String> = None;
+    let mut matchers = Vec::new();
+    for matcher in &query.matchers {
+        let matcher_type = match matcher.r#type() {
+            PbMatcherType::Eq => MatcherType::Eq,
+            PbMatcherType::Neq => MatcherType::Neq,
+            other => {
+                let msg = format!("matcher type {other:?} is not supported, only EQ/NEQ");
+                return Err(anyhow::anyhow!(msg).into());
+            }
+        };
+        if matcher.name == "__name__" {
+            if matcher_type != MatcherType::Eq {
+                return Err(anyhow::anyhow!("__name__ matcher must be EQ").into());
+            }
+            metric_name = Some(matcher.value.clone());
+        } else {
+            matchers.push(LabelMatcher {
+                matcher_type,
+                name: matcher.name.as_bytes().to_vec(),
+                value: matcher.value.as_bytes().to_vec(),
+            });
+        }
+    }
+    let metric_name = metric_name.ok_or_else(|| anyhow::anyhow!("__name__ matcher is required"))?;
+
+    let request = SearchRequest {
+        metric_name: metric_name.into_bytes(),
+        matchers,
+        // Prometheus range is inclusive on both ends, the engine takes
+        // a half-open range.
+        start_ms: query.start_timestamp_ms,
+        end_ms: query.end_timestamp_ms + 1,
+    };
+    let series = engine.search(&request).await?;
+    let timeseries = series
+        .into_iter()
+        .map(|s| pb_types::prometheus::remote_write::TimeSeries {
+            labels: series_labels(&s.metric_name, &s.labels),
+            samples: s
+                .samples
+                .into_iter()
+                .map(|p| pb_types::prometheus::remote_write::Sample {
+                    value: p.value,
+                    timestamp: p.timestamp,
+                })
+                .collect(),
+            exemplars: Vec::new(),
+        })
+        .collect();
+    Ok(timeseries)
+}
+
+/// Rebuild the label set of one series, with `__name__` first.
+fn series_labels(
+    metric_name: &[u8],
+    labels: &[Label],
+) -> Vec<pb_types::prometheus::remote_write::Label> {
+    let mut result = vec![pb_types::prometheus::remote_write::Label {
+        name: "__name__".to_string(),
+        value: String::from_utf8_lossy(metric_name).into_owned(),
+    }];
+    for label in labels {
+        result.push(pb_types::prometheus::remote_write::Label {
+            name: String::from_utf8_lossy(&label.name).into_owned(),
+            value: String::from_utf8_lossy(&label.value).into_owned(),
+        });
+    }
+    result
+}
+
+/// Human-friendly JSON query endpoint for debugging and ad-hoc checks, e.g.
+/// `/api/v1/query?metric=bench_cpu_usage&start=0&end=9999999999999&filter=job:
+/// api,code:200`.
+#[get("/api/v1/query")]
+async fn query_json(
+    data: web::Data<AppState>,
+    params: web::Query<std::collections::HashMap<String, String>>,
+) -> impl Responder {
+    let Some(metric) = params.get("metric") else {
+        return HttpResponse::BadRequest().body("metric is required");
+    };
+    let start: i64 = params
+        .get("start")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let end: i64 = params
+        .get("end")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(i64::MAX);
+    let matchers = params
+        .get("filter")
+        .map(|filter| {
+            filter
+                .split(',')
+                .filter_map(|pair| pair.split_once(':'))
+                .map(|(name, value)| LabelMatcher {
+                    matcher_type: MatcherType::Eq,
+                    name: name.as_bytes().to_vec(),
+                    value: value.as_bytes().to_vec(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let request = SearchRequest {
+        metric_name: metric.as_bytes().to_vec(),
+        matchers,
+        start_ms: start,
+        end_ms: end,
+    };
+    match data.engine.search(&request).await {
+        Ok(series) => {
+            let series_json: Vec<serde_json::Value> = series
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "metric": String::from_utf8_lossy(&s.metric_name),
+                        "labels": serde_json::Map::from_iter(s.labels.iter().map(|l| (
+                            String::from_utf8_lossy(&l.name).into_owned(),
+                            serde_json::Value::String(String::from_utf8_lossy(&l.value).into_owned()),
+                        ))),
+                        "samples": s.samples.iter().map(|p| (
+                            p.timestamp, p.value
+                        )).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
+        }
+        Err(e) => HttpResponse::InternalServerError().body(format!("query failed: {e}")),
     }
 }
 
@@ -228,6 +424,8 @@ pub fn main() {
                 .service(compact)
                 .service(toggle)
                 .service(prometheus_write)
+                .service(prometheus_read)
+                .service(query_json)
         })
         .workers(4)
         .bind(("127.0.0.1", port))

@@ -30,6 +30,7 @@ anyhow = { workspace = true }
 arrow = { workspace = true }
 columnar_storage = { workspace = true }
 common = { workspace = true }
+datafusion = { workspace = true }
 futures = { workspace = true }
 seahash = { workspace = true }
 thiserror = { workspace = true }

@@ -23,9 +23,11 @@ pub mod data;
 pub mod engine;
 pub mod index;
 pub mod metric;
+pub mod query;
 pub mod types;
 
 pub use engine::{MetricEngine, MetricEngineRef};
+pub use query::{LabelMatcher, MatcherType, SamplePoint, SearchRequest, SeriesSamples};
 pub use types::{hash, Label, Sample};
 
 // Re-export error types.
