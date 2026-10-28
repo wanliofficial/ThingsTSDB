@@ -22,36 +22,26 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     self,
-    common::DFSchema,
-    execution::{context::ExecutionProps, SendableRecordBatchStream},
+    execution::SendableRecordBatchStream,
     logical_expr::Expr,
-    physical_expr::LexOrdering,
-    physical_plan::{
-        execute_stream, memory::MemoryExec, sorts::sort::SortExec, union::UnionExec,
-        EmptyRecordBatchStream,
-    },
-    physical_planner::create_physical_sort_exprs,
-    prelude::{ident, SessionContext},
+    physical_plan::{execute_stream, union::UnionExec, EmptyRecordBatchStream},
+    prelude::SessionContext,
 };
-use futures::StreamExt;
 use itertools::Itertools;
-use object_store::path::Path;
 use parquet::{
-    arrow::{async_writer::ParquetObjectWriter, AsyncArrowWriter},
-    file::properties::WriterProperties,
-    format::SortingColumn,
-    schema::types::ColumnPath,
+    file::properties::WriterProperties, format::SortingColumn, schema::types::ColumnPath,
 };
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::mpsc};
 
 use crate::{
+    buffer::{spawn_flush_loop, FlushState},
     compaction::CompactionScheduler,
     config::{StorageConfig, WriteConfig},
-    ensure,
     manifest::{Manifest, ManifestRef},
     read::ParquetReader,
-    sst::{FileMeta, SstFile, SstPathGenerator},
-    types::{ObjectStoreRef, StorageSchema, TimeRange, WriteResult, SEQ_COLUMN_NAME},
+    sst::SstPathGenerator,
+    types::{ObjectStoreRef, StorageSchema, TimeRange},
+    wal::Wal,
     Result,
 };
 
@@ -86,7 +76,7 @@ pub trait ColumnarStorage {
     async fn compact(&self, req: CompactRequest) -> Result<()>;
 }
 
-pub type ColumnarStorageRef = Arc<(dyn ColumnarStorage + Send + Sync)>;
+pub type ColumnarStorageRef = Arc<dyn ColumnarStorage + Send + Sync>;
 
 #[derive(Clone)]
 pub struct StorageRuntimes {
@@ -121,6 +111,8 @@ pub struct ObjectBasedStorage {
     write_props: WriterProperties,
     sst_path_gen: Arc<SstPathGenerator>,
     compact_scheduler: CompactionScheduler,
+    flush_state: Arc<FlushState>,
+    flush_tx: mpsc::Sender<()>,
 }
 
 /// It will organize the data in the following way:
@@ -172,6 +164,34 @@ impl ObjectBasedStorage {
             storage_opts.scheduler,
             write_props.clone(),
         );
+
+        let wal = if storage_opts.wal.enabled {
+            Some(Wal::new(&path, &storage_opts.wal)?)
+        } else {
+            None
+        };
+        let flush_state = Arc::new(FlushState::new(
+            schema.clone(),
+            store.clone(),
+            write_props.clone(),
+            sst_path_gen.clone(),
+            manifest.clone(),
+            segment_duration,
+            &storage_opts.buffer,
+            wal,
+        ));
+        flush_state.recover_from_wal().await?;
+        let (flush_tx, flush_rx) = mpsc::channel(1);
+        if !flush_state.buffer_is_empty() {
+            let _ = flush_tx.try_send(());
+        }
+        spawn_flush_loop(
+            runtimes.sst_compact_runtime.clone(),
+            &flush_state,
+            flush_rx,
+            storage_opts.buffer.flush_interval.0,
+        );
+
         Ok(Self {
             path,
             schema,
@@ -183,76 +203,9 @@ impl ObjectBasedStorage {
             write_props,
             sst_path_gen,
             compact_scheduler,
+            flush_state,
+            flush_tx,
         })
-    }
-
-    async fn write_batch(&self, batch: RecordBatch) -> Result<WriteResult> {
-        let file_id = SstFile::allocate_id();
-        let file_path = self.sst_path_gen.generate(file_id);
-        let file_path = Path::from(file_path);
-        let object_store_writer = ParquetObjectWriter::new(self.store.clone(), file_path.clone());
-        let mut writer = AsyncArrowWriter::try_new(
-            object_store_writer,
-            self.schema().clone(),
-            Some(self.write_props.clone()),
-        )
-        .context("create arrow writer")?;
-
-        // sort record batch
-        let mut batches = self.sort_batch(batch).await?;
-        while let Some(batch) = batches.next().await {
-            let batch = batch.context("get sorted batch")?;
-            // Since file_id is increasing order, we can use it as sequence.
-            let sequence = file_id;
-            let batch_with_seq = self.schema.fill_builtin_columns(batch, sequence)?;
-            writer
-                .write(&batch_with_seq)
-                .await
-                .context("write arrow batch")?;
-        }
-        writer.close().await.context("close arrow writer")?;
-        let object_meta = self
-            .store
-            .head(&file_path)
-            .await
-            .context("get object meta")?;
-
-        Ok(WriteResult {
-            id: file_id,
-            seq: file_id,
-            size: object_meta.size,
-        })
-    }
-
-    fn build_sort_exprs(&self, df_schema: &DFSchema, sort_seq: bool) -> Result<LexOrdering> {
-        let mut sort_exprs = (0..self.schema.num_primary_keys)
-            .map(|i| {
-                ident(self.schema().field(i).name())
-                    .sort(true /* asc */, true /* nulls_first */)
-            })
-            .collect::<Vec<_>>();
-        if sort_seq {
-            sort_exprs.push(ident(SEQ_COLUMN_NAME).sort(true, true));
-        }
-        let sort_exprs =
-            create_physical_sort_exprs(&sort_exprs, df_schema, &ExecutionProps::default())
-                .context("create physical sort exprs")?;
-
-        Ok(sort_exprs)
-    }
-
-    async fn sort_batch(&self, batch: RecordBatch) -> Result<SendableRecordBatchStream> {
-        let ctx = SessionContext::default();
-        let schema = batch.schema();
-        let df_schema = DFSchema::try_from(self.schema().clone()).context("build DFSchema")?;
-        let sort_exprs = self.build_sort_exprs(&df_schema, false /* sort_seq */)?;
-        let batch_plan =
-            MemoryExec::try_new(&[vec![batch]], schema, None).context("build batch plan")?;
-        let physical_plan = Arc::new(SortExec::new(sort_exprs, Arc::new(batch_plan)));
-
-        let res =
-            execute_stream(physical_plan, ctx.task_ctx()).context("execute sort physical plan")?;
-        Ok(res)
     }
 
     fn build_write_props(write_options: WriteConfig, num_primary_key: usize) -> WriterProperties {
@@ -305,34 +258,18 @@ impl ColumnarStorage for ObjectBasedStorage {
     }
 
     async fn write(&self, req: WriteRequest) -> Result<()> {
-        if req.enable_check {
-            let segment_duration = self.segment_duration.as_millis() as i64;
-            ensure!(
-                req.time_range.start.0 / segment_duration
-                    == (req.time_range.end.0 - 1) / segment_duration,
-                "time range can't cross segment, value:{:?}",
-                &req.time_range
-            );
+        let trigger = self.flush_state.write(req).await?;
+        if trigger {
+            // A full channel means a flush is already pending, so the newest
+            // write is still covered by it.
+            let _ = self.flush_tx.try_send(());
         }
-
-        let num_rows = req.batch.num_rows();
-        let WriteResult {
-            id: file_id,
-            seq,
-            size: file_size,
-        } = self.write_batch(req.batch).await?;
-        let file_meta = FileMeta {
-            max_sequence: seq,
-            num_rows: num_rows as u32,
-            size: file_size as u32,
-            time_range: req.time_range,
-        };
-        self.manifest.add_file(file_id, file_meta).await?;
-
         Ok(())
     }
 
     async fn scan(&self, mut req: ScanRequest) -> Result<SendableRecordBatchStream> {
+        // Flush buffered writes so scans can see them.
+        self.flush_state.flush().await?;
         let total_ssts = self.manifest.find_ssts(&req.range).await;
         if total_ssts.is_empty() {
             return Ok(Box::pin(EmptyRecordBatchStream::new(
@@ -370,6 +307,7 @@ impl ColumnarStorage for ObjectBasedStorage {
     }
 
     async fn compact(&self, _req: CompactRequest) -> Result<()> {
+        self.flush_state.flush().await?;
         self.compact_scheduler.trigger_compaction()
     }
 }
@@ -377,6 +315,7 @@ impl ColumnarStorage for ObjectBasedStorage {
 #[cfg(test)]
 mod tests {
     use datafusion::logical_expr::{col, lit};
+    use futures::StreamExt;
     use object_store::local::LocalFileSystem;
     use test_log::test;
 
@@ -490,6 +429,147 @@ mod tests {
         });
     }
 
+    fn config_without_periodic_flush() -> StorageConfig {
+        let mut config = StorageConfig::default();
+        config.buffer.flush_interval = common::ReadableDuration::hours(1);
+        config
+    }
+
+    /// Merge stream output may be split into arbitrary batches, so compare the
+    /// concatenation of all rows.
+    async fn collect_batch(mut stream: SendableRecordBatchStream) -> RecordBatch {
+        let schema = stream.schema();
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.unwrap());
+        }
+        arrow::compute::concat_batches(&schema, &batches).unwrap()
+    }
+
+    #[test(test)]
+    fn test_storage_flush_into_single_sst() {
+        let schema = arrow_schema!(("pk", UInt8), ("value", Int64));
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let runtimes = build_runtimes();
+        runtimes.sst_compact_runtime.clone().block_on(async move {
+            let storage = ObjectBasedStorage::try_new(
+                root_dir.path().to_string_lossy().to_string(),
+                Duration::from_hours(2),
+                store,
+                schema.clone(),
+                1,
+                config_without_periodic_flush(),
+                runtimes,
+            )
+            .await
+            .unwrap();
+
+            // Writes sharing a primary key are buffered, and the last one wins.
+            for (i, value) in [10, 20, 30].into_iter().enumerate() {
+                let batch = record_batch!(
+                    ("pk", UInt8, vec![1, 2]),
+                    ("value", Int64, vec![value, value + 1])
+                )
+                .unwrap();
+                storage
+                    .write(WriteRequest {
+                        batch,
+                        time_range: ((i as i64 * 10)..(i as i64 * 10 + 10)).into(),
+                        enable_check: true,
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert!(storage.manifest.all_ssts().await.is_empty());
+
+            let result_stream = storage
+                .scan(ScanRequest {
+                    range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                    predicate: vec![],
+                    projections: None,
+                })
+                .await
+                .unwrap();
+            let actual = collect_batch(result_stream).await;
+            let expected =
+                record_batch!(("pk", UInt8, vec![1, 2]), ("value", Int64, vec![30, 31])).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(storage.manifest.all_ssts().await.len(), 1);
+        });
+    }
+
+    #[test(test)]
+    fn test_storage_wal_recovery() {
+        let schema = arrow_schema!(("pk", UInt8), ("value", Int64));
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let path = root_dir.path().to_string_lossy().to_string();
+        let rt = Arc::new(Runtime::new().unwrap());
+        let config = config_without_periodic_flush();
+
+        // Write without flushing and drop the storage, as if the process
+        // crashed before the buffer was persisted.
+        {
+            let config = config.clone();
+            let path = path.clone();
+            let schema = schema.clone();
+            let runtimes = StorageRuntimes::new(rt.clone(), rt.clone());
+            rt.block_on(async move {
+                let storage = ObjectBasedStorage::try_new(
+                    path,
+                    Duration::from_hours(2),
+                    Arc::new(LocalFileSystem::new()),
+                    schema,
+                    1,
+                    config,
+                    runtimes,
+                )
+                .await
+                .unwrap();
+                let batch =
+                    record_batch!(("pk", UInt8, vec![1, 2]), ("value", Int64, vec![10, 20]))
+                        .unwrap();
+                storage
+                    .write(WriteRequest {
+                        batch,
+                        time_range: (0..10).into(),
+                        enable_check: true,
+                    })
+                    .await
+                    .unwrap();
+            });
+        }
+
+        // Reopening the storage replays the WAL, so the write survives.
+        let runtimes = StorageRuntimes::new(rt.clone(), rt.clone());
+        rt.block_on(async move {
+            let storage = ObjectBasedStorage::try_new(
+                path,
+                Duration::from_hours(2),
+                Arc::new(LocalFileSystem::new()),
+                schema,
+                1,
+                config,
+                runtimes,
+            )
+            .await
+            .unwrap();
+            let result_stream = storage
+                .scan(ScanRequest {
+                    range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                    predicate: vec![],
+                    projections: None,
+                })
+                .await
+                .unwrap();
+            let actual = collect_batch(result_stream).await;
+            let expected =
+                record_batch!(("pk", UInt8, vec![1, 2]), ("value", Int64, vec![10, 20])).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(storage.manifest.all_ssts().await.len(), 1);
+        });
+    }
+
     #[test]
     fn test_storage_sort_batch() {
         let schema = arrow_schema!(("a", UInt8), ("b", UInt8), ("c", UInt8), ("c", UInt8));
@@ -516,7 +596,9 @@ mod tests {
             )
             .unwrap();
 
-            let mut sorted_batches = storage.sort_batch(batch).await.unwrap();
+            let mut sorted_batches = crate::buffer::sort_batch(&storage.schema, batch, false)
+                .await
+                .unwrap();
             let expected_bacth = record_batch!(
                 ("a", UInt8, vec![1, 2, 3, 4, 5, 6, 7, 8]),
                 ("b", UInt8, vec![3, 1, 4, 8, 5, 6, 7, 2]),

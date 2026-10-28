@@ -154,12 +154,61 @@ impl Default for ManifestConfig {
     }
 }
 
+/// Write buffer configuration. Writes are accumulated in memory and flushed
+/// into one SST file once a threshold is reached, instead of producing one SST
+/// per write request.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BufferConfig {
+    /// Maximum buffered rows before flushing.
+    pub max_rows: usize,
+    /// Maximum buffered bytes before flushing.
+    pub max_bytes: ReadableSize,
+    /// Maximum interval between periodic flushes.
+    pub flush_interval: ReadableDuration,
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: 100_000,
+            max_bytes: ReadableSize::mb(64),
+            flush_interval: ReadableDuration::secs(1),
+        }
+    }
+}
+
+/// Write-ahead log configuration, used to recover buffered writes after a
+/// crash.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WalConfig {
+    pub enabled: bool,
+    /// Whether to fsync the WAL on every write. Disabling it trades power-loss
+    /// durability for write throughput; process crashes are still recoverable.
+    pub sync_on_write: bool,
+    /// WAL directory, defaults to `{table_path}/wal`.
+    pub dir: Option<String>,
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sync_on_write: true,
+            dir: None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub write: WriteConfig,
     pub manifest: ManifestConfig,
     pub scheduler: SchedulerConfig,
+    pub buffer: BufferConfig,
+    pub wal: WalConfig,
     pub update_mode: UpdateMode,
 }
 

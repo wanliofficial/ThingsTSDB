@@ -331,9 +331,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use columnar_storage::{
-        config::StorageConfig,
-        storage::{ObjectBasedStorage, StorageRuntimes},
-        types::ObjectStoreRef,
+        config::StorageConfig, storage::StorageRuntimes, types::ObjectStoreRef,
     };
     use object_store::local::LocalFileSystem;
 

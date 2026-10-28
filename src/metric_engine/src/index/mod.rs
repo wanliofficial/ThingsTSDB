@@ -227,9 +227,9 @@ impl IndexManager {
                     Arc::new(BinaryArray::from_iter_values(tag_keys)),
                     Arc::new(BinaryArray::from_iter_values(tag_values)),
                     Arc::new(UInt64Array::from_iter_values(tsids)),
-                    Arc::new(Int64Array::from_iter_values(
-                        std::iter::repeat(now).take(num_rows),
-                    )),
+                    Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(
+                        now, num_rows,
+                    ))),
                 ],
             )
             .context("build index record batch")?;
@@ -277,7 +277,7 @@ mod tests {
         // Only verify the id allocation logic here, storage interactions are
         // covered by engine tests.
         let known: std::sync::Mutex<HashSet<u64>> = std::sync::Mutex::new(HashSet::new());
-        let mut samples = vec![
+        let mut samples = [
             sample("http_requests", "200", "proxy"),
             sample("http_requests", "200", "proxy"),
             sample("http_requests", "404", "proxy"),

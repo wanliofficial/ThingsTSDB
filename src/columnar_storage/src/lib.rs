@@ -17,6 +17,7 @@
 
 //! Storage Engine for metrics.
 
+mod buffer;
 mod compaction;
 pub mod config;
 mod macros;
@@ -28,6 +29,7 @@ pub mod storage;
 #[cfg(test)]
 mod test_util;
 pub mod types;
+mod wal;
 
 // Re-export error types.
 pub type AnyhowError = common::AnyhowError;

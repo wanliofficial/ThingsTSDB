@@ -278,7 +278,7 @@ impl TryFrom<Bytes> for Snapshot {
         let record_total_length = header.length as usize;
         ensure!(
             record_total_length > 0
-                && record_total_length % SnapshotRecord::LENGTH == 0
+                && record_total_length.is_multiple_of(SnapshotRecord::LENGTH)
                 && record_total_length + SnapshotHeader::LENGTH == bytes_len,
             "create snapshot from bytes failed, header:{header:?}, bytes_length: {bytes_len}",
         );

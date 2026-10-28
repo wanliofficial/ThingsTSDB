@@ -38,3 +38,17 @@ data_dir = "/tmp/horaedb-storage"
 # Sample data older than the ttl is evicted during compaction.
 # Metadata tables (metrics/series/index) are never ttl-evicted.
 # ttl = "720h"
+
+[metric_engine.storage.time_merge_storage.buffer]
+# Writes are accumulated and flushed into one SST file once a threshold is
+# reached, periodically, or before a read.
+max_rows = 100000
+max_bytes = "64MiB"
+flush_interval = "1s"
+
+[metric_engine.storage.time_merge_storage.wal]
+# A write-ahead log under `{data_dir}/wal` recovers buffered writes after a
+# crash. Disable it to skip the extra write and fsync.
+enabled = true
+sync_on_write = true
+# dir = "/tmp/horaedb-storage/wal"

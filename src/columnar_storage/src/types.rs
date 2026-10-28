@@ -237,6 +237,31 @@ impl StorageSchema {
 
         Ok(new_batch)
     }
+
+    /// Same as [`Self::fill_builtin_columns`], but assigns consecutive
+    /// sequences starting from `start_seq`, so rows written later within one
+    /// buffered batch win during merge.
+    pub fn fill_builtin_columns_with_start_seq(
+        &self,
+        record_batch: RecordBatch,
+        start_seq: u64,
+    ) -> Result<RecordBatch> {
+        let num_rows = record_batch.num_rows();
+        if num_rows == 0 {
+            return Ok(record_batch);
+        }
+
+        let mut columns = record_batch.columns().to_vec();
+        let seq_array = UInt64Array::from_iter_values(start_seq..start_seq + num_rows as u64);
+        columns.push(Arc::new(seq_array));
+        let reserved_array = UInt64Array::new_null(num_rows);
+        columns.push(Arc::new(reserved_array));
+
+        let new_batch = RecordBatch::try_new(self.arrow_schema.clone(), columns)
+            .context("construct record batch with seq column")?;
+
+        Ok(new_batch)
+    }
 }
 #[cfg(test)]
 mod tests {

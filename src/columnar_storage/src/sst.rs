@@ -118,7 +118,14 @@ impl SstFile {
     }
 
     pub fn allocate_id() -> FileId {
-        NEXT_ID.fetch_add(1, Ordering::SeqCst)
+        Self::allocate_ids(1)
+    }
+
+    /// Allocate `num` consecutive ids and return the first one. Row sequences
+    /// and file ids are allocated from the same counter, so a later write
+    /// always wins over an earlier one during merge.
+    pub fn allocate_ids(num: u64) -> FileId {
+        NEXT_ID.fetch_add(num, Ordering::SeqCst)
     }
 }
 
