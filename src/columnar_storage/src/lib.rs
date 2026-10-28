@@ -17,7 +17,6 @@
 
 //! Storage Engine for metrics.
 
-#![feature(duration_constructors)]
 mod compaction;
 pub mod config;
 mod macros;

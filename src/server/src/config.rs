@@ -162,11 +162,11 @@ impl Default for HttpOptions {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TimeoutOptions {
-    // Non IO Operation like stat and delete, they operate on a single file, we control them by
-    // setting timeout.
+    // Non IO Operation like stat and delete, they operate on a single file, we
+    // control them by setting timeout.
     pub timeout: ReadableDuration,
-    // IO Operation like read and write, they operate on data directly, we control them by setting
-    // io_timeout.
+    // IO Operation like read and write, they operate on data directly, we
+    // control them by setting io_timeout.
     pub io_timeout: ReadableDuration,
 }
 

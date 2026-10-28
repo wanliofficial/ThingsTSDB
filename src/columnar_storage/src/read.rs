@@ -324,8 +324,8 @@ impl MergeStream {
             }
         }
 
-        // last batch may have overlapping rows with the next batch, so keep them in
-        // pending_batch
+        // last batch may have overlapping rows with the next batch, so keep
+        // them in pending_batch
         self.pending_batch = groupby_pk_batches.pop();
 
         for batch in groupby_pk_batches {
@@ -474,8 +474,8 @@ impl ParquetReader {
             }
         };
 
-        // TODO: fetch using multiple threads since read from parquet will incur CPU
-        // when convert between arrow and parquet.
+        // TODO: fetch using multiple threads since read from parquet will incur
+        // CPU when convert between arrow and parquet.
         let sort_exec =
             SortPreservingMergeExec::new(sort_exprs, base_plan).with_round_robin_repartition(true);
 

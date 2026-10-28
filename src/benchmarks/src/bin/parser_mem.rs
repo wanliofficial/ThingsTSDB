@@ -108,9 +108,9 @@ impl Reporter for TotalAllocReporter {
     fn report(&self, metrics: &dyn MetricsProvider<'_>) -> Result<(), Box<dyn std::error::Error>> {
         // In hotpath, each profiled function will output a row of [metrics](https://github.com/pawurb/hotpath/blob/main/hotpath-alloc-report.png):
         // [calls, avg, pXX, total, %total], we only care about the `total`
-        // metric to verify our zero-allocation optimization. Since each function's
-        // metrics include those of its nested calls, we need to use the
-        // maximum value of the `total` field across all functions as
+        // metric to verify our zero-allocation optimization. Since each
+        // function's metrics include those of its nested calls, we need to use
+        // the maximum value of the `total` field across all functions as
         // the total memory allocated during decoding.
         let mut max_total: u64 = 0;
         for values in metrics.metric_data().values() {

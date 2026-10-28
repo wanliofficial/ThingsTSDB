@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![feature(duration_constructors)]
 mod config;
 
 use std::{

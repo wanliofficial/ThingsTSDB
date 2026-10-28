@@ -53,8 +53,8 @@ impl EncodingBench {
 
     pub fn raw_bytes_bench(&mut self) {
         // mock do_merge procedure
-        // first decode snapshot and then append with delta sstfiles, serialize to bytes
-        // at last
+        // first decode snapshot and then append with delta sstfiles, serialize
+        // to bytes at last
         let mut snapshot = Snapshot::try_from(self.raw_bytes.clone()).unwrap();
         snapshot.add_records(self.to_append.clone());
         let _ = snapshot.into_bytes();

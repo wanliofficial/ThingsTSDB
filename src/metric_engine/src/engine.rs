@@ -251,7 +251,8 @@ mod tests {
         let root = temp_dir::TempDir::new().unwrap();
         let engine = open_engine(&root).await;
 
-        // m1: A = {code=200, job=api}, B = {code=404, job=api}; m2: C = {job=db}
+        // m1: A = {code=200, job=api}, B = {code=404, job=api}; m2: C =
+        // {job=db}
         engine
             .write(vec![
                 make_sample("m1", Some("200"), "api", 1, 1.0),

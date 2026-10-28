@@ -17,8 +17,6 @@
 
 //! Metric Engine entry point.
 
-#![feature(duration_constructors)]
-
 pub mod data;
 pub mod engine;
 pub mod index;

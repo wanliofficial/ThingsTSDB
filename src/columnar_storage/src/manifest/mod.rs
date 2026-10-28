@@ -205,7 +205,8 @@ impl ManifestMerger {
             store,
             sender: tx,
             receiver: RwLock::new(rx),
-            // Init this to 0, because we will merge all delta files when startup.
+            // Init this to 0, because we will merge all delta files when
+            // startup.
             deltas_num: AtomicUsize::new(0),
             merge_options,
         };
@@ -288,8 +289,8 @@ impl ManifestMerger {
 
         let mut snapshot = read_snapshot(&self.store, &self.snapshot_path).await?;
         trace!(sst_ids = ?snapshot.records.iter().map(|r| r.id()).collect_vec(), "Before snapshot merge deltas");
-        // Since the deltas is unsorted, so we have to first add all new files, then
-        // delete old files.
+        // Since the deltas is unsorted, so we have to first add all new files,
+        // then delete old files.
         let mut to_deletes = Vec::new();
         for res in results {
             let manifest_update = res.context("Failed to join read delta files task")??;
