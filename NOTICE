@@ -19,3 +19,16 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 
 ================================================================
+
+EsMetrics
+Copyright 2026 Softalink LLC
+
+This product includes a selective Rust port of the block encodings from
+EsMetrics (https://github.com/softalink/esmetrics), which is a Rust port of
+VictoriaMetrics v1.146.0 (https://github.com/VictoriaMetrics/VictoriaMetrics),
+Copyright 2019-2026 VictoriaMetrics, Inc., licensed under the Apache License,
+Version 2.0. The ported files live in `src/storage_kernel/src/tsf/codec/` and
+`src/storage_kernel/src/mergeset/inmemory_block.rs`; see
+`src/storage_kernel/PORTING.md`.
+
+================================================================

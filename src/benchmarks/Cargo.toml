@@ -37,11 +37,13 @@ unsafe-split = ["remote_write/unsafe-split"]
 
 [dependencies]
 anyhow = { workspace = true }
+arrow = { workspace = true }
 bytes = { workspace = true }
 columnar_storage = { workspace = true }
 common = { workspace = true }
 hotpath = { workspace = true }
 num_cpus = { workspace = true }
+parquet = { workspace = true }
 pb_types = { workspace = true }
 prost = { workspace = true }
 protobuf = "3.7"
@@ -49,6 +51,7 @@ quick-protobuf = "0.8"
 remote_write = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+storage_kernel = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }

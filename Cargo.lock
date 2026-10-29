@@ -612,12 +612,14 @@ name = "benchmarks"
 version = "2.2.0-alpha"
 dependencies = [
  "anyhow",
+ "arrow",
  "bytes",
  "columnar_storage",
  "common",
  "criterion",
  "hotpath",
  "num_cpus",
+ "parquet",
  "pb_types",
  "prost",
  "protobuf",
@@ -626,6 +628,7 @@ dependencies = [
  "remote_write",
  "serde",
  "serde_json",
+ "storage_kernel",
  "tokio",
  "toml",
  "tracing",
@@ -3574,6 +3577,13 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "storage_kernel"
+version = "2.2.0-alpha"
+dependencies = [
+ "zstd",
+]
 
 [[package]]
 name = "strsim"

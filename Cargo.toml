@@ -24,7 +24,8 @@ members = [
     "src/metric_engine",
     "src/pb_types",
     "src/remote_write",
-    "src/server"
+    "src/server",
+    "src/storage_kernel"
 ]
 
 [workspace.package]
@@ -65,6 +66,7 @@ pb_types = { path = "src/pb_types" }
 prost = { version = "0.13" }
 remote_write = { path = "src/remote_write" }
 seahash = { version = "4" }
+storage_kernel = { path = "src/storage_kernel" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 snap = "1.1"
@@ -76,6 +78,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = "1"
+zstd = "0.13"
 
 # This profile optimizes for good runtime performance.
 [profile.release]
