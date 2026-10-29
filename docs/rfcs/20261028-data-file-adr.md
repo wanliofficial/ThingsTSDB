@@ -947,6 +947,18 @@ Expose from T1/T2:
    because the query API is metric-scoped and the schema/null/semantics work is large; see
    Open Questions.
 
+7. **Per-table (per-metric) format override, selectable at creation.**
+   Keep both readers and writers and let each metric pick `ParquetV1` or `TsfV1`, with a
+   global default in config — the `CREATE TABLE ... ENGINE=` shape familiar from SQL
+   systems. The query path already supports it, because readers are chosen per file by
+   `FileMeta.format` and results merge through the same LWW plan. The costs are that the
+   Parquet path can never be removed, the test matrix doubles, and flush must route
+   samples into format-specific partition buckets since one day partition mixes metrics.
+   Deferred rather than rejected: revisit after T4 if reading the data with external
+   Parquet tooling is a requirement. The choice should be a `file_format` property on the
+   metric record, not a new "storage engine" abstraction, because both formats return the
+   same Arrow schema and differ only in physical layout, size and latency.
+
 # Open Questions
 
 - **Device alignment.** Should `tsf-v2` group series chunks by `(metric_id, job_id,
@@ -961,6 +973,13 @@ Expose from T1/T2:
 - **Page size and codec per workload.** IoT scrape intervals (15s/60s) and historical
   backfills may want different page rows and precision bits. The format supports it; the
   policy is open.
+- **Per-table format override.** Should a metric be able to pin `file_format`
+  independently of the global default (Alternative 7)? If yes, the choice is persisted in
+  the metrics metadata table, flush buckets samples by format, compaction never merges
+  across formats, and changing a metric's format becomes a rewrite. It also makes the
+  Parquet path permanent. Decide after T4 based on whether Parquet-ecosystem access
+  (DuckDB, Spark, `parquet-tools`) is a real requirement rather than an internal
+  performance preference.
 - **Object-store-native layout.** Whether a future version splits a part into footer +
   per-series objects for finer ranged reads, or keeps one object and relies on caching.
 - **Compaction cadence and dedup interval.** Daily close compaction is assumed; whether
