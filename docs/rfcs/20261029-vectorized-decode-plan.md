@@ -1,0 +1,271 @@
+# Phase 2 Vectorized Decode Implementation Plan
+
+- Status: Proposed
+- Date: 2026-10-29
+- Related: ADR-0002 (`20261028-data-file-adr.md`), Phase 0 benchmark
+  (`20261028-phase0-benchmark.md`), `docs/roadmap.md`
+- Code: `src/storage_kernel/src/tsf/`, `src/columnar_storage/src/tsf/` (to be added)
+
+# 1. Purpose
+
+The Phase 0 prototype decodes TSF pages correctly but 4-7x slower than Arrow/Parquet
+on full scans (4.4-5.1 M rows/s vs 19.4-35.4 M rows/s). Selective queries already win
+by 28-41x thanks to page pruning, so decode work must not regress that path.
+
+This plan turns "vectorize decoding" into an executable sequence. It covers buffer
+reuse, column projection, index caching, zero-copy Arrow emission, hardware CRC,
+SIMD kernels and parallel page decoding, in that order of risk and expected payoff.
+The data file format stays frozen; no codec id or layout changes are made.
+
+# 2. Verified current state
+
+Confirmed against the prototype before writing this plan:
+
+| Observation | Location |
+|---|---|
+| ZSTD contexts are already thread-local and reused | `tsf/codec/compress.rs:14-18`, `:49-90` |
+| A page decode allocates **seven** `Vec`s: four typed columns plus `values`, `sequences` and `reserved` conversions | `tsf/page.rs:235-245`, `:270-296` |
+| The nearest-delta scratch buffer is zero-filled on every page | `tsf/codec/mod.rs:43-53` |
+| All four columns are decoded even when the query needs only timestamp and value | `tsf/page.rs:221-238` |
+| Every scan validates page CRC in software (slicing-by-8) | `tsf/page.rs:207-213`, `tsf/checksum.rs:69-87` |
+| Rows are filtered one by one into `Vec<Row>` (48 bytes each) | `tsf/file.rs:694-714` |
+| Series index and page index are decompressed on every read, with no cache | `tsf/file.rs:452-530`, `:650-673` |
+| `TsfReader` loads the whole file with `std::fs::read` | `tsf/file.rs:353-358` |
+| Nearest-delta tail decode is a serial prefix sum | `tsf/codec/nearest_delta.rs:86-91` |
+| Timestamps in both benchmark shapes use `DeltaConst`; only values need the delta path | Phase 0 workload, 15 s interval |
+| No Arrow/DataFusion dependency; ADR-0002 §11 requires this boundary | `storage_kernel/Cargo.toml`, ADR-0002 §11 |
+| Uncompressed page flag is written never and rejected by the reader | `tsf/page.rs:219-222` |
+
+# 3. Corrections to earlier assumptions
+
+1. **Allocation count.** Earlier estimates said four `Vec`s per page. It is seven,
+   plus a scratch zero-fill. The plan targets the actual allocations.
+2. **Arrow boundary.** Arrow emission must not land in `storage_kernel`. ADR-0002 §11
+   keeps that crate Arrow-free; `columnar_storage::tsf::scan` owns Arrow conversion.
+   `storage_kernel` exposes typed column buffers; Arrow wraps them without copying.
+3. **Benchmark IO fairness.** The Phase 0 TSF scan is timed after the whole file has
+   been read into memory, while the Parquet scan includes file IO. That biases the
+   comparison in TSF's favour, not against it. Milestone 2 must re-benchmark through
+   `pread` plus page cache on both sides.
+4. **CRC crate availability.** ADR-0002 lists `crc32c` as a Phase 2 dependency, but it
+   was not available in the local registry. Use the crate when vendorable; otherwise
+   call the SSE4.2 `_mm_crc32_u64` intrinsic with runtime detection and keep the
+   software implementation as a portable fallback.
+
+# 4. Design
+
+## 4.1 Decode buffers and column projection
+
+`storage_kernel` gains a caller-owned decode context; the reader stays immutable and
+`Sync`.
+
+```rust
+bitflags-like ColumnMask: u8   // 1 = ts, 2 = value, 4 = seq, 8 = reserved
+pub struct PageBuffers {       // reused across pages
+    pub row_count: usize,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,          // or Vec<u64> bits, converted at emission
+    sequences: Vec<u64>,
+    reserved: Vec<u64>,
+}
+pub fn decode_page_into(
+    page: &[u8],
+    mask: ColumnMask,
+    out: &mut PageBuffers,
+) -> Result<(), String>;
+```
+
+- `decode_page` remains as a thin wrapper for tests and compaction; it stays the
+  scalar reference oracle.
+- Unselected columns are bounds-checked but not decoded. CRC still covers all
+  payloads, so corruption detection is unchanged.
+- Buffers are cleared, not freed. The nearest-delta scratch is reused without
+  zero-filling when capacity suffices.
+- `values` is stored as `Vec<f64>`; converting in place from `i64` bits is allowed
+  only inside the decode kernel and is covered by the differential tests.
+- Working set per worker is under 1 MiB for 8,192-row pages (4 x 8,192 x 8 B plus
+  scratch).
+
+Projection policy: scans project timestamp and value by default; compaction,
+migration and `__seq__`-filtered reads use `ColumnMask::ALL`. Committed TSF files are
+already LWW-resolved at write time, so queries do not need `__seq__`.
+
+## 4.2 Read API and filtering
+
+Replace `Vec<Row>` on the scan path with page-slice results:
+
+```rust
+pub struct DecodedColumns {
+    pub metric_id: u64,
+    pub series_id: u64,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f64>,
+    pub sequences: Vec<u64>,   // empty unless requested
+    pub reserved: Vec<u64>,    // empty unless requested
+    pub mask: ColumnMask,
+}
+pub fn read_series_columns(
+    &self,
+    metric_id: u64,
+    series_id: u64,
+    range: TimeRange,
+    columns: ColumnMask,
+    ctx: &mut ReadContext,     // buffers + index cache
+) -> Result<DecodedColumns, String>;
+```
+
+- Timestamps in a page are non-decreasing, so a time range maps to a contiguous
+  slice via `partition_point`; boundary pages are sliced, not filtered row by row.
+- Sequence predicates are not assumed monotonic. Compaction reads keep the scalar
+  path until a sequence-range kernel is justified by a profile.
+- `Row` and `read_all` remain for tests, compaction and migration only.
+- Rows preserve order; duplicate timestamps and NaN values stay legal and are not
+  converted to Arrow nulls.
+
+## 4.3 Index cache
+
+`ReadContext` owns an LRU cache of decompressed series-index blocks (keyed by file
+identity and metric, since one sparse index covers many series) and page indexes
+(keyed by file identity, metric and series). Files are immutable, so
+entries never need invalidation; entry size and total bytes are bounded (initial
+default 16 MiB per worker, configurable).
+
+Hit-rate and reject counters are exposed for ADR-0002 §13 observability. The cache
+is per worker to avoid locks; the reader itself remains stateless.
+
+## 4.4 Arrow emission boundary
+
+`columnar_storage::tsf::scan` converts `DecodedColumns` into Arrow arrays without
+copying:
+
+- `ScalarBuffer::from(Vec<i64>)` / `ScalarBuffer::from(Vec<f64>)` for timestamp and
+  value columns;
+- `metric_id`/`series_id` columns filled per row (dictionary-encoded when a batch
+  mixes series);
+- Arrow `filter` for any non-contiguous predicate (for example sequence filters);
+- one `RecordBatch` per accumulated batch of about 8,192 rows, not per 200-row page.
+  A batch may span series; each `DecodedColumns` carries its identifiers so the
+  scan layer can fill the key columns.
+
+Buffer reuse ends at the Arrow boundary: a `PageBuffers` allocation is handed to
+Arrow or returned to a pool, never mutated while a batch still references it.
+
+## 4.5 CRC
+
+Keep per-page CRC validation (corruption is fatal per ADR-0002 §3.8). Move it off
+the critical path:
+
+1. prefer the `crc32c` crate (SIMD, hardware-backed);
+2. otherwise `_mm_crc32_u64` with `is_x86_feature_detected!("sse4.2")`;
+3. keep slicing-by-8 as the portable fallback;
+4. optionally overlap CRC with decompression/decode on separate workers.
+
+If profiling shows CRC below 5% of scan time, stop at the hardware dispatch and do
+not add overlap machinery.
+
+## 4.6 SIMD kernels
+
+Runtime-dispatched (`AVX2`, `SSE4.2`, scalar), unsafe confined to these kernels and
+fuzzed:
+
+- `Const` / `DeltaConst`: `fill` and constant-stride fill, no per-element branch;
+- nearest-delta / nearest-delta2: decode deltas into scratch, then a block-wise
+  two-pass prefix sum (lane-local sums, then lane offsets) so accumulation stops
+  being strictly serial;
+- plain varint: 4-way varint decode when the page falls back to codec 0;
+- timestamp and value paths share the same integer kernels.
+
+Precision bits are an encode-side choice; decode does not branch on them.
+
+## 4.7 Parallelism and batching
+
+- Decode runs on a dedicated pool (rayon or dedicated threads), never on tokio
+  workers, per `docs/3high-design.md`.
+- Work unit is a page; results are accumulated per series chunk and merged into
+  ~8,192-row Arrow batches to amortise emission.
+- Each worker owns a `ReadContext` (buffers plus cache); `TsfReader` needs no locks.
+- Ordering is preserved by assigning pages to ordered slots before emission.
+
+## 4.8 Format compliance: uncompressed pages
+
+ADR-0002 §3.5/§4.4 require the writer to store a payload uncompressed when ZSTD
+does not save at least 10%, with page flag bit 3, and the reader to honour it. The
+prototype does neither. This is a correctness/compliance fix, independent of
+performance work, and lands in T1 with round-trip and golden-byte tests. Existing
+files remain readable.
+
+# 5. Milestones and gates
+
+Milestones 0, 1, 3 and 4 belong to T1 (kernel work). Milestone 2 is the T2 Arrow
+boundary. Milestone 5 sits on the T2/T3 boundary.
+
+| # | Deliverable | Exit gate |
+|---|---|---|
+| 0 | Criterion page-decode benchmark plus `perf`/flamegraph harness; breakdown across ZSTD, codec, CRC, allocation, filtering and index decompression | At least 90% of scan time accounted for; baseline recorded; no behaviour change |
+| 1 | `decode_page_into` + `ColumnMask` + `PageBuffers`; contiguous time slicing; index cache; scratch reuse; `Row` removed from scans | Differential parity on at least 100k randomized pages in CI (1M nightly) across all codecs, NaN/all-NaN, duplicate timestamps and precision sweeps; full scan at least 1.5x faster; selective query latency not worse |
+| 2 | `DecodedColumns` plus zero-copy Arrow emission and Arrow filtering in `columnar_storage::tsf::scan`; Phase 0 rerun through `pread` + page cache with an Arrow-to-Arrow comparison | Full scan at least 2x current; fair Parquet comparison; row order, duplicate timestamps and NaN parity with the scalar path |
+| 3 | Hardware CRC32C with runtime dispatch; optional overlap | Checksums identical on every test vector and corpus; keep only if it moves scan time by at least 5% |
+| 4 | SIMD kernels: fill, block prefix sum, 4-way varint | Each kernel at least 1.5x over scalar; scalar oracle differential and `cargo-fuzz` clean |
+| 5 | Dedicated decode pool, ordered emission, batch accumulation, memory caps, cache metrics | Full scan at least 15 M rows/s; 30-day single-series and dashboard queries p99 under 50 ms; per-worker memory bounded and reported |
+
+Each milestone is merged only after the previous gate's numbers are recorded in this
+document or the Phase 0 report.
+
+# 6. Testing strategy
+
+- **Unit differential:** every codec, page sizes 1..=8,192, NaN and all-NaN pages,
+  duplicate timestamps, `precision_bits` 1..=64, empty payloads. Compare against
+  `decode_page` as the oracle.
+- **Property/fuzz:** `cargo-fuzz` targets for `decode_page_into` and each SIMD
+  kernel; assertion that fuzzed input never yields a different result than the
+  scalar path and never panics on malformed input (returns `Err`).
+- **Corruption:** CRC mismatches in page, page index, series index, chunk-group and
+  footer remain fatal after optimisation.
+- **End-to-end:** the existing metric-engine test suite must return identical results
+  with the TSF path; Phase 0 benchmark rerun with the real IO path.
+- **Performance CI:** store criterion baselines; a regression above 10% on the
+  page-decode kernels fails the check. Full phase-0 runs stay manual.
+
+# 7. Acceptance metrics
+
+- Full scan: at least 15 M rows/s on the Phase 0 wide gauge workload, single node,
+  by the end of milestone 5.
+- Selective query: 100 series over a 10% window remains at or below the current
+  7-9 ms, measured through the real IO path.
+- 30-day, single-series and dashboard-style queries: p99 under 50 ms (ADR-0002).
+- Memory: decode working set under 1 MiB per worker; index cache bounded and
+  configurable; no unbounded page-buffer growth.
+- Correctness: zero differential or fuzz failures; all corruption tests still fail
+  loudly.
+
+# 8. Out of scope
+
+- Gorilla/CHIMP value encoding (needs a new codec id and a fresh benchmark).
+- Lossy `precision_bits` as a default.
+- Object-store ranged reads and remote caches.
+- Page-size changes. Tune after projection and Arrow emission are measured.
+- Sequence-range vectorisation; compaction keeps the scalar path until profiled.
+
+# 9. Risks and open questions
+
+- **Buffer ownership at the Arrow boundary.** Zero-copy requires handing the `Vec`
+  to Arrow; a pool must not hand out live memory. This needs a small, well-tested
+  allocator abstraction.
+- **Cache key stability.** Files are immutable, but compaction replaces them. Keys
+  must include a file identity that changes on rewrite (path plus size or file ID),
+  not just metric and series.
+- **Portability.** `std::simd` is nightly-only; prefer `std::arch` intrinsics with a
+  scalar fallback. `3high-design.md` allows `unsafe` only in codec kernels, all
+  fuzzed.
+- **Target feasibility.** If milestone 5 gains most of the throughput from
+  parallelism rather than SIMD, revisit the SIMD budget and state the result.
+- **`crc32c` dependency.** Confirm vendoring; otherwise document the intrinsic
+  fallback in ADR-0002 §11.
+
+# 10. References
+
+- ADR-0002: `docs/rfcs/20261028-data-file-adr.md`
+- Phase 0 benchmark: `docs/rfcs/20261028-phase0-benchmark.md`
+- Module layout and Arrow boundary: ADR-0002 §11
+- Threading and unsafe policy: `docs/3high-design.md`
+- Prototype: `src/storage_kernel/src/tsf/{page.rs,file.rs,checksum.rs,codec/}`

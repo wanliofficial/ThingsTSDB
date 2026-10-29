@@ -832,18 +832,26 @@ src/columnar_storage/src/tsf/
 - The format design borrows ideas from Apache IoTDB TsFile (chunk groups, column chunks,
   page statistics) but shares no bytes or code.
 
-Dependencies added by Phase 2: `zstd`, `crc32c`, `xxhash-rust`, `bytes`. No new
-DataFusion/Arrow dependency in `storage_kernel`.
+Dependencies added by Phase 2: `zstd`, `crc32c`, `xxhash-rust`, `bytes`. If the
+`crc32c` crate cannot be vendored, the reader dispatches to the SSE4.2
+`_mm_crc32_u64` intrinsic at runtime and keeps the software implementation as a
+portable fallback. No new DataFusion/Arrow dependency in `storage_kernel`.
 
 ## 12. Work Breakdown and Acceptance
 
 | Milestone | Scope | Exit criteria |
 |---|---|---|
-| T1 | `storage_kernel::tsf` file writer/reader, page codecs, checksums, golden byte layouts | round-trip and fuzz tests; corrupted files rejected; 1M-row round trip |
-| T2 | `columnar_storage::tsf` flush path, `ScanRequest` extensions, Arrow emission | parity with Parquet for the existing metric-engine test suite |
+| T1 | `storage_kernel::tsf` file writer/reader, page codecs, checksums, projected decode buffers, golden byte layouts | round-trip and differential/fuzz tests; corrupted files rejected; 1M-row round trip; uncompressed-page flag honoured |
+| T2 | `columnar_storage::tsf` flush path, `ScanRequest` extensions, zero-copy Arrow emission | parity with Parquet for the existing metric-engine test suite; Phase 0 benchmark rerun Arrow-to-Arrow through the real IO path |
 | T3 | partition manager, TTL drop, small/big compaction, dedup, crash recovery, orphan GC | kill -9 tests; TTL drop leaves no query-visible files; compaction reduces part count |
 | T4 | manifest format field, dual-read, rewrite job, config switch, metrics | mixed Parquet/TSF queries return identical results; rewrite removes Parquet files |
 | T5 | benchmarks vs Parquet and TsFile-style pages | size, write throughput, query p99, page-skip ratio, recovery time |
+
+Decode-side detail (buffer reuse, column projection, index cache, zero-copy Arrow
+emission, hardware CRC, SIMD kernels, parallel page decoding) is in
+`docs/rfcs/20261029-vectorized-decode-plan.md`. T1 additionally requires differential
+parity against the scalar decoder on all codecs; T2 requires at least 2x the prototype
+scan throughput with selective-query latency unchanged or better.
 
 Acceptance targets (from the roadmap, made measurable):
 
@@ -852,6 +860,8 @@ Acceptance targets (from the roadmap, made measurable):
   `__seq__` is constant per flush.
 - **Write throughput:** at least 90% of the current Parquet path on the same hardware,
   measured after WAL and manifest commit.
+- **Full scan:** at least 15 M rows/s on the Phase 0 wide gauge workload by the end
+  of the decode plan, keeping TSF within roughly 2x of Arrow/Parquet.
 - **Query latency:** a 30-day, single-series query p99 under 50 ms; a 1-day Grafana-style
   query p99 under 50 ms.
 - **Page pruning:** on a 30-day dataset, a 1-hour query reads at most 5% of the pages of
@@ -867,7 +877,8 @@ workload meets the size target at 1.57 B/sample, and selective queries are 28-41
 faster than Parquet scan-and-filter. Full-scan decode is 4-7x slower than Arrow, so
 vectorized page decoding and direct Arrow emission are mandatory before T2 lands.
 Write throughput is 70-99% of Parquet, below the 90% target on the noisiest gauge
-shape; buffer reuse and cheaper codec selection are the first optimizations.
+shape; buffer reuse and cheaper codec selection are the first optimizations. The
+decode follow-up is specified in `docs/rfcs/20261029-vectorized-decode-plan.md`.
 
 ## 13. Observability
 
@@ -962,6 +973,7 @@ Expose from T1/T2:
 # References
 
 - `docs/rfcs/20261028-mergeset-index-adr.md` (ADR-0001: TSID, indexDB, dual-read)
+- `docs/rfcs/20261029-vectorized-decode-plan.md` (Phase 2 decode plan)
 - `/media/wanli/WD_SSD1/home/wanli/workspace/esmetrics/crates/esm-encoding/src/`
 - `/media/wanli/WD_SSD1/home/wanli/workspace/esmetrics/crates/esm-storage/src/block_header.rs`
 - `/media/wanli/WD_SSD1/home/wanli/workspace/esmetrics/crates/esm-storage/src/metaindex_row.rs`
