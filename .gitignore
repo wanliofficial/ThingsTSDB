@@ -12,3 +12,5 @@ bin
 !src/benchmarks/src/bin
 coverage.txt
 tini
+.qoder/
+horaedb.toml
