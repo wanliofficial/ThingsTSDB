@@ -114,8 +114,8 @@ pub fn unmarshal_var_int64s_4way<'a>(dst: &mut [i64], src: &'a [u8]) -> Result<&
         ));
     }
     let mut idx = 0usize;
-    let mut chunks = dst.chunks_exact_mut(4);
-    for out in &mut chunks {
+    let (chunks, remainder) = dst.as_chunks_mut::<4>();
+    for out in chunks {
         let a = read_var_uint64_fast(src, &mut idx)?;
         let b = read_var_uint64_fast(src, &mut idx)?;
         let c = read_var_uint64_fast(src, &mut idx)?;
@@ -125,7 +125,7 @@ pub fn unmarshal_var_int64s_4way<'a>(dst: &mut [i64], src: &'a [u8]) -> Result<&
         out[2] = zigzag_decode(c);
         out[3] = zigzag_decode(d);
     }
-    for out in chunks.into_remainder() {
+    for out in remainder {
         *out = zigzag_decode(read_var_uint64_fast(src, &mut idx)?);
     }
     Ok(&src[idx..])
@@ -137,13 +137,11 @@ unsafe fn fill_i64_avx2(dst: &mut [i64], value: i64) {
     use std::arch::x86_64::{_mm256_set1_epi64x, _mm256_storeu_si256};
 
     let v = _mm256_set1_epi64x(value);
-    let mut chunks = dst.chunks_exact_mut(4);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = dst.as_chunks_mut::<4>();
+    for chunk in chunks {
         _mm256_storeu_si256(chunk.as_mut_ptr() as *mut _, v);
     }
-    for out in chunks.into_remainder() {
-        *out = value;
-    }
+    remainder.fill(value);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -155,14 +153,14 @@ unsafe fn fill_delta_i64_avx2(dst: &mut [i64], first: i64, delta: i64) {
 
     let steps = _mm256_setr_epi64x(0, delta, delta.wrapping_mul(2), delta.wrapping_mul(3));
     let mut base = first;
-    let mut chunks = dst.chunks_exact_mut(4);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = dst.as_chunks_mut::<4>();
+    for chunk in chunks {
         let res = _mm256_add_epi64(_mm256_set1_epi64x(base), steps);
         _mm256_storeu_si256(chunk.as_mut_ptr() as *mut _, res);
         base = base.wrapping_add(delta.wrapping_mul(4));
     }
     let mut v = base;
-    for out in chunks.into_remainder() {
+    for out in remainder {
         *out = v;
         v = v.wrapping_add(delta);
     }
@@ -180,8 +178,8 @@ unsafe fn prefix_sum_i64_avx2(data: &mut [i64], init: i64) {
     // scan, turning [a, a+b, c, c+d] into [a, a+b, a+b+c, a+b+c+d].
     let hi_lane_mask = _mm256_setr_epi64x(0, 0, -1, -1);
     let mut carry = init;
-    let mut chunks = data.chunks_exact_mut(4);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = data.as_chunks_mut::<4>();
+    for chunk in chunks {
         let v = _mm256_loadu_si256(chunk.as_ptr() as *const _);
         let scan = _mm256_add_epi64(v, _mm256_slli_si256(v, 8));
         let low_total = _mm256_extract_epi64(scan, 1);
@@ -193,7 +191,7 @@ unsafe fn prefix_sum_i64_avx2(data: &mut [i64], init: i64) {
         _mm256_storeu_si256(chunk.as_mut_ptr() as *mut _, res);
         carry = _mm256_extract_epi64(res, 3);
     }
-    for out in chunks.into_remainder() {
+    for out in remainder {
         carry = carry.wrapping_add(*out);
         *out = carry;
     }

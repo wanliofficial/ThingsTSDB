@@ -250,9 +250,9 @@ impl PendingColumns {
     fn extend(&mut self, columns: DecodedColumns) {
         let rows = columns.len();
         self.metric_ids
-            .extend(std::iter::repeat(columns.metric_id).take(rows));
+            .extend(std::iter::repeat_n(columns.metric_id, rows));
         self.series_ids
-            .extend(std::iter::repeat(columns.series_id).take(rows));
+            .extend(std::iter::repeat_n(columns.series_id, rows));
         self.timestamps.extend_from_slice(&columns.timestamps);
         self.values.extend_from_slice(&columns.values);
         if self.mask.contains(ColumnMask::SEQUENCE) {
