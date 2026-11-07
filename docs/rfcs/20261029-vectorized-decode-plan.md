@@ -1,6 +1,6 @@
 # Phase 2 Vectorized Decode Implementation Plan
 
-- Status: Implemented (T1 kernel work and the T2 Arrow boundary)
+- Status: Implemented (T1 kernel work, T2 Arrow boundary and flush path, T3/T4 storage integration)
 - Date: 2026-10-29
 - Implemented: 2026-11-07
 - Related: ADR-0002 (`20261028-data-file-adr.md`), Phase 0 benchmark
@@ -362,3 +362,20 @@ cargo test -p storage_kernel -p columnar_storage
 cargo bench -p benchmarks --bench page_decode
 cargo run --release -p benchmarks --bin phase2_bench -- 20000 200 gauge
 ```
+
+## 11.3 Storage integration (T2 flush path, T3, T4)
+
+The decode work above lands in the storage engine as follows:
+
+| Piece | Location | Test |
+|---|---|---|
+| Arrow batch -> TSF rows | `columnar_storage::tsf::write` | `test_encode_batch_round_trips` |
+| Flush writes TSF per `StorageConfig.format` | `buffer::{write_parquet,write_tsf}` | `test_storage_tsf_flush_and_scan` |
+| Compaction writes TSF and carries `min_sequence` | `compaction/executor.rs` | `test_storage_dual_read_parquet_and_tsf` |
+| `format` + `min_sequence` in the manifest | `pb_types` `SstMeta` 5/6, snapshot record v2 | `test_snapshot_record_v2_round_trip`, `test_snapshot_record_v1_dual_read`, `test_snapshot_v1_upgrade` |
+| Dual-read execution plan | `read::build_df_plan` + `tsf::exec::TsfExec` | `test_storage_dual_read_parquet_and_tsf` |
+| Partition TTL drop | `Manifest::{plan_ttl_drop,drop_expired_partitions}` | `test_plan_and_drop_ttl_partitions` |
+
+`TsfExec` runs one partition per file so `SortPreservingMergeExec` above it sees
+sorted streams; each partition decodes only its own file's time range. Whole-object
+fetches are still used, so range reads remain the next decode-adjacent follow-up.

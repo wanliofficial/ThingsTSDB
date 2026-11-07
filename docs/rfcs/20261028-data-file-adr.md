@@ -1,7 +1,6 @@
 # ADR-0002: Partitioned TSF Data Files and the Single-Value Series Model
 
-- Status: Partially implemented (T1 and the T2 Arrow boundary; T2 flush path and
-  T3/T4 pending)
+- Status: Implemented for T1-T4 on the sample schema (T5 benchmark matrix pending)
 - Date: 2026-10-28
 - Implemented: 2026-11-07 (see `docs/rfcs/20261029-vectorized-decode-plan.md`)
 - Related: `docs/rfcs/20261028-mergeset-index-adr.md` (ADR-0001), `docs/roadmap.md`,
@@ -778,13 +777,21 @@ TSF is designed to be one object per part:
 Phase 2 ships behind:
 
 ```toml
-[metric_engine.storage]
-format = "tsf"                 # "parquet" | "tsf"
-partition_duration = "1d"
-page_rows = 8192
-page_size = "1MiB"
-compression = "zstd"
+[storage.time_merge_storage]
+format = "tsf"                 # "parquet" | "tsf"; defaults to "parquet"
+
+# Not implemented yet: page sizing is fixed at the kernel default
+# (8,192 rows) and compression is chosen per page by the encoder.
+# partition_duration = "1d"
+# page_rows = 8192
+# page_size = "1MiB"
+# compression = "zstd"
 ```
+
+`format` is the switch implemented in Phase 2 (`StorageConfig::format`). It applies
+to the sample data table only; metadata tables stay on Parquet because TSF v1 has a
+single fixed schema. Page rows and compression are structural constants of the
+current writer and are not exposed as config yet.
 
 Migration procedure:
 
@@ -812,17 +819,30 @@ src/storage_kernel/src/tsf/
   mod.rs
   file.rs            # header/footer/index layouts, reader/writer
   page.rs            # page build/decode, statistics
-  codec.rs           # const/delta/nearest-delta/varint/ZSTD wrappers
-  compression.rs     # zstd helpers, codec ids
+  partition.rs       # pure UTC-day partition + TTL planning helpers
+  compaction.rs      # pure LWW dedup and compaction policy helpers
+  codec/             # const/delta/nearest-delta/varint/ZSTD wrappers
+    mod.rs
+    int.rs
+    float.rs
+    nearest_delta.rs
+    nearest_delta2.rs
+    compress.rs
+    encoding.rs
+    simd.rs
   bloom.rs           # series bloom filter
   checksum.rs        # crc32c helpers
 src/columnar_storage/src/tsf/
-  mod.rs             # TsfStorage implementing ColumnarStorage
+  mod.rs
   scan.rs            # ScanRequest -> page reads -> Arrow batches
-  flush.rs           # buffer -> TSF writer
-  compaction.rs      # small/big part merge and dedup
-  manifest.rs        # FileMeta format field, partition drop
+  write.rs           # sorted RecordBatch -> TSF rows and file bytes
+  exec.rs            # TsfExec: DataFusion plan for TSF files (dual-read)
 ```
+
+The flush path lives in `columnar_storage::buffer` (it owns the WAL and manifest
+ordering); TSF compaction output lives in `columnar_storage::compaction::executor`.
+`FileMeta.format` and the partition TTL drop live in `columnar_storage::sst` and
+`columnar_storage::manifest`.
 
 - `storage_kernel::tsf` has no Arrow or DataFusion dependency. It operates on byte
   slices, typed columns and plain Rust vectors.
@@ -867,22 +887,38 @@ Done:
 - **T2 boundary** in `columnar_storage::tsf`: `DecodedColumns`, zero-copy Arrow
   emission, Arrow sequence filtering and the 2x-plus full-scan result measured in
   the decode plan.
-- **T3 groundwork** in `storage_kernel::tsf`: pure UTC-day partition/TTL helpers and
-  pure compaction policy/LWW-dedup helpers.
+- **T2 flush path**: `FlushState` writes either Parquet or TSF per
+  `StorageConfig::format`; `columnar_storage::tsf::write::{batch_to_rows,
+  encode_batch}` converts sorted batches and rejects schemas other than the sample
+  `(metric_id, tsid, timestamp, value)`. TSF output must stay inside one UTC day and
+  is written to `{root}/data/{YYYYMMDD}/{file_id}.tsf`. Covered by
+  `test_storage_tsf_flush_and_scan`.
+- **T3** in `storage_kernel::tsf`: pure UTC-day partition/TTL helpers and pure
+  compaction policy/LWW-dedup helpers; `Manifest::plan_ttl_drop` and
+  `drop_expired_partitions` drive a manifest-first, object-delete-after TTL drop
+  (`test_plan_and_drop_ttl_partitions`). Compaction output honors the configured
+  format, refuses TSF output that would span a day, and carries `min_sequence`
+  across its inputs.
+- **T4** in `pb_types`/`columnar_storage`: `SstMeta` gained `min_sequence` (5) and
+  `format` (6) with the new `FileFormat` enum, defaulting to `PARQUET_V1` so old
+  manifests and deltas still parse. Snapshot records are versioned (v1 = 32 bytes,
+  v2 = 44 bytes) with v1 dual-read that upgrades on the next rewrite. The query path
+  partitions SSTs by format in `build_df_plan` and unions `ParquetExec` with the new
+  `TsfExec`, so a root written by both formats scans as one merge stream
+  (`test_storage_dual_read_parquet_and_tsf`).
 
 Follow-up (not yet implemented):
 
-- **T2 flush path:** write TSF files from the metric-engine flush path and make the
-  existing metric-engine tests run against it.
-- **T3:** partition manager, manifest-driven TTL drop, small/big compaction jobs,
-  crash recovery and orphan GC.
-- **T4:** manifest `format`/`min_sequence` fields, dual-read, the Parquet-to-TSF
-  rewrite job, the config switch and metrics.
+- **T2 range reads:** `TsfExec` fetches whole objects; footer/first-page range reads
+  are still pending.
+- **T3 partition manager:** automatic partition discovery, small/big compaction job
+  policies, crash recovery and orphan GC beyond the pure helpers and the TTL drop.
+- **T4 rewrite job:** a background Parquet-to-TSF rewrite, and per-format metrics.
 - **T5:** the full size/write-throughput/query-p99/recovery benchmark matrix.
 
-The remaining work needs a partition-manager and a TSF `ExecutionPlan` integration;
-neither is a mechanical extension of the decode work, so it is tracked here rather
-than implied by the Phase 2 completion.
+The remaining work is mostly operational plumbing (partition manager, GC, rewrite
+job) rather than format or decode work, so it is tracked here rather than implied by
+the Phase 2 completion.
 
 Acceptance targets (from the roadmap, made measurable):
 
