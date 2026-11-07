@@ -575,4 +575,56 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 1, "old samples are gone");
     }
+
+    /// The metric engine's data table is exactly the TSF sample schema, so it
+    /// must work unchanged when `format = tsf`: write, flush and query both go
+    /// through the TSF path (ADR-0002 §7.2).
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_tsf_format_serves_search() {
+        use columnar_storage::config::DataFileFormat;
+
+        let root = temp_dir::TempDir::new().unwrap();
+        let opts = StorageConfig {
+            format: DataFileFormat::Tsf,
+            ..Default::default()
+        };
+        let engine = open_engine_with_opts(&root, opts).await;
+
+        prepare_data(&engine).await;
+
+        let results = engine
+            .search(&search_req(
+                "m1",
+                vec![matcher("code", "200", MatcherType::Eq)],
+                0,
+                100,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].samples.len(), 3);
+        assert_eq!(results[0].samples[2].value, 3.0);
+
+        // Values written twice to the same key must still collapse to one row.
+        engine
+            .write(vec![make_sample("m1", "200", "api", 20, 99.0)])
+            .await
+            .unwrap();
+        let results = engine
+            .search(&search_req(
+                "m1",
+                vec![matcher("code", "200", MatcherType::Eq)],
+                0,
+                100,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(results[0].samples.len(), 3);
+        let updated = results[0]
+            .samples
+            .iter()
+            .find(|s| s.timestamp == 20)
+            .expect("sample at ts=20");
+        assert_eq!(updated.value, 99.0);
+    }
 }

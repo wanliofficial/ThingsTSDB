@@ -76,8 +76,13 @@ impl MetricEngine {
     ) -> Result<Self> {
         // Metadata tables are not TTL-evicted: their rows use write-time
         // timestamps and must survive data expiry.
+        //
+        // They also stay on Parquet: TSF v1 only models the sample schema
+        // (`metric_id, tsid, timestamp, value`), and `StorageConfig::format`
+        // applies to the data table (ADR-0002 §12.1).
         let mut metadata_opts = storage_opts.clone();
         metadata_opts.scheduler.ttl = None;
+        metadata_opts.format = columnar_storage::config::DataFileFormat::Parquet;
         let metric_storage: ColumnarStorageRef = Arc::new(
             open_table_storage(
                 format!("{root_path}/metrics"),
