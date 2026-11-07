@@ -336,13 +336,24 @@ Criterion (`page_decode`, 8,192-row gauge page):
 Value decoding dominates the page (nearest-delta plus ZSTD) and matches the
 standalone ZSTD decompression cost; timestamp decoding is effectively free.
 Allocation accounts for under 2% of a page decode, so the remaining budget is
-codec work rather than buffer churn. CRC is ~7% of page decode time, below the
-plan's 5% overlap threshold, so §4.5 stops at hardware dispatch.
+codec work rather than buffer churn. CRC is ~7% of page decode time, above the
+plan's 5% threshold, so the hardware path is kept; overlapping CRC with decode
+is deferred to avoid coupling the checksum and projection paths.
 
 The randomized projection differential test covers mixed codecs,
 NaN/infinity values, duplicate timestamps and random sequences, and is part of
-the normal `cargo test -p storage_kernel` run. CI-scale 100k-page and nightly
-1M-page runs remain to be wired into the pipeline.
+the normal `cargo test -p storage_kernel` run (128 pages). The milestone 1
+CI-scale gate runs as an ignored nightly test for 100,000 pages (about 44 s in a
+release build):
+
+```text
+cargo test -p storage_kernel --release -- --ignored randomized_differential_nightly
+```
+
+The 1M-page nightly run is not wired into the pipeline yet. T1 also has a
+golden page-header layout test that pins every fixed offset, all four payload
+slices and the CRC, and a 1M-row file round-trip test that runs in the normal
+suite (about 3 s in a debug build).
 
 ## 11.2 Reproduce
 

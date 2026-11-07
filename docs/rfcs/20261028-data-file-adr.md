@@ -1,7 +1,9 @@
 # ADR-0002: Partitioned TSF Data Files and the Single-Value Series Model
 
-- Status: Proposed
+- Status: Partially implemented (T1 and the T2 Arrow boundary; T2 flush path and
+  T3/T4 pending)
 - Date: 2026-10-28
+- Implemented: 2026-11-07 (see `docs/rfcs/20261029-vectorized-decode-plan.md`)
 - Related: `docs/rfcs/20261028-mergeset-index-adr.md` (ADR-0001), `docs/roadmap.md`,
   `docs/3high-design.md`
 - Reference implementations: `esmetrics` (Rust port of VictoriaMetrics v1.146.0,
@@ -852,6 +854,35 @@ emission, hardware CRC, SIMD kernels, parallel page decoding) is in
 `docs/rfcs/20261029-vectorized-decode-plan.md`. T1 additionally requires differential
 parity against the scalar decoder on all codecs; T2 requires at least 2x the prototype
 scan throughput with selective-query latency unchanged or better.
+
+### 12.1 Implementation status (2026-11-07)
+
+Done:
+
+- **T1** in `storage_kernel::tsf`: file/page codecs, CRC32C with hardware dispatch,
+  projected decode buffers, reusable page buffers, a golden page-header layout test,
+  a 1M-row round-trip test and the §4.8 uncompressed-page flag. The randomized
+  differential suite runs 128 pages per commit and 100k pages as an ignored nightly
+  test; `cargo-fuzz` targets are not wired yet.
+- **T2 boundary** in `columnar_storage::tsf`: `DecodedColumns`, zero-copy Arrow
+  emission, Arrow sequence filtering and the 2x-plus full-scan result measured in
+  the decode plan.
+- **T3 groundwork** in `storage_kernel::tsf`: pure UTC-day partition/TTL helpers and
+  pure compaction policy/LWW-dedup helpers.
+
+Follow-up (not yet implemented):
+
+- **T2 flush path:** write TSF files from the metric-engine flush path and make the
+  existing metric-engine tests run against it.
+- **T3:** partition manager, manifest-driven TTL drop, small/big compaction jobs,
+  crash recovery and orphan GC.
+- **T4:** manifest `format`/`min_sequence` fields, dual-read, the Parquet-to-TSF
+  rewrite job, the config switch and metrics.
+- **T5:** the full size/write-throughput/query-p99/recovery benchmark matrix.
+
+The remaining work needs a partition-manager and a TSF `ExecutionPlan` integration;
+neither is a mechanical extension of the decode work, so it is tracked here rather
+than implied by the Phase 2 completion.
 
 Acceptance targets (from the roadmap, made measurable):
 
