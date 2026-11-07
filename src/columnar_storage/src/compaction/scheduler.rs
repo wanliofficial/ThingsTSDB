@@ -32,7 +32,7 @@ use crate::{
     config::SchedulerConfig,
     manifest::ManifestRef,
     read::ParquetReader,
-    sst::SstPathGenerator,
+    sst::{FileFormat, SstPathGenerator},
     types::{ObjectStoreRef, RuntimeRef, StorageSchema},
     Result,
 };
@@ -58,6 +58,7 @@ impl Scheduler {
         parquet_reader: Arc<ParquetReader>,
         config: SchedulerConfig,
         write_props: WriterProperties,
+        format: FileFormat,
     ) -> Self {
         let (task_tx, task_rx) = mpsc::channel(config.max_pending_compaction_tasks);
         let (trigger_tx, trigger_rx) = mpsc::channel::<()>(1);
@@ -74,6 +75,7 @@ impl Scheduler {
                 write_props,
                 config.memory_limit.0,
                 trigger_tx.clone(),
+                format,
             );
 
             runtime.spawn(async move {
