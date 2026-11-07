@@ -28,7 +28,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use storage_kernel::tsf::{
-    codec::{marshal_var_int64s, simd},
+    checksum::crc32c,
+    codec::{compress_zstd_level, decompress_zstd, marshal_var_int64s, simd},
     page::{decode_page, decode_page_into, encode_page, ColumnMask, PageBuffers, MAX_PAGE_ROWS},
     Row,
 };
@@ -130,5 +131,45 @@ fn bench_kernels(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_page_decode, bench_kernels);
+fn bench_crc_and_compression(c: &mut Criterion) {
+    let rows = gauge_rows(MAX_PAGE_ROWS);
+    let (page, _) = encode_page(&rows).unwrap();
+
+    let mut group = c.benchmark_group("tsf_crc");
+    group.throughput(Throughput::Bytes(page.len() as u64));
+    group.bench_function("crc32c_page", |b| {
+        b.iter(|| black_box(crc32c(black_box(&page))))
+    });
+
+    let big = vec![0x5au8; 1 << 20];
+    group.throughput(Throughput::Bytes(big.len() as u64));
+    group.bench_function("crc32c_1mib", |b| {
+        b.iter(|| black_box(crc32c(black_box(&big))))
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("tsf_zstd");
+    let raw: Vec<u8> = rows
+        .iter()
+        .flat_map(|row| row.value.to_bits().to_le_bytes())
+        .collect();
+    let mut compressed = Vec::new();
+    compress_zstd_level(&mut compressed, &raw, 1);
+    group.throughput(Throughput::Bytes(raw.len() as u64));
+    group.bench_function("decompress_value_bits", |b| {
+        b.iter(|| {
+            let mut dst = Vec::new();
+            decompress_zstd(&mut dst, black_box(&compressed)).unwrap();
+            black_box(dst.len())
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_page_decode,
+    bench_kernels,
+    bench_crc_and_compression
+);
 criterion_main!(benches);
