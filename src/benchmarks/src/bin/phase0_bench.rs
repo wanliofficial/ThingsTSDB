@@ -129,19 +129,34 @@ fn main() -> Result<(), String> {
 
     let tsf_scan = time_best(3, || reader.read_all().map(|v| v.len()))?;
     println!(
-        "TSF full scan: {:.3} s ({:.0} rows/s), {:.2} ns/row",
+        "TSF full scan (scalar rows): {:.3} s ({:.0} rows/s), {:.2} ns/row",
         tsf_scan.0.as_secs_f64(),
         rows as f64 / tsf_scan.0.as_secs_f64(),
         tsf_scan.0.as_secs_f64() * 1e9 / rows as f64
     );
+    let tsf_arrow_scan = time_best(3, || {
+        let request = columnar_storage::tsf::TsfScanRequest::new(
+            METRIC_ID,
+            TimeRange::new(i64::MIN, i64::MAX),
+        );
+        let batches = columnar_storage::tsf::scan(&reader, &request)?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum::<usize>())
+    })?;
+    println!(
+        "TSF full scan (Arrow emission): {:.3} s ({:.0} rows/s), {:.2} ns/row",
+        tsf_arrow_scan.0.as_secs_f64(),
+        rows as f64 / tsf_arrow_scan.0.as_secs_f64(),
+        tsf_arrow_scan.0.as_secs_f64() * 1e9 / rows as f64
+    );
     let parquet_scan = time_best(3, || read_parquet_all(&parquet_path))?;
     println!(
-        "Parquet full scan: {:.3} s ({:.0} rows/s), {:.2} ns/row",
+        "Parquet full scan (Arrow): {:.3} s ({:.0} rows/s), {:.2} ns/row",
         parquet_scan.0.as_secs_f64(),
         rows as f64 / parquet_scan.0.as_secs_f64(),
         parquet_scan.0.as_secs_f64() * 1e9 / rows as f64
     );
     assert_eq!(tsf_scan.1, parquet_scan.1);
+    assert_eq!(tsf_arrow_scan.1, parquet_scan.1);
     println!();
 
     // 100 random series, 10% of the time range: representative dashboard query.
