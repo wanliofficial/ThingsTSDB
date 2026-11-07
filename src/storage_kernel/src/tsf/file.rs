@@ -21,14 +21,17 @@
 //! ADR-0002 and keeps the whole file in memory. Object-store ranged reads and
 //! caches are deferred; the encode/decode and pruning costs are the same.
 
-use std::path::Path;
+use std::{collections::HashMap, hash::Hash, path::Path, sync::Arc};
 
 use super::Row;
 use crate::tsf::{
     bloom,
     checksum::crc32c,
     codec::{compress_zstd_level, decompress_zstd},
-    page::{decode_page, encode_page, PageMeta, MAX_PAGE_ROWS},
+    page::{
+        contiguous_time_slice, decode_page, decode_page_into, encode_page, ColumnMask, PageBuffers,
+        PageMeta, MAX_PAGE_ROWS,
+    },
 };
 
 pub const FILE_HEADER_SIZE: usize = 128;
@@ -87,6 +90,399 @@ impl TimeRange {
 
 /// `[start, end)` over `__seq__`.
 pub type SequenceRange = Option<(u64, u64)>;
+
+/// Decoded, projected columns for one series and one time range.
+///
+/// Unrequested columns are empty. Rows preserve the on-disk order
+/// `(timestamp, __seq__)`; duplicate timestamps and NaN values are kept.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecodedColumns {
+    pub metric_id: u64,
+    pub series_id: u64,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f64>,
+    pub sequences: Vec<u64>,
+    pub reserved: Vec<u64>,
+    pub mask: ColumnMask,
+}
+
+impl DecodedColumns {
+    pub fn new(metric_id: u64, series_id: u64, mask: ColumnMask) -> Self {
+        Self {
+            metric_id,
+            series_id,
+            timestamps: Vec::new(),
+            values: Vec::new(),
+            sequences: Vec::new(),
+            reserved: Vec::new(),
+            mask,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        if self.mask.contains(ColumnMask::TIMESTAMP) {
+            self.timestamps.len()
+        } else {
+            self.values
+                .len()
+                .max(self.sequences.len())
+                .max(self.reserved.len())
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Approximate heap bytes held by this batch.
+    pub fn capacity_bytes(&self) -> usize {
+        self.timestamps.capacity() * std::mem::size_of::<i64>()
+            + self.values.capacity() * std::mem::size_of::<f64>()
+            + self.sequences.capacity() * std::mem::size_of::<u64>()
+            + self.reserved.capacity() * std::mem::size_of::<u64>()
+    }
+}
+
+/// Counters exposed for ADR-0002 §13 observability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub rejects: u64,
+    pub entries: usize,
+    pub bytes: usize,
+}
+
+impl CacheStats {
+    pub fn hit_ratio(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+
+    pub fn merge(&mut self, other: &CacheStats) {
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.evictions += other.evictions;
+        self.rejects += other.rejects;
+        self.entries += other.entries;
+        self.bytes += other.bytes;
+    }
+}
+
+struct CacheSlot<V> {
+    value: Arc<V>,
+    bytes: usize,
+    tick: u64,
+}
+
+/// A small byte-bounded LRU cache.
+///
+/// Entries are immutable for the lifetime of a TSF file, so there is no
+/// invalidation path: a new file gets a new identity and therefore new keys.
+struct LruCache<K, V> {
+    map: HashMap<K, CacheSlot<V>>,
+    bytes: usize,
+    max_bytes: usize,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    rejects: u64,
+}
+
+impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            bytes: 0,
+            max_bytes,
+            tick: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            rejects: 0,
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<Arc<V>> {
+        self.tick += 1;
+        match self.map.get_mut(key) {
+            Some(slot) => {
+                slot.tick = self.tick;
+                self.hits += 1;
+                Some(slot.value.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V, bytes: usize) -> Arc<V> {
+        self.tick += 1;
+        let value = Arc::new(value);
+        if bytes > self.max_bytes {
+            // A single entry larger than the whole budget is returned
+            // uncached, so queries still make progress.
+            self.rejects += 1;
+            return value;
+        }
+        if let Some(old) = self.map.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        self.map.insert(
+            key,
+            CacheSlot {
+                value: value.clone(),
+                bytes,
+                tick: self.tick,
+            },
+        );
+        self.bytes += bytes;
+        while self.bytes > self.max_bytes {
+            let victim = self
+                .map
+                .iter()
+                .min_by_key(|(_, slot)| slot.tick)
+                .map(|(key, _)| key.clone());
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(slot) = self.map.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(slot.bytes);
+                self.evictions += 1;
+            }
+        }
+        value
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+
+    fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+            rejects: self.rejects,
+            entries: self.map.len(),
+            bytes: self.bytes,
+        }
+    }
+}
+
+type SeriesIndexKey = (u64, u64);
+type SeriesBlockKey = (u64, u64, u64);
+type PageIndexKey = (u64, u64, u64);
+
+/// Default per-worker index-cache budget from the decode plan (16 MiB).
+pub const DEFAULT_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Caller-owned decode state: page buffers plus decompressed index caches.
+///
+/// The reader itself stays immutable and `Sync`; one context belongs to one
+/// decode worker so no locks are needed.
+pub struct ReadContext {
+    pub buffers: PageBuffers,
+    series_index: LruCache<SeriesIndexKey, Vec<SeriesIndexRow>>,
+    series_blocks: LruCache<SeriesBlockKey, Vec<SeriesEntry>>,
+    page_index: LruCache<PageIndexKey, Vec<PageEntry>>,
+}
+
+impl Default for ReadContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReadContext {
+    pub fn new() -> Self {
+        Self::with_cache_bytes(DEFAULT_CACHE_BYTES)
+    }
+
+    /// Creates a context whose three index caches share `max_bytes`.
+    pub fn with_cache_bytes(max_bytes: usize) -> Self {
+        let per_cache = max_bytes / 3;
+        let mut buffers = PageBuffers::new();
+        buffers.reserve_page();
+        Self {
+            buffers,
+            series_index: LruCache::new(per_cache),
+            series_blocks: LruCache::new(per_cache),
+            page_index: LruCache::new(per_cache),
+        }
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        let mut stats = self.series_index.stats();
+        stats.merge(&self.series_blocks.stats());
+        stats.merge(&self.page_index.stats());
+        stats
+    }
+
+    pub fn cache_bytes(&self) -> usize {
+        self.series_index.bytes + self.series_blocks.bytes + self.page_index.bytes
+    }
+
+    pub fn clear_caches(&mut self) {
+        self.series_index.clear();
+        self.series_blocks.clear();
+        self.page_index.clear();
+    }
+}
+
+/// Options for a parallel metric scan.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanOptions {
+    /// Number of decode workers. Zero means "available parallelism".
+    pub workers: usize,
+    /// Index-cache budget per worker.
+    pub cache_bytes_per_worker: usize,
+    /// Target rows per emitted Arrow batch. Kept here so the kernel reports
+    /// the same batching contract the Arrow layer uses.
+    pub batch_rows: usize,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            workers: 0,
+            cache_bytes_per_worker: DEFAULT_CACHE_BYTES,
+            batch_rows: MAX_PAGE_ROWS,
+        }
+    }
+}
+
+/// Result of a parallel metric scan: decoded series in `series_id` order.
+#[derive(Debug)]
+pub struct ScanResult {
+    pub columns: Vec<DecodedColumns>,
+    pub stats: CacheStats,
+    pub workers: usize,
+    pub bytes: usize,
+}
+
+/// Decodes one metric range, splitting series chunks across dedicated
+/// worker threads when more than one worker is requested.
+///
+/// Ordering is deterministic: the returned `columns` follow the file's
+/// `series_id` order regardless of thread completion order. Each worker owns
+/// its own [`ReadContext`], so the reader is never locked.
+pub fn scan_metric_parallel(
+    reader: &TsfReader,
+    metric_id: u64,
+    range: TimeRange,
+    columns: ColumnMask,
+    opts: &ScanOptions,
+) -> Result<ScanResult, String> {
+    let Some(group) = reader.group_for(metric_id)? else {
+        return Ok(ScanResult {
+            columns: Vec::new(),
+            stats: CacheStats::default(),
+            workers: 0,
+            bytes: 0,
+        });
+    };
+    let header = reader.chunk_group_header(&group)?;
+    if !header.overlaps(range) {
+        return Ok(ScanResult {
+            columns: Vec::new(),
+            stats: CacheStats::default(),
+            workers: 0,
+            bytes: 0,
+        });
+    }
+    let entries = reader.series_entries(&header)?;
+    if entries.is_empty() {
+        return Ok(ScanResult {
+            columns: Vec::new(),
+            stats: CacheStats::default(),
+            workers: 0,
+            bytes: 0,
+        });
+    }
+
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let requested = if opts.workers == 0 {
+        available
+    } else {
+        opts.workers
+    };
+    let workers = requested.clamp(1, entries.len());
+
+    let decode_chunk =
+        |chunk: &[SeriesEntry]| -> Result<(Vec<DecodedColumns>, CacheStats), String> {
+            let mut ctx = ReadContext::with_cache_bytes(opts.cache_bytes_per_worker);
+            let mut out = Vec::new();
+            for entry in chunk {
+                if entry.max_timestamp < range.start || entry.min_timestamp >= range.end {
+                    continue;
+                }
+                let mut columns_out = DecodedColumns::new(metric_id, entry.series_id, columns);
+                reader.read_entry_columns(
+                    metric_id,
+                    entry,
+                    range,
+                    columns,
+                    &mut ctx,
+                    &mut columns_out,
+                )?;
+                if !columns_out.is_empty() {
+                    out.push(columns_out);
+                }
+            }
+            Ok((out, ctx.cache_stats()))
+        };
+
+    if workers == 1 {
+        let (columns, stats) = decode_chunk(&entries)?;
+        let bytes = columns.iter().map(|c| c.capacity_bytes()).sum();
+        return Ok(ScanResult {
+            columns,
+            stats,
+            workers: 1,
+            bytes,
+        });
+    }
+
+    let chunk_size = entries.len().div_ceil(workers);
+    let mut all = Vec::with_capacity(entries.len());
+    let mut stats = CacheStats::default();
+    std::thread::scope(|scope| -> Result<(), String> {
+        let handles: Vec<_> = entries
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(move || decode_chunk(chunk)))
+            .collect();
+        for handle in handles {
+            let (mut columns, worker_stats) = handle
+                .join()
+                .map_err(|_| "decode worker panicked".to_string())??;
+            stats.merge(&worker_stats);
+            all.append(&mut columns);
+        }
+        Ok(())
+    })?;
+    // `entries` is sorted by series_id and chunks preserve order, so `all` is
+    // already deterministic. Sort defensively to keep the contract explicit.
+    all.sort_by_key(|c| c.series_id);
+    let bytes = all.iter().map(|c| c.capacity_bytes()).sum();
+    Ok(ScanResult {
+        columns: all,
+        stats,
+        workers,
+        bytes,
+    })
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct FileHeader {
@@ -355,6 +751,9 @@ pub struct TsfReader {
     header: FileHeader,
     groups: Vec<ChunkGroupEntry>,
     bloom: Option<Vec<u8>>,
+    /// Identity used as the index-cache key prefix. Files are immutable, so a
+    /// rewrite produces a different header CRC and/or size.
+    identity: u64,
 }
 
 impl TsfReader {
@@ -399,12 +798,22 @@ impl TsfReader {
         } else {
             None
         };
+        // The header CRC changes whenever the file contents change, and the
+        // length disambiguates CRC collisions; together they form a stable
+        // identity for the immutable file.
+        let header_crc = u32::from_le_bytes(data[124..128].try_into().unwrap());
+        let identity = ((header_crc as u64) << 32) | (data.len() as u32 as u64);
         Ok(Self {
             data,
             header,
             groups,
             bloom,
+            identity,
         })
+    }
+
+    pub fn file_identity(&self) -> u64 {
+        self.identity
     }
 
     pub fn header(&self) -> &FileHeader {
@@ -513,6 +922,148 @@ impl TsfReader {
         Ok(entries)
     }
 
+    fn series_index_rows_cached(
+        &self,
+        group: &ChunkGroupHeader,
+        ctx: &mut ReadContext,
+    ) -> Result<Arc<Vec<SeriesIndexRow>>, String> {
+        let key = (self.identity, group.metric_id);
+        if let Some(rows) = ctx.series_index.get(&key) {
+            return Ok(rows);
+        }
+        let rows = self.series_index_rows(group)?;
+        let bytes = rows.len() * SERIES_INDEX_ROW_SIZE;
+        Ok(ctx.series_index.insert(key, rows, bytes))
+    }
+
+    fn series_block_cached(
+        &self,
+        group: &ChunkGroupHeader,
+        row: &SeriesIndexRow,
+        ctx: &mut ReadContext,
+    ) -> Result<Arc<Vec<SeriesEntry>>, String> {
+        let key = (self.identity, group.metric_id, row.first_series_id);
+        if let Some(entries) = ctx.series_blocks.get(&key) {
+            return Ok(entries);
+        }
+        let entries = self.series_block(row)?;
+        let bytes = entries.len() * SERIES_ENTRY_SIZE;
+        Ok(ctx.series_blocks.insert(key, entries, bytes))
+    }
+
+    fn page_index_cached(
+        &self,
+        metric_id: u64,
+        series_id: u64,
+        header: &SeriesChunkHeader,
+        ctx: &mut ReadContext,
+    ) -> Result<Arc<Vec<PageEntry>>, String> {
+        let key = (self.identity, metric_id, series_id);
+        if let Some(pages) = ctx.page_index.get(&key) {
+            return Ok(pages);
+        }
+        let raw = decompress_at(
+            &self.data,
+            header.page_index_offset,
+            header.page_index_size,
+            header.page_index_crc32c,
+            "page index",
+        )?;
+        if !raw.len().is_multiple_of(PAGE_ENTRY_SIZE) {
+            return Err("page index size is not a multiple of 80".to_string());
+        }
+        let mut pages = Vec::with_capacity(raw.len() / PAGE_ENTRY_SIZE);
+        for chunk in raw.as_chunks::<PAGE_ENTRY_SIZE>().0 {
+            pages.push(PageEntry {
+                min_timestamp: get_i64(chunk, 0),
+                max_timestamp: get_i64(chunk, 8),
+                first_value_bits: get_u64(chunk, 16),
+                last_value_bits: get_u64(chunk, 24),
+                min_value_bits: get_u64(chunk, 32),
+                max_value_bits: get_u64(chunk, 40),
+                min_sequence: get_u64(chunk, 48),
+                max_sequence: get_u64(chunk, 56),
+                page_offset: get_u64(chunk, 64),
+                page_size: get_u32(chunk, 72),
+                row_count: get_u32(chunk, 76),
+            });
+        }
+        if pages.len() != header.page_count as usize {
+            return Err("page index entry count mismatch".to_string());
+        }
+        let indexed_rows: u64 = pages.iter().map(|p| p.row_count as u64).sum();
+        if indexed_rows != header.sample_count {
+            return Err("series chunk sample count mismatch".to_string());
+        }
+        let bytes = pages.len() * PAGE_ENTRY_SIZE;
+        Ok(ctx.page_index.insert(key, pages, bytes))
+    }
+
+    fn series_entry_cached(
+        &self,
+        group: &ChunkGroupHeader,
+        series_id: u64,
+        ctx: &mut ReadContext,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let rows = self.series_index_rows_cached(group, ctx)?;
+        let pos = rows.partition_point(|r| r.first_series_id <= series_id);
+        if pos == 0 {
+            return Ok(None);
+        }
+        let row = &rows[pos - 1];
+        if series_id > row.last_series_id {
+            return Ok(None);
+        }
+        let entries = self.series_block_cached(group, row, ctx)?;
+        Ok(entries
+            .binary_search_by_key(&series_id, |e| e.series_id)
+            .ok()
+            .map(|idx| entries[idx]))
+    }
+
+    fn series_entries_cached(
+        &self,
+        group: &ChunkGroupHeader,
+        ctx: &mut ReadContext,
+    ) -> Result<Vec<SeriesEntry>, String> {
+        let rows = self.series_index_rows_cached(group, ctx)?;
+        let mut entries = Vec::with_capacity(group.series_count as usize);
+        for row in rows.iter() {
+            entries.extend(self.series_block_cached(group, row, ctx)?.iter().copied());
+        }
+        Ok(entries)
+    }
+
+    /// Parses and validates one series chunk header.
+    fn series_chunk_header(&self, entry: &SeriesEntry) -> Result<SeriesChunkHeader, String> {
+        let h = slice(&self.data, entry.chunk_offset, SERIES_CHUNK_HEADER_SIZE)?;
+        if crc32c(&h[..92]) != u32::from_le_bytes(h[92..96].try_into().unwrap()) {
+            return Err(format!(
+                "series chunk header CRC mismatch for series {}",
+                entry.series_id
+            ));
+        }
+        let header = SeriesChunkHeader {
+            series_id: get_u64(h, 0),
+            sample_count: get_u64(h, 8),
+            page_count: get_u32(h, 16),
+            min_timestamp: get_i64(h, 24),
+            max_timestamp: get_i64(h, 32),
+            page_index_offset: get_u64(h, 56),
+            page_index_size: get_u32(h, 64),
+            page_index_crc32c: get_u32(h, 84),
+        };
+        if header.series_id != entry.series_id {
+            return Err("series chunk header ID mismatch".to_string());
+        }
+        if header.min_timestamp != entry.min_timestamp
+            || header.max_timestamp != entry.max_timestamp
+        {
+            return Err("series chunk header timestamp range mismatch".to_string());
+        }
+        Ok(header)
+    }
+
     fn series_entry(
         &self,
         group: &ChunkGroupHeader,
@@ -573,6 +1124,138 @@ impl TsfReader {
         self.read_series_entry(metric_id, &entry, range, sequence_range)
     }
 
+    /// Reads projected columns for one series, reusing `ctx` buffers and
+    /// index caches.
+    ///
+    /// Timestamps are decoded internally even when not requested, because a
+    /// boundary page is sliced by `partition_point`; only requested columns
+    /// are returned. Sequence predicates are not applied here (they are not
+    /// monotonic); compaction keeps the [`Row`] path.
+    pub fn read_series_columns(
+        &self,
+        metric_id: u64,
+        series_id: u64,
+        range: TimeRange,
+        columns: ColumnMask,
+        ctx: &mut ReadContext,
+    ) -> Result<DecodedColumns, String> {
+        let mut out = DecodedColumns::new(metric_id, series_id, columns);
+        if let Some(filter) = &self.bloom {
+            if !bloom::might_contain(filter, series_id) {
+                return Ok(out);
+            }
+        }
+        let Some(group) = self.group_for(metric_id)? else {
+            return Ok(out);
+        };
+        let header = self.chunk_group_header(&group)?;
+        if !header.overlaps(range) {
+            return Ok(out);
+        }
+        let Some(entry) = self.series_entry_cached(&header, series_id, ctx)? else {
+            return Ok(out);
+        };
+        self.read_entry_columns(metric_id, &entry, range, columns, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// Reads projected columns for every series of one metric, in
+    /// `series_id` order.
+    pub fn read_metric_columns(
+        &self,
+        metric_id: u64,
+        range: TimeRange,
+        columns: ColumnMask,
+        ctx: &mut ReadContext,
+    ) -> Result<Vec<DecodedColumns>, String> {
+        let Some(group) = self.group_for(metric_id)? else {
+            return Ok(Vec::new());
+        };
+        let header = self.chunk_group_header(&group)?;
+        if !header.overlaps(range) {
+            return Ok(Vec::new());
+        }
+        let entries = self.series_entries_cached(&header, ctx)?;
+        let mut out = Vec::new();
+        for entry in &entries {
+            if entry.max_timestamp < range.start || entry.min_timestamp >= range.end {
+                continue;
+            }
+            let mut columns_out = DecodedColumns::new(metric_id, entry.series_id, columns);
+            self.read_entry_columns(metric_id, entry, range, columns, ctx, &mut columns_out)?;
+            if !columns_out.is_empty() {
+                out.push(columns_out);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads projected columns for every row in the file.
+    pub fn read_all_columns(
+        &self,
+        columns: ColumnMask,
+        ctx: &mut ReadContext,
+    ) -> Result<Vec<DecodedColumns>, String> {
+        let mut out = Vec::new();
+        for group in &self.groups {
+            out.extend(self.read_metric_columns(
+                group.metric_id,
+                TimeRange::new(i64::MIN, i64::MAX),
+                columns,
+                ctx,
+            )?);
+        }
+        Ok(out)
+    }
+
+    fn read_entry_columns(
+        &self,
+        metric_id: u64,
+        entry: &SeriesEntry,
+        range: TimeRange,
+        columns: ColumnMask,
+        ctx: &mut ReadContext,
+        out: &mut DecodedColumns,
+    ) -> Result<(), String> {
+        if entry.max_timestamp < range.start || entry.min_timestamp >= range.end {
+            return Ok(());
+        }
+        let header = self.series_chunk_header(entry)?;
+        let pages = self.page_index_cached(metric_id, entry.series_id, &header, ctx)?;
+        let decode_mask = columns | ColumnMask::TIMESTAMP;
+        for page in pages.iter() {
+            if page.max_timestamp < range.start || page.min_timestamp >= range.end {
+                continue;
+            }
+            let bytes = slice(&self.data, page.page_offset, page.page_size as usize)?;
+            decode_page_into(bytes, decode_mask, &mut ctx.buffers)?;
+            if ctx.buffers.row_count != page.row_count as usize {
+                return Err("decoded page row count mismatch".to_string());
+            }
+            let selected = contiguous_time_slice(&ctx.buffers.timestamps, range.start, range.end);
+            if selected.is_empty() {
+                continue;
+            }
+            if columns.contains(ColumnMask::TIMESTAMP) {
+                out.timestamps
+                    .extend_from_slice(&ctx.buffers.timestamps[selected.clone()]);
+            }
+            if columns.contains(ColumnMask::VALUE) {
+                out.values
+                    .extend_from_slice(&ctx.buffers.values[selected.clone()]);
+            }
+            if columns.contains(ColumnMask::SEQUENCE) {
+                out.sequences
+                    .extend_from_slice(&ctx.buffers.sequences[selected.clone()]);
+            }
+            if columns.contains(ColumnMask::RESERVED) {
+                out.reserved
+                    .extend_from_slice(&ctx.buffers.reserved[selected.clone()]);
+            }
+        }
+        Ok(())
+    }
+
     /// Reads every series of one metric in `[range.start, range.end)`.
     pub fn read_metric(
         &self,
@@ -622,31 +1305,7 @@ impl TsfReader {
                 return Ok(Vec::new());
             }
         }
-        let h = slice(&self.data, entry.chunk_offset, SERIES_CHUNK_HEADER_SIZE)?;
-        if crc32c(&h[..92]) != u32::from_le_bytes(h[92..96].try_into().unwrap()) {
-            return Err(format!(
-                "series chunk header CRC mismatch for series {}",
-                entry.series_id
-            ));
-        }
-        let header = SeriesChunkHeader {
-            series_id: get_u64(h, 0),
-            sample_count: get_u64(h, 8),
-            page_count: get_u32(h, 16),
-            min_timestamp: get_i64(h, 24),
-            max_timestamp: get_i64(h, 32),
-            page_index_offset: get_u64(h, 56),
-            page_index_size: get_u32(h, 64),
-            page_index_crc32c: get_u32(h, 84),
-        };
-        if header.series_id != entry.series_id {
-            return Err("series chunk header ID mismatch".to_string());
-        }
-        if header.min_timestamp != entry.min_timestamp
-            || header.max_timestamp != entry.max_timestamp
-        {
-            return Err("series chunk header timestamp range mismatch".to_string());
-        }
+        let header = self.series_chunk_header(entry)?;
         let raw = decompress_at(
             &self.data,
             header.page_index_offset,
@@ -1267,5 +1926,206 @@ mod tests {
         let reader = TsfReader::open(&path).unwrap();
         assert_eq!(reader.read_all().unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn assert_columns_match_rows(columns: &DecodedColumns, rows: &[Row]) {
+        assert_eq!(columns.len(), rows.len());
+        if columns.mask.contains(ColumnMask::TIMESTAMP) {
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(columns.timestamps[i], row.timestamp);
+            }
+        }
+        if columns.mask.contains(ColumnMask::VALUE) {
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(columns.values[i].to_bits(), row.value.to_bits());
+            }
+        }
+        if columns.mask.contains(ColumnMask::SEQUENCE) {
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(columns.sequences[i], row.sequence);
+            }
+        }
+        if columns.mask.contains(ColumnMask::RESERVED) {
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(columns.reserved[i], row.reserved);
+            }
+        }
+    }
+
+    fn mixed_rows() -> Vec<Row> {
+        let mut rows = Vec::new();
+        for metric in 1..=2u64 {
+            for series in 0..5u64 {
+                for i in 0..300i64 {
+                    let mut timestamp = 1_700_000_000_000 + i * 10;
+                    // Duplicate timestamps are legal.
+                    if i > 0 && i % 97 == 0 {
+                        timestamp -= 10;
+                    }
+                    let value = if i == 31 && series == 2 {
+                        f64::NAN
+                    } else {
+                        series as f64 * 100.0 + i as f64
+                    };
+                    rows.push(row(metric, series, timestamp, value, (i as u64) % 4));
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn test_columns_differential_against_scalar_rows() {
+        let rows = mixed_rows();
+        let (bytes, _) = encode_file(
+            rows,
+            (0, 2_000_000_000_000),
+            &WriterOptions { page_rows: 64 },
+        )
+        .unwrap();
+        let reader = TsfReader::from_bytes(bytes).unwrap();
+        let mut ctx = ReadContext::new();
+        let ranges = [
+            (i64::MIN, i64::MAX),
+            (1_700_000_000_000, 1_700_000_001_000),
+            (1_700_000_000_500, 1_700_000_000_900),
+            (1_700_000_001_505, 1_700_000_001_515),
+            (0, 1),
+        ];
+        for metric in [1u64, 2] {
+            for series in 0..5u64 {
+                for (start, end) in ranges {
+                    let range = TimeRange::new(start, end);
+                    let scalar = reader.read_series(metric, series, range, None).unwrap();
+                    for mask in [
+                        ColumnMask::ALL,
+                        ColumnMask::SAMPLE,
+                        ColumnMask::TIMESTAMP,
+                        ColumnMask::VALUE | ColumnMask::SEQUENCE,
+                        ColumnMask::RESERVED,
+                    ] {
+                        let columns = reader
+                            .read_series_columns(metric, series, range, mask, &mut ctx)
+                            .unwrap();
+                        assert_eq!(columns.mask, mask);
+                        assert_columns_match_rows(&columns, &scalar);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_metric_columns_match_rows_and_keep_series_order() {
+        let rows = mixed_rows();
+        let (bytes, _) = encode_file(
+            rows,
+            (0, 2_000_000_000_000),
+            &WriterOptions { page_rows: 128 },
+        )
+        .unwrap();
+        let reader = TsfReader::from_bytes(bytes).unwrap();
+        let mut ctx = ReadContext::new();
+        let range = TimeRange::new(1_700_000_000_000, 1_700_000_001_000);
+        let columns = reader
+            .read_metric_columns(1, range, ColumnMask::SAMPLE, &mut ctx)
+            .unwrap();
+        assert_eq!(
+            columns.iter().map(|c| c.series_id).collect::<Vec<_>>(),
+            (0..5).collect::<Vec<_>>()
+        );
+        for columns in &columns {
+            let rows = reader
+                .read_series(1, columns.series_id, range, None)
+                .unwrap();
+            assert_columns_match_rows(columns, &rows);
+        }
+
+        let all = reader
+            .read_all_columns(ColumnMask::ALL, &mut ReadContext::new())
+            .unwrap();
+        let total: usize = all.iter().map(|c| c.len()).sum();
+        assert_eq!(total, reader.read_all().unwrap().len());
+    }
+
+    #[test]
+    fn test_index_cache_hits_and_evictions() {
+        let mut rows = Vec::new();
+        for series in 0..200u64 {
+            for i in 0..10i64 {
+                rows.push(row(3, series, 1_000 + i, series as f64, 1));
+            }
+        }
+        let (bytes, _) = encode_file(rows, (0, 10_000), &WriterOptions::default()).unwrap();
+        let reader = TsfReader::from_bytes(bytes).unwrap();
+        let range = TimeRange::new(i64::MIN, i64::MAX);
+        let mut ctx = ReadContext::with_cache_bytes(1 << 20);
+        reader
+            .read_series_columns(3, 73, range, ColumnMask::SAMPLE, &mut ctx)
+            .unwrap();
+        let first = ctx.cache_stats();
+        assert!(first.misses > 0);
+        assert!(first.entries > 0);
+        reader
+            .read_series_columns(3, 73, range, ColumnMask::SAMPLE, &mut ctx)
+            .unwrap();
+        let second = ctx.cache_stats();
+        assert!(second.hits > first.hits, "expected a cache hit");
+        assert!(second.hit_ratio() > 0.0);
+
+        // A zero-byte budget must reject cache inserts but still answer.
+        let mut tiny = ReadContext::with_cache_bytes(0);
+        let out = reader
+            .read_series_columns(3, 73, range, ColumnMask::SAMPLE, &mut tiny)
+            .unwrap();
+        assert!(!out.is_empty());
+        assert!(tiny.cache_stats().rejects > 0);
+        assert_eq!(tiny.cache_bytes(), 0);
+    }
+
+    #[test]
+    fn test_parallel_scan_matches_single_worker_and_preserves_order() {
+        let mut rows = Vec::new();
+        for series in 0..64u64 {
+            for i in 0..80i64 {
+                rows.push(row(
+                    9,
+                    series,
+                    2_000 + i * 5,
+                    series as f64 + (i as f64) * 0.5,
+                    i as u64,
+                ));
+            }
+        }
+        let (bytes, _) = encode_file(rows, (0, 10_000), &WriterOptions { page_rows: 32 }).unwrap();
+        let reader = TsfReader::from_bytes(bytes).unwrap();
+        let range = TimeRange::new(2_100, 2_250);
+        let mut ctx = ReadContext::new();
+        let single = reader
+            .read_metric_columns(9, range, ColumnMask::SAMPLE, &mut ctx)
+            .unwrap();
+        let parallel = scan_metric_parallel(
+            &reader,
+            9,
+            range,
+            ColumnMask::SAMPLE,
+            &ScanOptions {
+                workers: 4,
+                cache_bytes_per_worker: DEFAULT_CACHE_BYTES,
+                batch_rows: MAX_PAGE_ROWS,
+            },
+        )
+        .unwrap();
+        assert_eq!(parallel.workers, 4);
+        assert_eq!(single.len(), parallel.columns.len());
+        for (a, b) in single.iter().zip(&parallel.columns) {
+            assert_eq!(a.series_id, b.series_id);
+            assert_eq!(a.timestamps, b.timestamps);
+            assert_eq!(
+                a.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                b.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert!(parallel.stats.hits + parallel.stats.misses > 0);
     }
 }
