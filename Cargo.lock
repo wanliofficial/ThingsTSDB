@@ -917,6 +917,7 @@ dependencies = [
  "pb_types",
  "prost",
  "serde",
+ "storage_kernel",
  "temp-dir",
  "test-log",
  "tokio",

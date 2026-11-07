@@ -28,6 +28,7 @@ pub mod sst;
 pub mod storage;
 #[cfg(test)]
 mod test_util;
+pub mod tsf;
 pub mod types;
 mod wal;
 
