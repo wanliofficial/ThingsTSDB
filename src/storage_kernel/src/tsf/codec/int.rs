@@ -234,7 +234,7 @@ fn marshal_var_int64s_slow(dst: &mut Vec<u8>, vs: &[i64]) {
 
 /// Zig-zag decodes `u`.
 #[inline]
-fn zigzag_decode(u: u64) -> i64 {
+pub(crate) fn zigzag_decode(u: u64) -> i64 {
     ((u >> 1) as i64) ^ (((u << 63) as i64) >> 63)
 }
 
@@ -314,7 +314,7 @@ pub fn unmarshal_var_int64s<'a>(dst: &mut [i64], src: &'a [u8]) -> Result<&'a [u
 /// possible, advancing `*idx`. Falls back to the per-byte reader near the
 /// end of `src` and for varints longer than 8 bytes.
 #[inline]
-fn read_var_uint64_fast(src: &[u8], idx: &mut usize) -> Result<u64, String> {
+pub(crate) fn read_var_uint64_fast(src: &[u8], idx: &mut usize) -> Result<u64, String> {
     let start = *idx;
     if let Some(window) = src.get(start..start + 8) {
         let w = u64::from_le_bytes(window.try_into().expect("window is 8 bytes"));

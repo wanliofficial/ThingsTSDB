@@ -97,16 +97,12 @@ pub(crate) fn unmarshal_int64_nearest_delta2(
         dst.resize(dst_len + items_count, 0);
         let a = &mut dst[dst_len..];
 
-        let mut v = first_value;
-        let mut d1 = is[0];
-        a[0] = v;
-        v = v.wrapping_add(d1);
-        a[1] = v;
-        for (i, &d2) in is[1..].iter().enumerate() {
-            d1 = d1.wrapping_add(d2);
-            v = v.wrapping_add(d1);
-            a[i + 2] = v;
-        }
+        // First prefix pass turns [d1, d2, ...] into deltas, the second turns
+        // deltas into values. Both passes are vectorised.
+        super::simd::prefix_sum_i64_in_place(is, 0);
+        super::simd::prefix_sum_i64_in_place(is, first_value);
+        a[0] = first_value;
+        a[1..].copy_from_slice(is);
         Ok(())
     })
 }

@@ -273,21 +273,14 @@ pub(crate) fn unmarshal_int64_array(
                     src.len()
                 ));
             }
-            if first_value == 0 {
-                fastnum::append_int64_zeros(dst, items_count);
-                return Ok(());
-            }
-            if first_value == 1 {
-                fastnum::append_int64_ones(dst, items_count);
-                return Ok(());
-            }
-            for _ in 0..items_count {
-                dst.push(first_value);
+            let start = dst.len();
+            dst.resize(start + items_count, 0);
+            if first_value != 0 {
+                super::simd::fill_i64(&mut dst[start..], first_value);
             }
             Ok(())
         }
         MarshalType::DeltaConst => {
-            let mut v = first_value;
             let (d, n_len) = unmarshal_var_int64(src)
                 .ok_or_else(|| "cannot unmarshal delta value for delta const".to_string())?;
             if n_len < src.len() {
@@ -296,10 +289,9 @@ pub(crate) fn unmarshal_int64_array(
                     src.len() - n_len
                 ));
             }
-            for _ in 0..items_count {
-                dst.push(v);
-                v = v.wrapping_add(d);
-            }
+            let start = dst.len();
+            dst.resize(start + items_count, 0);
+            super::simd::fill_delta_i64(&mut dst[start..], first_value, d);
             Ok(())
         }
     }

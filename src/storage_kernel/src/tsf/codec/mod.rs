@@ -27,6 +27,7 @@ mod float;
 mod int;
 mod nearest_delta;
 mod nearest_delta2;
+pub mod simd;
 
 #[cfg(test)]
 mod testutil;
@@ -38,17 +39,22 @@ pub use encoding::*;
 pub use float::*;
 pub use int::*;
 
-/// Runs `f` with a zero-filled thread-local `Vec<i64>` scratch buffer of length
-/// `len`.
-pub(crate) fn with_int64_scratch<R>(len: usize, f: impl FnOnce(&mut Vec<i64>) -> R) -> R {
+/// Runs `f` with a thread-local `Vec<i64>` scratch buffer of exactly `len`
+/// items.
+///
+/// The buffer is grown when needed but never cleared; callers must overwrite
+/// every element before reading it. This avoids the per-page zero-fill of the
+/// reference implementation while keeping the scratch allocation warm.
+pub(crate) fn with_int64_scratch<R>(len: usize, f: impl FnOnce(&mut [i64]) -> R) -> R {
     thread_local! {
         static SCRATCH: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     }
     SCRATCH.with(|cell| {
         let mut v = cell.borrow_mut();
-        v.clear();
-        v.resize(len, 0);
-        f(&mut v)
+        if v.len() < len {
+            v.resize(len, 0);
+        }
+        f(&mut v[..len])
     })
 }
 
@@ -65,15 +71,5 @@ mod fastnum {
     #[inline]
     pub(super) fn is_int64_ones(a: &[i64]) -> bool {
         a.iter().all(|&v| v == 1)
-    }
-
-    #[inline]
-    pub(super) fn append_int64_zeros(dst: &mut Vec<i64>, n: usize) {
-        dst.resize(dst.len() + n, 0);
-    }
-
-    #[inline]
-    pub(super) fn append_int64_ones(dst: &mut Vec<i64>, n: usize) {
-        dst.resize(dst.len() + n, 1);
     }
 }

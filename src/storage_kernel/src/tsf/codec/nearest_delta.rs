@@ -86,12 +86,9 @@ pub(crate) fn unmarshal_int64_nearest_delta(
             ));
         }
 
-        let mut v = first_value;
-        dst.push(v);
-        for &d in is.iter() {
-            v = v.wrapping_add(d);
-            dst.push(v);
-        }
+        dst.push(first_value);
+        super::simd::prefix_sum_i64_in_place(is, first_value);
+        dst.extend_from_slice(is);
         Ok(())
     })
 }
