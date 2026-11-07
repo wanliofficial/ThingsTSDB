@@ -72,7 +72,7 @@ fn main() -> Result<(), String> {
         stats.series,
         stats.groups
     );
-    let reader = TsfReader::from_bytes(tsf_bytes)?;
+    let reader = TsfReader::from_bytes(tsf_bytes.clone())?;
     println!("File identity: 0x{:016x}", reader.file_identity());
     println!();
 
@@ -80,6 +80,7 @@ fn main() -> Result<(), String> {
     benchmark_columns(&reader, rows)?;
     benchmark_parallel(&reader, rows)?;
     benchmark_arrow_scan(&reader, rows)?;
+    benchmark_on_disk(&tsf_bytes, rows)?;
     benchmark_selective(&reader, series, samples)?;
     Ok(())
 }
@@ -212,6 +213,51 @@ fn benchmark_arrow_scan(reader: &TsfReader, rows: u64) -> Result<(), String> {
             emitted as f64 / batches.len().max(1) as f64
         );
     });
+    debug_assert_eq!(emitted, rows as usize);
+    Ok(())
+}
+
+/// Measures the on-disk path: `TsfReader::open` (whole-file read through the
+/// page cache) plus the Arrow scan, and the same scan on a warm reader.
+fn benchmark_on_disk(bytes: &[u8], rows: u64) -> Result<(), String> {
+    let path = std::env::temp_dir().join(format!("phase2-bench-{}.tsf", std::process::id()));
+    std::fs::write(&path, bytes).map_err(|e| format!("cannot write {path:?}: {e}"))?;
+    // Warm the page cache so the measurement is not dominated by first touch.
+    let _ = TsfReader::open(&path)?;
+
+    let request =
+        columnar_storage::tsf::TsfScanRequest::new(METRIC_ID, TimeRange::new(i64::MIN, i64::MAX));
+
+    let (open_elapsed, opened) = time_best(3, || TsfReader::open(&path))?;
+    println!(
+        "On-disk open (whole-file read, warm cache): {:.3} ms, identity=0x{:016x}",
+        open_elapsed.as_secs_f64() * 1e3,
+        opened.file_identity()
+    );
+
+    let warm = TsfReader::open(&path)?;
+    let (warm_elapsed, batches) = time_best(3, || columnar_storage::tsf::scan(&warm, &request))?;
+    let emitted: usize = batches.iter().map(|b| b.num_rows()).sum();
+    report(
+        "On-disk Arrow scan (warm reader)",
+        warm_elapsed,
+        emitted,
+        || {},
+    );
+
+    let (combined_elapsed, combined_rows) = time_best(3, || {
+        let reader = TsfReader::open(&path)?;
+        let batches = columnar_storage::tsf::scan(&reader, &request)?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum::<usize>())
+    })?;
+    report(
+        "On-disk open + Arrow scan",
+        combined_elapsed,
+        combined_rows,
+        || {},
+    );
+
+    let _ = std::fs::remove_file(&path);
     debug_assert_eq!(emitted, rows as usize);
     Ok(())
 }
