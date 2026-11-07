@@ -433,45 +433,81 @@ impl ParquetReader {
         predicates: Vec<Expr>,
         keep_builtin: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // we won't use url for selecting object_store.
-        let dummy_url = ObjectStoreUrl::parse("empty://").unwrap();
+        // ADR-0002 §7.2: during migration both formats are selected and merged.
+        let (parquet_ssts, tsf_ssts): (Vec<SstFile>, Vec<SstFile>) =
+            ssts.into_iter().partition(|f| !f.meta().is_tsf());
+
         let df_schema =
             DFSchema::try_from(self.schema.arrow_schema.clone()).context("build DFSchema")?;
         let sort_exprs = self.build_sort_exprs(&df_schema, true /* sort_seq */)?;
 
-        let file_groups = ssts
-            .into_iter()
-            .map(|f| {
-                vec![PartitionedFile::new(
-                    self.sst_path_gen.generate(f.id()),
-                    f.meta().size as u64,
-                )]
-            })
-            .collect::<Vec<_>>();
-        let scan_config = FileScanConfig::new(dummy_url, self.schema.arrow_schema.clone())
-            .with_output_ordering(vec![sort_exprs.clone(); file_groups.len()])
-            .with_file_groups(file_groups)
-            .with_projection(projection);
+        // Build one physical plan per format and merge under the sort.
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        if !parquet_ssts.is_empty() {
+            plans.push(self.build_parquet_plan(
+                parquet_ssts,
+                projection.clone(),
+                predicates.clone(),
+                sort_exprs.clone(),
+            )?);
+        }
+        if !tsf_ssts.is_empty() {
+            let files = tsf_ssts
+                .into_iter()
+                .map(|f| crate::tsf::TsfFile {
+                    path: object_store::path::Path::from(
+                        self.sst_path_gen.generate_for(f.id(), f.meta()),
+                    ),
+                    time_range: f.meta().time_range.clone(),
+                })
+                .collect::<Vec<_>>();
+            let range = files
+                .iter()
+                .fold(None::<crate::types::TimeRange>, |acc, f| match acc {
+                    None => Some(f.time_range.clone()),
+                    Some(mut acc) => {
+                        acc.merge(&f.time_range);
+                        Some(acc)
+                    }
+                })
+                .unwrap_or_else(|| {
+                    crate::types::TimeRange::new(
+                        crate::types::Timestamp::MIN,
+                        crate::types::Timestamp::MAX,
+                    )
+                });
+            plans.push(Arc::new(
+                crate::tsf::TsfExec::try_new(
+                    self.store.clone(),
+                    self.schema.clone(),
+                    files,
+                    range,
+                    projection.clone(),
+                    sort_exprs.clone(),
+                )
+                .map_err(|e| anyhow::anyhow!("build TSF plan: {e}"))?,
+            ));
+        }
 
-        let mut builder = ParquetExec::builder(scan_config).with_parquet_file_reader_factory(
-            Arc::new(DefaultParquetFileReaderFactory::new(self.store.clone())),
-        );
+        let base_plan = match plans.len() {
+            0 => {
+                return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                    self.schema.arrow_schema.clone(),
+                )))
+            }
+            1 => plans.remove(0),
+            _ => Arc::new(datafusion::physical_plan::union::UnionExec::new(plans)),
+        };
+
         let base_plan: Arc<dyn ExecutionPlan> = match conjunction(predicates) {
             Some(expr) => {
                 let filters = create_physical_expr(&expr, &df_schema, &ExecutionProps::new())
                     .context("create physical expr")?;
-
-                builder = builder.with_predicate(filters.clone());
-                let parquet_exec = builder.build();
-
-                let filter_exec = FilterExec::try_new(filters, Arc::new(parquet_exec))
-                    .context("create filter exec")?;
+                let filter_exec =
+                    FilterExec::try_new(filters, base_plan).context("create filter exec")?;
                 Arc::new(filter_exec)
             }
-            None => {
-                let parquet_exec = builder.build();
-                Arc::new(parquet_exec)
-            }
+            None => base_plan,
         };
 
         // TODO: fetch using multiple threads since read from parquet will incur
@@ -492,6 +528,46 @@ impl ParquetReader {
         );
         Ok(Arc::new(merge_exec))
     }
+
+    fn build_parquet_plan(
+        &self,
+        ssts: Vec<SstFile>,
+        projection: Option<Vec<usize>>,
+        predicates: Vec<Expr>,
+        sort_exprs: LexOrdering,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // we won't use url for selecting object_store.
+        let dummy_url = ObjectStoreUrl::parse("empty://").unwrap();
+        let df_schema =
+            DFSchema::try_from(self.schema.arrow_schema.clone()).context("build DFSchema")?;
+
+        let file_groups = ssts
+            .into_iter()
+            .map(|f| {
+                vec![PartitionedFile::new(
+                    self.sst_path_gen.generate(f.id()),
+                    f.meta().size as u64,
+                )]
+            })
+            .collect::<Vec<_>>();
+        let scan_config = FileScanConfig::new(dummy_url, self.schema.arrow_schema.clone())
+            .with_output_ordering(vec![sort_exprs.clone(); file_groups.len()])
+            .with_file_groups(file_groups)
+            .with_projection(projection);
+
+        let mut builder = ParquetExec::builder(scan_config).with_parquet_file_reader_factory(
+            Arc::new(DefaultParquetFileReaderFactory::new(self.store.clone())),
+        );
+        match conjunction(predicates) {
+            Some(expr) => {
+                let filters = create_physical_expr(&expr, &df_schema, &ExecutionProps::new())
+                    .context("create physical expr")?;
+                builder = builder.with_predicate(filters);
+                Ok(Arc::new(builder.build()))
+            }
+            None => Ok(Arc::new(builder.build())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,7 +581,7 @@ mod tests {
         arrow_schema,
         operator::{BytesMergeOperator, LastValueOperator, MergeOperatorRef},
         record_batch,
-        sst::FileMeta,
+        sst::{FileFormat, FileMeta},
         test_util::{check_stream, make_sendable_record_batches},
     };
 
@@ -591,9 +667,11 @@ mod tests {
                             id,
                             FileMeta {
                                 max_sequence: id,
+                                min_sequence: 0,
                                 num_rows: 1,
                                 size: 1,
                                 time_range: (1..10).into(),
+                                format: FileFormat::Parquet,
                             },
                         )
                     })
