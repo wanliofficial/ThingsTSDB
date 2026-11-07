@@ -21,6 +21,7 @@
 pub mod bloom;
 pub mod checksum;
 pub mod codec;
+pub mod compaction;
 pub mod file;
 pub mod page;
 pub mod partition;

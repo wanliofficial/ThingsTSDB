@@ -601,20 +601,8 @@ pub fn encode_file(
             opts.page_rows
         ));
     }
-    rows.sort_unstable_by_key(|r| (r.metric_id, r.series_id, r.timestamp, r.sequence));
-    let mut deduped: Vec<Row> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let duplicate = deduped.last().is_some_and(|last| {
-            last.metric_id == row.metric_id
-                && last.series_id == row.series_id
-                && last.timestamp == row.timestamp
-        });
-        if duplicate {
-            *deduped.last_mut().unwrap() = row;
-        } else {
-            deduped.push(row);
-        }
-    }
+    super::compaction::dedup_lww(&mut rows);
+    let deduped = rows;
 
     let min_sequence = deduped.iter().map(|r| r.sequence).min().unwrap();
     let max_sequence = deduped.iter().map(|r| r.sequence).max().unwrap();
