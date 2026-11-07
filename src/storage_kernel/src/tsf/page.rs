@@ -808,6 +808,17 @@ mod tests {
     fn test_decode_page_into_randomized_differential() {
         // Milestone 1 gate: every projection must agree with the full scalar
         // oracle across mixed codecs, NaN levels, duplicates and edge values.
+        run_randomized_differential(128);
+    }
+
+    #[test]
+    #[ignore = "100k-page nightly differential; run explicitly with --ignored"]
+    fn test_decode_page_into_randomized_differential_nightly() {
+        // Nightly gate from the plan: 100k randomized pages in CI, 1M nightly.
+        run_randomized_differential(100_000);
+    }
+
+    fn run_randomized_differential(cases: usize) {
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = move || {
             state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -825,7 +836,8 @@ mod tests {
             ColumnMask::RESERVED,
             ColumnMask::TIMESTAMP | ColumnMask::SEQUENCE | ColumnMask::RESERVED,
         ];
-        for case in 0..128usize {
+        let mut buffers = PageBuffers::new();
+        for case in 0..cases {
             let n = 1 + (next() as usize % 513);
             let mut timestamp = 1_700_000_000_000i64;
             let mut input = Vec::with_capacity(n);
@@ -855,7 +867,6 @@ mod tests {
             let (bytes, _) = encode_page(&input).unwrap();
             let oracle = decode_page(&bytes).unwrap();
             for mask in masks {
-                let mut buffers = PageBuffers::new();
                 decode_page_into(&bytes, mask, &mut buffers).unwrap();
                 assert_eq!(buffers.row_count, n, "case {case}");
                 assert_selected_columns(&buffers, &oracle, mask);
