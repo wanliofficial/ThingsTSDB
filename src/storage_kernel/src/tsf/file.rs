@@ -2116,4 +2116,101 @@ mod tests {
         }
         assert!(parallel.stats.hits + parallel.stats.misses > 0);
     }
+
+    /// T1 acceptance: a 1M-row file must round-trip every column exactly.
+    ///
+    /// Kept in the normal suite: it runs in a few seconds and guards the page
+    /// boundaries, the index and the NaN/reserved columns at file scale.
+    #[test]
+    fn test_one_million_row_roundtrip() {
+        const SERIES: u64 = 1000;
+        const SAMPLES: i64 = 1000;
+        let interval = 15_000i64;
+        let base = 1_700_000_000_000i64;
+
+        let mut rows = Vec::with_capacity((SERIES * SAMPLES as u64) as usize);
+        for series in 0..SERIES {
+            for i in 0..SAMPLES {
+                let value = if i == 17 && series == 33 {
+                    f64::NAN
+                } else {
+                    series as f64 * 0.5 + (i as f64 * 0.01).sin()
+                };
+                rows.push(Row {
+                    metric_id: 1,
+                    series_id: series,
+                    timestamp: base + i * interval,
+                    value,
+                    sequence: 1000 + i as u64,
+                    reserved: (series + i as u64) % 3,
+                });
+            }
+        }
+        let expected_rows = rows.len() as u64;
+
+        let (bytes, stats) = encode_file(
+            rows,
+            (base, base + SAMPLES * interval),
+            &WriterOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(stats.rows, expected_rows);
+        assert_eq!(stats.series, SERIES);
+        assert!(
+            bytes.len() < 16 * 1024 * 1024,
+            "unexpected file size {}",
+            bytes.len()
+        );
+
+        let reader = TsfReader::from_bytes(bytes).unwrap();
+        assert_eq!(reader.header().row_count, expected_rows);
+        assert_eq!(reader.header().series_count, SERIES);
+        assert_eq!(reader.metric_ids(), vec![1]);
+
+        // Full column scan must reproduce every row, including the NaN bits and
+        // the reserved column.
+        let mut ctx = ReadContext::new();
+        let columns = reader
+            .read_metric_columns(
+                1,
+                TimeRange::new(i64::MIN, i64::MAX),
+                ColumnMask::ALL,
+                &mut ctx,
+            )
+            .unwrap();
+        let scanned: u64 = columns.iter().map(|c| c.len() as u64).sum();
+        assert_eq!(scanned, expected_rows);
+        let mut checked = 0u64;
+        for column in &columns {
+            let series = column.series_id;
+            assert_eq!(column.len() as i64, SAMPLES);
+            for (i, timestamp) in column.timestamps.iter().enumerate() {
+                assert_eq!(*timestamp, base + i as i64 * interval);
+            }
+            for (i, value) in column.values.iter().enumerate() {
+                let expected = if i == 17 && series == 33 {
+                    f64::NAN
+                } else {
+                    series as f64 * 0.5 + (i as f64 * 0.01).sin()
+                };
+                assert_eq!(value.to_bits(), expected.to_bits());
+            }
+            for (i, sequence) in column.sequences.iter().enumerate() {
+                assert_eq!(*sequence, 1000 + i as u64);
+            }
+            for (i, reserved) in column.reserved.iter().enumerate() {
+                assert_eq!(*reserved, (series + i as u64) % 3);
+            }
+            checked += column.len() as u64;
+        }
+        assert_eq!(checked, expected_rows);
+
+        // A single-series read still works on a ~630-page file.
+        let one = reader
+            .read_series(1, 500, TimeRange::new(base, base + 5 * interval), None)
+            .unwrap();
+        assert_eq!(one.len(), 5);
+        assert_eq!(one[0].series_id, 500);
+        assert_eq!(one.last().unwrap().timestamp, base + 4 * interval);
+    }
 }
