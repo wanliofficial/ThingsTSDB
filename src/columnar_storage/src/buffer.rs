@@ -30,7 +30,11 @@ use std::{
 };
 
 use anyhow::Context;
-use arrow::{array::RecordBatch, compute::concat_batches};
+use arrow::{
+    array::{Array, RecordBatch},
+    compute::concat_batches,
+};
+use bytes::Bytes;
 use datafusion::{
     common::DFSchema,
     execution::{context::ExecutionProps, SendableRecordBatchStream},
@@ -41,18 +45,19 @@ use datafusion::{
     prelude::SessionContext,
 };
 use futures::StreamExt;
-use object_store::path::Path;
+use object_store::{path::Path, PutPayload};
 use parquet::{
     arrow::{async_writer::ParquetObjectWriter, AsyncArrowWriter},
     file::properties::WriterProperties,
 };
+use storage_kernel::tsf::file::{encode_file, WriterOptions};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error};
 
 use crate::{
     config::BufferConfig,
     manifest::ManifestRef,
-    sst::{FileMeta, SstFile, SstPathGenerator},
+    sst::{FileFormat, FileId, FileMeta, SstFile, SstPathGenerator},
     storage::WriteRequest,
     types::{ObjectStoreRef, RuntimeRef, StorageSchema, TimeRange, SEQ_COLUMN_NAME},
     wal::{Wal, WalFrame},
@@ -137,6 +142,7 @@ pub(crate) struct FlushState {
     sst_path_gen: Arc<SstPathGenerator>,
     manifest: ManifestRef,
     segment_duration: Duration,
+    format: FileFormat,
     buffer: StdMutex<BufferState>,
     wal: Option<Wal>,
     write_lock: Mutex<()>,
@@ -152,6 +158,7 @@ impl FlushState {
         sst_path_gen: Arc<SstPathGenerator>,
         manifest: ManifestRef,
         segment_duration: Duration,
+        format: FileFormat,
         buffer_config: &BufferConfig,
         wal: Option<Wal>,
     ) -> Self {
@@ -162,6 +169,7 @@ impl FlushState {
             sst_path_gen,
             manifest,
             segment_duration,
+            format,
             buffer: StdMutex::new(BufferState::new(buffer_config)),
             wal,
             write_lock: Mutex::new(()),
@@ -315,32 +323,18 @@ impl FlushState {
         let mut sorted = sort_batch(&self.schema, combined, true).await?;
 
         let file_id = SstFile::allocate_id();
-        let file_path = Path::from(self.sst_path_gen.generate(file_id));
-        let object_writer = ParquetObjectWriter::new(self.store.clone(), file_path.clone());
-        let mut writer = AsyncArrowWriter::try_new(
-            object_writer,
-            self.schema.arrow_schema.clone(),
-            Some(self.write_props.clone()),
-        )
-        .context("create arrow writer")?;
-        let mut written_rows = 0;
-        while let Some(batch) = sorted.next().await {
-            let batch = batch.context("get sorted batch")?;
-            written_rows += batch.num_rows();
-            writer.write(&batch).await.context("write arrow batch")?;
-        }
-        writer.close().await.context("close arrow writer")?;
-        let object_meta = self
-            .store
-            .head(&file_path)
-            .await
-            .context("get object meta")?;
+        let (object_size, written_rows, min_seq) = match self.format {
+            FileFormat::Parquet => self.write_parquet(file_id, &mut sorted).await?,
+            FileFormat::Tsf => self.write_tsf(file_id, &mut sorted, &time_range).await?,
+        };
 
         let file_meta = FileMeta {
             max_sequence: max_seq,
+            min_sequence: min_seq,
             num_rows: written_rows as u32,
-            size: object_meta.size as u32,
+            size: object_size as u32,
             time_range,
+            format: self.format,
         };
         self.manifest.add_file(file_id, file_meta).await?;
         debug!(
@@ -351,6 +345,84 @@ impl FlushState {
             "Flushed write buffer"
         );
         Ok(())
+    }
+
+    /// Streams the sorted batches into a Parquet object. Returns
+    /// `(size_bytes, rows, min_sequence)`.
+    async fn write_parquet(
+        &self,
+        file_id: FileId,
+        sorted: &mut SendableRecordBatchStream,
+    ) -> Result<(u64, usize, u64)> {
+        let file_path = Path::from(self.sst_path_gen.generate(file_id));
+        let object_writer = ParquetObjectWriter::new(self.store.clone(), file_path.clone());
+        let mut writer = AsyncArrowWriter::try_new(
+            object_writer,
+            self.schema.arrow_schema.clone(),
+            Some(self.write_props.clone()),
+        )
+        .context("create arrow writer")?;
+        let mut written_rows = 0;
+        let mut min_seq = u64::MAX;
+        while let Some(batch) = sorted.next().await {
+            let batch = batch.context("get sorted batch")?;
+            written_rows += batch.num_rows();
+            min_seq = min_seq.min(min_seq_of_batch(&batch, self.schema.seq_idx)?);
+            writer.write(&batch).await.context("write arrow batch")?;
+        }
+        writer.close().await.context("close arrow writer")?;
+        let object_meta = self
+            .store
+            .head(&file_path)
+            .await
+            .context("get object meta")?;
+        Ok((
+            object_meta.size as u64,
+            written_rows,
+            if written_rows == 0 { 0 } else { min_seq },
+        ))
+    }
+
+    /// Encodes the sorted batches into one TSF object. TSF is single-file, so
+    /// the whole segment is materialized before writing. Returns
+    /// `(size_bytes, rows, min_sequence)`.
+    async fn write_tsf(
+        &self,
+        file_id: FileId,
+        sorted: &mut SendableRecordBatchStream,
+        time_range: &TimeRange,
+    ) -> Result<(u64, usize, u64)> {
+        use storage_kernel::tsf::partition::{partition_end, partition_start};
+
+        let start = partition_start(*time_range.start);
+        let end = partition_end(*time_range.start);
+        crate::ensure!(
+            *time_range.end <= end,
+            "TSF file spans more than one day: {:?}",
+            time_range
+        );
+
+        let mut rows = Vec::new();
+        let mut written_rows = 0;
+        while let Some(batch) = sorted.next().await {
+            let batch = batch.context("get sorted batch")?;
+            written_rows += batch.num_rows();
+            rows.extend(
+                crate::tsf::write::batch_to_rows(&batch, &self.schema)
+                    .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
+            );
+        }
+        let (bytes, _stats) = encode_file(rows, (start, end), &WriterOptions::default())
+            .map_err(|e| anyhow::anyhow!("encode TSF file: {e}"))?;
+        let object_size = bytes.len() as u64;
+        let (min_seq, _) = sequence_span(&bytes)?;
+
+        let file_path = Path::from(self.sst_path_gen.generate_tsf(file_id, start));
+        self.store
+            .put(&file_path, PutPayload::from_bytes(Bytes::from(bytes)))
+            .await
+            .context("write TSF object")?;
+        Ok((object_size, written_rows, min_seq))
     }
 
     pub(crate) fn buffer_is_empty(&self) -> bool {
@@ -404,6 +476,31 @@ pub(crate) async fn sort_batch(
     let physical_plan = Arc::new(SortExec::new(sort_exprs, Arc::new(batch_plan)));
 
     Ok(execute_stream(physical_plan, ctx.task_ctx()).context("execute sort physical plan")?)
+}
+
+/// Minimum `__seq__` in a batch; assumes a non-null sequence column.
+fn min_seq_of_batch(batch: &RecordBatch, seq_idx: usize) -> Result<u64> {
+    use arrow::array::UInt64Array;
+    let column = batch
+        .column(seq_idx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .context("sequence column is not UInt64")?;
+    let mut min = u64::MAX;
+    for i in 0..column.len() {
+        if !column.is_null(i) {
+            min = min.min(column.value(i));
+        }
+    }
+    Ok(min)
+}
+
+/// Reads the `(min_sequence, max_sequence)` span from an encoded TSF file.
+fn sequence_span(bytes: &[u8]) -> Result<(u64, u64)> {
+    let reader = storage_kernel::tsf::file::TsfReader::from_bytes(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("reopen encoded TSF file: {e}"))?;
+    let header = reader.header();
+    Ok((header.min_sequence, header.max_sequence))
 }
 
 fn build_sort_exprs(

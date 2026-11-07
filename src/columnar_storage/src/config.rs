@@ -210,6 +210,27 @@ pub struct StorageConfig {
     pub buffer: BufferConfig,
     pub wal: WalConfig,
     pub update_mode: UpdateMode,
+    /// Data file format written by the flush and compaction paths. Parquet is
+    /// the default; `tsf` opts into the ADR-0002 single-file format.
+    pub format: DataFileFormat,
+}
+
+/// On-disk data file format selected by [`StorageConfig::format`].
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DataFileFormat {
+    #[default]
+    Parquet,
+    Tsf,
+}
+
+impl From<DataFileFormat> for crate::sst::FileFormat {
+    fn from(value: DataFileFormat) -> Self {
+        match value {
+            DataFileFormat::Parquet => crate::sst::FileFormat::Parquet,
+            DataFileFormat::Tsf => crate::sst::FileFormat::Tsf,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]

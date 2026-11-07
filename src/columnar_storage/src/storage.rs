@@ -147,6 +147,7 @@ impl ObjectBasedStorage {
         .await?;
         let manifest = Arc::new(manifest);
         let write_props = Self::build_write_props(storage_opts.write, num_primary_keys);
+        let format = storage_opts.format.clone().into();
         let sst_path_gen = Arc::new(SstPathGenerator::new(path.clone()));
         let parquet_reader = Arc::new(ParquetReader::new(
             store.clone(),
@@ -163,6 +164,7 @@ impl ObjectBasedStorage {
             parquet_reader.clone(),
             storage_opts.scheduler,
             write_props.clone(),
+            format,
         );
 
         let wal = if storage_opts.wal.enabled {
@@ -177,6 +179,7 @@ impl ObjectBasedStorage {
             sst_path_gen.clone(),
             manifest.clone(),
             segment_duration,
+            format,
             &storage_opts.buffer,
             wal,
         ));
@@ -497,6 +500,227 @@ mod tests {
             assert_eq!(actual, expected);
             assert_eq!(storage.manifest.all_ssts().await.len(), 1);
         });
+    }
+
+    /// End-to-end TSF path: flush writes a `.tsf` object under the day
+    /// partition directory, the manifest records `format = Tsf`, and a scan
+    /// reads the file back through `TsfExec` (ADR-0002 §7.2, §8.1).
+    #[test(test)]
+    fn test_storage_tsf_flush_and_scan() {
+        use object_store::path::Path;
+        use storage_kernel::tsf::partition::partition_label;
+
+        use crate::sst::FileFormat;
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let runtimes = build_runtimes();
+        runtimes.sst_compact_runtime.clone().block_on(async move {
+            let mut config = config_without_periodic_flush();
+            config.format = crate::config::DataFileFormat::Tsf;
+            let storage = ObjectBasedStorage::try_new(
+                root_dir.path().to_string_lossy().to_string(),
+                Duration::from_hours(2),
+                store,
+                schema.clone(),
+                3, // metric_id, tsid, timestamp
+                config,
+                runtimes,
+            )
+            .await
+            .unwrap();
+
+            // 2023-11-14T22:13:20Z, comfortably inside one UTC day and one
+            // 2-hour segment.
+            let t0 = 1_700_000_000_000i64;
+            let batch = record_batch!(
+                ("metric_id", UInt64, vec![1, 1, 1]),
+                ("tsid", UInt64, vec![10, 10, 11]),
+                ("timestamp", Int64, vec![t0, t0 + 1, t0 + 2]),
+                ("value", Float64, vec![1.5, 2.5, 3.5])
+            )
+            .unwrap();
+            storage
+                .write(WriteRequest {
+                    batch,
+                    time_range: (t0..t0 + 10).into(),
+                    enable_check: true,
+                })
+                .await
+                .unwrap();
+
+            let result_stream = storage
+                .scan(ScanRequest {
+                    range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                    predicate: vec![],
+                    projections: None,
+                })
+                .await
+                .unwrap();
+            let actual = collect_batch(result_stream).await;
+            let expected = record_batch!(
+                ("metric_id", UInt64, vec![1, 1, 1]),
+                ("tsid", UInt64, vec![10, 10, 11]),
+                ("timestamp", Int64, vec![t0, t0 + 1, t0 + 2]),
+                ("value", Float64, vec![1.5, 2.5, 3.5])
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+
+            // The manifest must describe exactly one TSF file whose object
+            // lives under the day partition directory.
+            let ssts = storage.manifest.all_ssts().await;
+            assert_eq!(ssts.len(), 1);
+            let sst = &ssts[0];
+            assert_eq!(sst.meta().format, FileFormat::Tsf);
+            assert_eq!(sst.meta().num_rows, 3);
+            assert!(sst.meta().min_sequence > 0);
+
+            let path = storage.sst_path_gen.generate_for(sst.id(), sst.meta());
+            assert!(
+                path.ends_with(".tsf"),
+                "TSF object path should end with .tsf, got {path}"
+            );
+            assert!(
+                path.contains(&format!("/data/{}/", partition_label(t0))),
+                "TSF object should live under the day partition, got {path}"
+            );
+            storage
+                .store
+                .get(&Path::from(path))
+                .await
+                .expect("TSF object must exist");
+        });
+    }
+
+    /// Migration dual-read: an old Parquet SST and a new TSF SST in the same
+    /// root must both be read and merged (ADR-0002 §7.2, §10).
+    #[test(test)]
+    fn test_storage_dual_read_parquet_and_tsf() {
+        use crate::config::DataFileFormat;
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let path = root_dir.path().to_string_lossy().to_string();
+        let t0 = 1_700_000_000_000i64;
+
+        // Phase 1: write a Parquet SST with the legacy (default) format.
+        {
+            let rt = Arc::new(Runtime::new().unwrap());
+            let runtimes = StorageRuntimes::new(rt.clone(), rt.clone());
+            let path = path.clone();
+            let schema = schema.clone();
+            rt.block_on(async move {
+                let storage = ObjectBasedStorage::try_new(
+                    path.clone(),
+                    Duration::from_hours(2),
+                    Arc::new(LocalFileSystem::new()),
+                    schema.clone(),
+                    3,
+                    config_without_periodic_flush(),
+                    runtimes,
+                )
+                .await
+                .unwrap();
+                let batch = record_batch!(
+                    ("metric_id", UInt64, vec![1]),
+                    ("tsid", UInt64, vec![10]),
+                    ("timestamp", Int64, vec![t0]),
+                    ("value", Float64, vec![1.5])
+                )
+                .unwrap();
+                storage
+                    .write(WriteRequest {
+                        batch,
+                        time_range: (t0..t0 + 1).into(),
+                        enable_check: true,
+                    })
+                    .await
+                    .unwrap();
+                storage.flush_state.flush().await.unwrap();
+            });
+        }
+
+        // Phase 2: reopen the same root with TSF enabled and write another row.
+        // The scan must union both formats and merge on the primary keys.
+        {
+            let rt = Arc::new(Runtime::new().unwrap());
+            let runtimes = StorageRuntimes::new(rt.clone(), rt.clone());
+            rt.block_on(async move {
+                let mut config = config_without_periodic_flush();
+                config.format = DataFileFormat::Tsf;
+                let storage = ObjectBasedStorage::try_new(
+                    path,
+                    Duration::from_hours(2),
+                    Arc::new(LocalFileSystem::new()),
+                    schema,
+                    3,
+                    config,
+                    runtimes,
+                )
+                .await
+                .unwrap();
+                // Same (metric_id, tsid, timestamp) key with a newer value must
+                // win the LWW merge across formats.
+                let batch = record_batch!(
+                    ("metric_id", UInt64, vec![1, 1]),
+                    ("tsid", UInt64, vec![10, 11]),
+                    ("timestamp", Int64, vec![t0, t0 + 1]),
+                    ("value", Float64, vec![9.5, 2.5])
+                )
+                .unwrap();
+                storage
+                    .write(WriteRequest {
+                        batch,
+                        time_range: (t0..t0 + 2).into(),
+                        enable_check: true,
+                    })
+                    .await
+                    .unwrap();
+
+                let formats: Vec<_> = {
+                    storage.flush_state.flush().await.unwrap();
+                    storage
+                        .manifest
+                        .all_ssts()
+                        .await
+                        .iter()
+                        .map(|f| f.meta().format)
+                        .collect()
+                };
+                assert!(formats.contains(&crate::sst::FileFormat::Parquet));
+                assert!(formats.contains(&crate::sst::FileFormat::Tsf));
+
+                let result_stream = storage
+                    .scan(ScanRequest {
+                        range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                        predicate: vec![],
+                        projections: None,
+                    })
+                    .await
+                    .unwrap();
+                let actual = collect_batch(result_stream).await;
+                let expected = record_batch!(
+                    ("metric_id", UInt64, vec![1, 1]),
+                    ("tsid", UInt64, vec![10, 11]),
+                    ("timestamp", Int64, vec![t0, t0 + 1]),
+                    ("value", Float64, vec![9.5, 2.5])
+                )
+                .unwrap();
+                assert_eq!(actual, expected);
+            });
+        }
     }
 
     #[test(test)]

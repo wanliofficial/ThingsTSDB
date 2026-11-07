@@ -21,9 +21,13 @@
 //! the conversion from typed columns to Arrow batches, zero-copy where the
 //! buffer ownership allows it, and the ~8,192-row batching contract.
 
+pub mod exec;
 pub mod scan;
+pub mod write;
 
+pub use exec::{TsfExec, TsfFile};
 pub use scan::{
     decoded_columns_to_batch, filter_by_sequence, kernel_time_range, scan, scan_metric,
     scan_series, tsf_schema, BatchBuilder, TsfScanOptions, TsfScanRequest,
 };
+pub use write::{batch_to_rows, encode_batch};
