@@ -74,6 +74,15 @@ pub trait ColumnarStorage {
     async fn scan(&self, req: ScanRequest) -> Result<SendableRecordBatchStream>;
 
     async fn compact(&self, req: CompactRequest) -> Result<()>;
+
+    /// Rewrites every Parquet SST to TSF and swaps them in the manifest
+    /// (ADR-0002 §10 step 4). A no-op when the table is already all-TSF.
+    ///
+    /// Safe to call repeatedly: rewritten files are skipped on later passes.
+    /// Files that span more than one UTC day are left as Parquet and reported.
+    async fn rewrite_legacy_files(&self) -> Result<crate::tsf::RewriteReport> {
+        Err(anyhow::anyhow!("rewrite_legacy_files is not supported by this storage").into())
+    }
 }
 
 pub type ColumnarStorageRef = Arc<dyn ColumnarStorage + Send + Sync>;
@@ -312,6 +321,22 @@ impl ColumnarStorage for ObjectBasedStorage {
     async fn compact(&self, _req: CompactRequest) -> Result<()> {
         self.flush_state.flush().await?;
         self.compact_scheduler.trigger_compaction()
+    }
+
+    async fn rewrite_legacy_files(&self) -> Result<crate::tsf::RewriteReport> {
+        // Flush first so the rewrite sees a complete manifest, and so nothing
+        // new lands in Parquet while it runs.
+        self.flush_state.flush().await?;
+        let ssts = self.manifest.all_ssts().await;
+        crate::tsf::rewrite_to_tsf(
+            &self.store,
+            &self.schema,
+            &self.manifest,
+            &self.parquet_reader,
+            &self.sst_path_gen,
+            ssts,
+        )
+        .await
     }
 }
 
@@ -721,6 +746,94 @@ mod tests {
                 assert_eq!(actual, expected);
             });
         }
+    }
+
+    /// Switching a table to TSF and then calling the storage-level rewrite
+    /// migrates the legacy Parquet files (ADR-0002 §10 step 4).
+    #[test(test)]
+    fn test_storage_rewrite_legacy_files() {
+        use crate::config::DataFileFormat;
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let path = root_dir.path().to_string_lossy().to_string();
+        let store = Arc::new(LocalFileSystem::new());
+        let t0 = 1_700_000_000_000i64;
+        let runtimes = build_runtimes();
+
+        runtimes.sst_compact_runtime.clone().block_on(async move {
+            let storage = ObjectBasedStorage::try_new(
+                path.clone(),
+                Duration::from_hours(2),
+                store,
+                schema.clone(),
+                3,
+                config_without_periodic_flush(),
+                runtimes,
+            )
+            .await
+            .unwrap();
+            let batch = record_batch!(
+                ("metric_id", UInt64, vec![1, 1]),
+                ("tsid", UInt64, vec![10, 11]),
+                ("timestamp", Int64, vec![t0, t0 + 1]),
+                ("value", Float64, vec![1.5, 2.5])
+            )
+            .unwrap();
+            storage
+                .write(WriteRequest {
+                    batch,
+                    time_range: (t0..t0 + 2).into(),
+                    enable_check: true,
+                })
+                .await
+                .unwrap();
+            storage.flush_state.flush().await.unwrap();
+            assert_eq!(storage.manifest.all_ssts().await.len(), 1);
+            assert_eq!(
+                storage.manifest.all_ssts().await[0].meta().format,
+                crate::sst::FileFormat::Parquet
+            );
+
+            let report = storage.rewrite_legacy_files().await.unwrap();
+            assert_eq!(report.rewritten_files, 1);
+            assert_eq!(report.output_rows, 2);
+            assert!(report.made_progress());
+
+            let ssts = storage.manifest.all_ssts().await;
+            assert_eq!(ssts.len(), 1);
+            assert_eq!(ssts[0].meta().format, crate::sst::FileFormat::Tsf);
+
+            // A second call is a no-op.
+            let report = storage.rewrite_legacy_files().await.unwrap();
+            assert!(!report.made_progress());
+
+            // Scanning still returns the rows.
+            let stream = storage
+                .scan(ScanRequest {
+                    range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                    predicate: vec![],
+                    projections: None,
+                })
+                .await
+                .unwrap();
+            let actual = collect_batch(stream).await;
+            let expected: arrow::array::RecordBatch = record_batch!(
+                ("metric_id", UInt64, vec![1, 1]),
+                ("tsid", UInt64, vec![10, 11]),
+                ("timestamp", Int64, vec![t0, t0 + 1]),
+                ("value", Float64, vec![1.5, 2.5])
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            // Silence the unused-import lint if the format switch is removed.
+            let _ = DataFileFormat::Tsf;
+        });
     }
 
     #[test(test)]
