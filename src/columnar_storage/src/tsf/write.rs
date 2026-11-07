@@ -22,6 +22,7 @@
 //! `storage_kernel::tsf` and encodes a single immutable file (ADR-0002 §3).
 //! `storage_kernel` stays Arrow-free, so the conversion lives here.
 
+use anyhow::Context;
 use arrow::{
     array::{Array, Float64Array, Int64Array, RecordBatch, UInt64Array},
     datatypes::DataType,
@@ -31,7 +32,7 @@ use storage_kernel::tsf::{
     Row,
 };
 
-use crate::types::{StorageSchema, RESERVED_COLUMN_NAME, SEQ_COLUMN_NAME};
+use crate::types::{StorageSchema, TimeRange, RESERVED_COLUMN_NAME, SEQ_COLUMN_NAME};
 
 /// Converts a sorted batch into rows for the TSF writer.
 ///
@@ -175,6 +176,73 @@ pub fn encode_batch(
 ) -> Result<(Vec<u8>, FileStats), String> {
     let rows = batch_to_rows(batch, schema)?;
     encode_file(rows, partition, &WriterOptions::default())
+}
+
+/// Resolves the UTC-day partition that bounds a TSF file.
+///
+/// Rejects a range that would span more than one day: a TSF file must belong to
+/// exactly one partition directory so a retention drop can delete it as a unit
+/// (ADR-0002 §8.1, §8.3).
+pub fn day_partition(time_range: &TimeRange) -> crate::Result<(i64, i64)> {
+    use storage_kernel::tsf::partition::{partition_end, partition_start};
+
+    let start = partition_start(*time_range.start);
+    let end = partition_end(*time_range.start);
+    crate::ensure!(
+        *time_range.end <= end,
+        "TSF file spans more than one day: {:?}",
+        time_range
+    );
+    Ok((start, end))
+}
+
+/// Streams sorted batches into one TSF object.
+///
+/// Shared by the flush path, compaction and the Parquet-to-TSF rewrite job so
+/// the encoding and day-boundary rules stay in one place. Returns
+/// `(object_size, rows, min_sequence)`.
+pub(crate) async fn write_stream(
+    store: &crate::types::ObjectStoreRef,
+    path_gen: &crate::sst::SstPathGenerator,
+    schema: &StorageSchema,
+    file_id: crate::sst::FileId,
+    stream: &mut datafusion::execution::SendableRecordBatchStream,
+    time_range: &TimeRange,
+) -> crate::Result<(u64, usize, u64)> {
+    use futures::StreamExt;
+
+    let (start, end) = day_partition(time_range)?;
+
+    let mut rows = Vec::new();
+    let mut written_rows = 0;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.context("get sorted batch")?;
+        written_rows += batch.num_rows();
+        rows.extend(
+            batch_to_rows(&batch, schema)
+                .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
+        );
+    }
+    let (bytes, _stats) = encode_file(rows, (start, end), &WriterOptions::default())
+        .map_err(|e| anyhow::anyhow!("encode TSF file: {e}"))?;
+    let object_size = bytes.len() as u64;
+
+    // Read the sequence span back from the encoded header instead of tracking
+    // it while streaming: `encode_file` dedups by LWW first, so the stored
+    // minimum is the authoritative one.
+    let reader = storage_kernel::tsf::file::TsfReader::from_bytes(bytes.clone())
+        .map_err(|e| anyhow::anyhow!("reopen encoded TSF file: {e}"))?;
+    let min_sequence = reader.header().min_sequence;
+
+    let object_path = object_store::path::Path::from(path_gen.generate_tsf(file_id, start));
+    store
+        .put(
+            &object_path,
+            object_store::PutPayload::from_bytes(bytes::Bytes::from(bytes)),
+        )
+        .await
+        .context("write TSF object")?;
+    Ok((object_size, written_rows, min_sequence))
 }
 
 #[cfg(test)]

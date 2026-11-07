@@ -22,10 +22,9 @@ use std::sync::{
 
 use anyhow::Context;
 use async_scoped::TokioScope;
-use bytes::Bytes;
 use datafusion::{execution::TaskContext, physical_plan::execute_stream};
 use futures::StreamExt;
-use object_store::{path::Path, PutPayload};
+use object_store::path::Path;
 use parquet::{
     arrow::{async_writer::ParquetObjectWriter, AsyncArrowWriter},
     file::properties::WriterProperties,
@@ -253,37 +252,15 @@ impl Executor {
                 (object_meta.size as u64, num_rows, min_sequence_of(task))
             }
             FileFormat::Tsf => {
-                use storage_kernel::tsf::{
-                    file::{encode_file, WriterOptions},
-                    partition::{partition_end, partition_start},
-                };
-                let start = partition_start(*time_range.start);
-                let end = partition_end(*time_range.start);
-                crate::ensure!(
-                    *time_range.end <= end,
-                    "TSF compaction output spans more than one day: {:?}",
-                    time_range
-                );
-                let mut rows = Vec::new();
-                let mut num_rows = 0;
-                while let Some(batch) = stream.next().await {
-                    let batch = batch.context("execute plan")?;
-                    num_rows += batch.num_rows();
-                    rows.extend(
-                        crate::tsf::write::batch_to_rows(&batch, &self.inner.schema)
-                            .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
-                    );
-                }
-                let (bytes, _stats) = encode_file(rows, (start, end), &WriterOptions::default())
-                    .map_err(|e| anyhow::anyhow!("encode TSF file: {e}"))?;
-                let size = bytes.len() as u64;
-                let path = Path::from(self.inner.sst_path_gen.generate_tsf(file_id, start));
-                self.inner
-                    .store
-                    .put(&path, PutPayload::from_bytes(Bytes::from(bytes)))
-                    .await
-                    .context("write TSF object")?;
-                (size, num_rows, min_sequence_of(task))
+                crate::tsf::write::write_stream(
+                    &self.inner.store,
+                    &self.inner.sst_path_gen,
+                    &self.inner.schema,
+                    file_id,
+                    &mut stream,
+                    &time_range,
+                )
+                .await?
             }
         };
         let file_meta = FileMeta {

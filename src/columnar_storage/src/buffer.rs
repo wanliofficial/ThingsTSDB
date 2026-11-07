@@ -34,7 +34,6 @@ use arrow::{
     array::{Array, RecordBatch},
     compute::concat_batches,
 };
-use bytes::Bytes;
 use datafusion::{
     common::DFSchema,
     execution::{context::ExecutionProps, SendableRecordBatchStream},
@@ -45,12 +44,11 @@ use datafusion::{
     prelude::SessionContext,
 };
 use futures::StreamExt;
-use object_store::{path::Path, PutPayload};
+use object_store::path::Path;
 use parquet::{
     arrow::{async_writer::ParquetObjectWriter, AsyncArrowWriter},
     file::properties::WriterProperties,
 };
-use storage_kernel::tsf::file::{encode_file, WriterOptions};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error};
 
@@ -392,37 +390,15 @@ impl FlushState {
         sorted: &mut SendableRecordBatchStream,
         time_range: &TimeRange,
     ) -> Result<(u64, usize, u64)> {
-        use storage_kernel::tsf::partition::{partition_end, partition_start};
-
-        let start = partition_start(*time_range.start);
-        let end = partition_end(*time_range.start);
-        crate::ensure!(
-            *time_range.end <= end,
-            "TSF file spans more than one day: {:?}",
-            time_range
-        );
-
-        let mut rows = Vec::new();
-        let mut written_rows = 0;
-        while let Some(batch) = sorted.next().await {
-            let batch = batch.context("get sorted batch")?;
-            written_rows += batch.num_rows();
-            rows.extend(
-                crate::tsf::write::batch_to_rows(&batch, &self.schema)
-                    .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
-            );
-        }
-        let (bytes, _stats) = encode_file(rows, (start, end), &WriterOptions::default())
-            .map_err(|e| anyhow::anyhow!("encode TSF file: {e}"))?;
-        let object_size = bytes.len() as u64;
-        let (min_seq, _) = sequence_span(&bytes)?;
-
-        let file_path = Path::from(self.sst_path_gen.generate_tsf(file_id, start));
-        self.store
-            .put(&file_path, PutPayload::from_bytes(Bytes::from(bytes)))
-            .await
-            .context("write TSF object")?;
-        Ok((object_size, written_rows, min_seq))
+        crate::tsf::write::write_stream(
+            &self.store,
+            &self.sst_path_gen,
+            &self.schema,
+            file_id,
+            sorted,
+            time_range,
+        )
+        .await
     }
 
     pub(crate) fn buffer_is_empty(&self) -> bool {
@@ -493,14 +469,6 @@ fn min_seq_of_batch(batch: &RecordBatch, seq_idx: usize) -> Result<u64> {
         }
     }
     Ok(min)
-}
-
-/// Reads the `(min_sequence, max_sequence)` span from an encoded TSF file.
-fn sequence_span(bytes: &[u8]) -> Result<(u64, u64)> {
-    let reader = storage_kernel::tsf::file::TsfReader::from_bytes(bytes.to_vec())
-        .map_err(|e| anyhow::anyhow!("reopen encoded TSF file: {e}"))?;
-    let header = reader.header();
-    Ok((header.min_sequence, header.max_sequence))
 }
 
 fn build_sort_exprs(
