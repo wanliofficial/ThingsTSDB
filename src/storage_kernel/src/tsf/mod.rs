@@ -23,6 +23,7 @@ pub mod checksum;
 pub mod codec;
 pub mod file;
 pub mod page;
+pub mod partition;
 
 pub use page::{ColumnMask, PageBuffers};
 
