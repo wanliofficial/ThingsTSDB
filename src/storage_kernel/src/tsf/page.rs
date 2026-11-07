@@ -702,4 +702,100 @@ mod tests {
         let err = decode_page(&bytes).unwrap_err();
         assert!(err.contains("uncompressed page"), "unexpected error: {err}");
     }
+
+    #[test]
+    fn test_decode_page_into_randomized_differential() {
+        // Milestone 1 gate: every projection must agree with the full scalar
+        // oracle across mixed codecs, NaN levels, duplicates and edge values.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let masks = [
+            ColumnMask::ALL,
+            ColumnMask::SAMPLE,
+            ColumnMask::TIMESTAMP,
+            ColumnMask::VALUE,
+            ColumnMask::SEQUENCE,
+            ColumnMask::RESERVED,
+            ColumnMask::TIMESTAMP | ColumnMask::SEQUENCE | ColumnMask::RESERVED,
+        ];
+        for case in 0..128usize {
+            let n = 1 + (next() as usize % 513);
+            let mut timestamp = 1_700_000_000_000i64;
+            let mut input = Vec::with_capacity(n);
+            for i in 0..n {
+                if i > 0 && next() % 11 != 0 {
+                    timestamp += 15_000;
+                }
+                let value = match (next() % 8) as u8 {
+                    0 => f64::NAN,
+                    1 => 42.5,
+                    2 => 1_000.0 + (i as f64) * 10.0,
+                    3 => 0.0,
+                    4 => -0.0,
+                    5 => f64::INFINITY,
+                    6 => f64::NEG_INFINITY,
+                    _ => (i as f64 * 0.01).sin(),
+                };
+                input.push(Row {
+                    metric_id: 1,
+                    series_id: 2,
+                    timestamp,
+                    value,
+                    sequence: next() % 1_000,
+                    reserved: next() % 3,
+                });
+            }
+            let (bytes, _) = encode_page(&input).unwrap();
+            let oracle = decode_page(&bytes).unwrap();
+            for mask in masks {
+                let mut buffers = PageBuffers::new();
+                decode_page_into(&bytes, mask, &mut buffers).unwrap();
+                assert_eq!(buffers.row_count, n, "case {case}");
+                assert_selected_columns(&buffers, &oracle, mask);
+                // A warm buffer must produce the same result.
+                decode_page_into(&bytes, mask, &mut buffers).unwrap();
+                assert_selected_columns(&buffers, &oracle, mask);
+            }
+        }
+    }
+
+    fn assert_selected_columns(buffers: &PageBuffers, oracle: &DecodedPage, mask: ColumnMask) {
+        if mask.contains(ColumnMask::TIMESTAMP) {
+            assert_eq!(buffers.timestamps, oracle.timestamps);
+        } else {
+            assert!(buffers.timestamps.is_empty());
+        }
+        if mask.contains(ColumnMask::VALUE) {
+            assert_eq!(
+                buffers
+                    .values
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                oracle
+                    .values
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            assert!(buffers.values.is_empty());
+        }
+        if mask.contains(ColumnMask::SEQUENCE) {
+            assert_eq!(buffers.sequences, oracle.sequences);
+        } else {
+            assert!(buffers.sequences.is_empty());
+        }
+        if mask.contains(ColumnMask::RESERVED) {
+            assert_eq!(buffers.reserved, oracle.reserved);
+        } else {
+            assert!(buffers.reserved.is_empty());
+        }
+    }
 }
