@@ -17,12 +17,14 @@
 
 //! TSF v1 pages: encoding, statistics and decoding.
 
+use std::ops::{BitOr, BitOrAssign, Range};
+
 use super::Row;
 use crate::tsf::{
     checksum::crc32c_multi,
     codec::{
         marshal_timestamps, marshal_values, marshal_var_int64, unmarshal_timestamps,
-        unmarshal_values, unmarshal_var_int64s, MarshalType,
+        unmarshal_values, MarshalType,
     },
 };
 
@@ -34,6 +36,165 @@ const FLAG_HAS_NAN: u16 = 1 << 0;
 const FLAG_ALL_NAN: u16 = 1 << 1;
 const FLAG_DUP_TIMESTAMPS: u16 = 1 << 2;
 const FLAG_UNCOMPRESSED: u16 = 1 << 3;
+
+/// Selects which page columns are decoded.
+///
+/// This is a `bitflags`-like type kept as a single byte so page metadata and
+/// call sites stay small. Bits not defined here are rejected by
+/// [`ColumnMask::from_bits`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ColumnMask(u8);
+
+impl ColumnMask {
+    /// All four stored columns.
+    pub const ALL: Self = Self(15);
+    /// No columns. Only CRC and payload bounds are validated.
+    pub const NONE: Self = Self(0);
+    pub const RESERVED: Self = Self(8);
+    /// The default scan projection: timestamp and value. `__seq__` is already
+    /// resolved at write time, and `__reserved__` is only needed by
+    /// compaction/expiration.
+    pub const SAMPLE: Self = Self(1 | 2);
+    pub const SEQUENCE: Self = Self(4);
+    pub const TIMESTAMP: Self = Self(1);
+    pub const VALUE: Self = Self(2);
+
+    pub const fn empty() -> Self {
+        Self::NONE
+    }
+
+    pub const fn all() -> Self {
+        Self::ALL
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Builds a mask from raw bits, rejecting undefined bits.
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    /// Builds a mask from raw bits, ignoring undefined bits.
+    pub const fn from_bits_truncate(bits: u8) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+
+    /// Iterates the selected columns in storage order.
+    pub fn iter(self) -> impl Iterator<Item = (ColumnMask, &'static str)> {
+        [
+            (Self::TIMESTAMP, "timestamp"),
+            (Self::VALUE, "value"),
+            (Self::SEQUENCE, "__seq__"),
+            (Self::RESERVED, "__reserved__"),
+        ]
+        .into_iter()
+        .filter(move |(mask, _)| self.contains(*mask))
+    }
+}
+
+impl BitOr for ColumnMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for ColumnMask {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Reusable decode buffers.
+///
+/// One instance is owned by each decode worker and reused across pages. The
+/// buffers are cleared, never freed, so a warm worker performs no allocation
+/// per page. Unselected columns stay empty (or keep their previous contents
+/// until [`PageBuffers::clear`] is called); callers must check `mask`.
+#[derive(Debug, Default, Clone)]
+pub struct PageBuffers {
+    /// Number of rows in the last decoded page.
+    pub row_count: usize,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f64>,
+    pub sequences: Vec<u64>,
+    pub reserved: Vec<u64>,
+    /// Scratch space for value/sequence/reserved bit patterns. Reused across
+    /// pages so decoding does not allocate.
+    scratch: Vec<i64>,
+}
+
+impl PageBuffers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears logical contents while keeping capacity.
+    pub fn clear(&mut self) {
+        self.row_count = 0;
+        self.timestamps.clear();
+        self.values.clear();
+        self.sequences.clear();
+        self.reserved.clear();
+        // `decode_i64s_into_vec` clears scratch before writing, so no clear is
+        // needed here.
+    }
+
+    /// Approximate heap bytes held by this context. Used for the per-worker
+    /// memory budget in ADR-0002 §7.4.
+    pub fn capacity_bytes(&self) -> usize {
+        self.timestamps.capacity() * std::mem::size_of::<i64>()
+            + self.values.capacity() * std::mem::size_of::<f64>()
+            + self.sequences.capacity() * std::mem::size_of::<u64>()
+            + self.reserved.capacity() * std::mem::size_of::<u64>()
+            + self.scratch.capacity() * std::mem::size_of::<i64>()
+    }
+
+    /// Ensures a warm context has room for one maximum-size page.
+    pub fn reserve_page(&mut self) {
+        let rows = MAX_PAGE_ROWS;
+        self.timestamps.reserve(rows);
+        self.values.reserve(rows);
+        self.sequences.reserve(rows);
+        self.reserved.reserve(rows);
+        self.scratch.reserve(rows);
+    }
+}
+
+/// Maps a half-open time range to a contiguous slice of a non-decreasing
+/// timestamp column.
+pub fn contiguous_time_slice(timestamps: &[i64], start: i64, end: i64) -> Range<usize> {
+    let lo = timestamps.partition_point(|&ts| ts < start);
+    let hi = timestamps.partition_point(|&ts| ts < end);
+    lo..hi.max(lo)
+}
 
 /// Statistics needed by the page index and by the series chunk header.
 #[derive(Debug, Clone, Default)]
@@ -95,6 +256,17 @@ pub fn encode_page(rows: &[Row]) -> Result<(Vec<u8>, PageMeta), String> {
     let (reserved_mt, first_reserved) =
         marshal_values(&mut reserved_payload, &reserved, PRECISION_BITS);
 
+    // ADR-0002 §4.4: a page whose payloads did not benefit from ZSTD is
+    // stored uncompressed and marked with flag bit 3. The codecs already fall
+    // back from `Zstd*` to the raw nearest-delta variants per payload; if none
+    // of the four payloads used a zstd codec, the whole page is uncompressed.
+    let page_is_uncompressed = ![ts_mt, value_mt, seq_mt, reserved_mt].iter().any(|mt| {
+        matches!(
+            mt,
+            MarshalType::ZstdNearestDelta | MarshalType::ZstdNearestDelta2
+        )
+    });
+
     let mut meta = PageMeta {
         row_count: rows.len() as u32,
         min_timestamp: timestamps[0],
@@ -154,6 +326,9 @@ pub fn encode_page(rows: &[Row]) -> Result<(Vec<u8>, PageMeta), String> {
     if all_nan {
         flags |= FLAG_ALL_NAN;
     }
+    if page_is_uncompressed {
+        flags |= FLAG_UNCOMPRESSED;
+    }
     meta.min_value_bits = min_value_bits;
     meta.max_value_bits = max_value_bits;
     meta.has_nan = has_nan;
@@ -203,8 +378,17 @@ pub fn encode_page(rows: &[Row]) -> Result<(Vec<u8>, PageMeta), String> {
     Ok((page, meta))
 }
 
-/// Decodes one page. The CRC of the header and payloads is verified.
-pub fn decode_page(page: &[u8]) -> Result<DecodedPage, String> {
+/// Decodes one page into `out`, keeping only the columns in `mask`.
+///
+/// The page CRC always covers the header and all four payloads, so corruption
+/// detection is independent of the projection. Unselected payloads are
+/// bounds-checked but not decoded.
+pub fn decode_page_into(
+    page: &[u8],
+    mask: ColumnMask,
+    out: &mut PageBuffers,
+) -> Result<(), String> {
+    out.clear();
     if page.len() < PAGE_HEADER_SIZE {
         return Err(format!("page is too small: {} bytes", page.len()));
     }
@@ -217,36 +401,89 @@ pub fn decode_page(page: &[u8]) -> Result<DecodedPage, String> {
         return Err(format!("invalid page row count {row_count}"));
     }
     let flags = u16::from_le_bytes(page[4..6].try_into().unwrap());
-    if flags & FLAG_UNCOMPRESSED != 0 {
-        return Err("uncompressed page flag is not supported by the prototype".to_string());
-    }
     let ts_mt = page[6];
     let value_mt = page[7];
     let seq_mt = page[8];
     let reserved_mt = page[9];
-    let first_timestamp = i64::from_le_bytes(page[28..36].try_into().unwrap());
-    let first_value = i64::from_le_bytes(page[36..44].try_into().unwrap());
-    let first_sequence = i64::from_le_bytes(page[76..84].try_into().unwrap());
-    let first_reserved = i64::from_le_bytes(page[84..92].try_into().unwrap());
+    if flags & FLAG_UNCOMPRESSED != 0 {
+        // ADR-0002 §3.5: bit 3 promises that no payload was zstd-compressed.
+        // A file that sets it while carrying a zstd codec is corrupt.
+        for (codec, name) in [
+            (ts_mt, "timestamp"),
+            (value_mt, "value"),
+            (seq_mt, "__seq__"),
+            (reserved_mt, "__reserved__"),
+        ] {
+            if matches!(codec, 1 | 4) {
+                return Err(format!(
+                    "uncompressed page contains a zstd-compressed {name} payload"
+                ));
+            }
+        }
+    }
 
+    // Bounds-check every payload, even the unselected ones.
     let ts = payload(page, 92)?;
     let values = payload(page, 100)?;
     let sequences = payload(page, 108)?;
     let reserved = payload(page, 116)?;
 
-    let timestamps = decode_i64s(ts, ts_mt, first_timestamp, row_count)?;
-    let value_bits = decode_i64s(values, value_mt, first_value, row_count)?;
-    let sequence_bits = decode_i64s(sequences, seq_mt, first_sequence, row_count)?;
-    let reserved_bits = decode_i64s(reserved, reserved_mt, first_reserved, row_count)?;
+    if mask.contains(ColumnMask::TIMESTAMP) {
+        let first_timestamp = i64::from_le_bytes(page[28..36].try_into().unwrap());
+        decode_i64s_into_vec(&mut out.timestamps, ts, ts_mt, first_timestamp, row_count)?;
+    }
+    if mask.contains(ColumnMask::VALUE) {
+        let first_value = i64::from_le_bytes(page[36..44].try_into().unwrap());
+        decode_i64s_into_vec(&mut out.scratch, values, value_mt, first_value, row_count)?;
+        out.values.clear();
+        out.values.reserve(row_count);
+        out.values
+            .extend(out.scratch.iter().map(|&bits| f64::from_bits(bits as u64)));
+    }
+    if mask.contains(ColumnMask::SEQUENCE) {
+        let first_sequence = i64::from_le_bytes(page[76..84].try_into().unwrap());
+        decode_i64s_into_vec(
+            &mut out.scratch,
+            sequences,
+            seq_mt,
+            first_sequence,
+            row_count,
+        )?;
+        out.sequences.clear();
+        out.sequences.reserve(row_count);
+        out.sequences
+            .extend(out.scratch.iter().map(|&bits| bits as u64));
+    }
+    if mask.contains(ColumnMask::RESERVED) {
+        let first_reserved = i64::from_le_bytes(page[84..92].try_into().unwrap());
+        decode_i64s_into_vec(
+            &mut out.scratch,
+            reserved,
+            reserved_mt,
+            first_reserved,
+            row_count,
+        )?;
+        out.reserved.clear();
+        out.reserved.reserve(row_count);
+        out.reserved
+            .extend(out.scratch.iter().map(|&bits| bits as u64));
+    }
+    out.row_count = row_count;
+    Ok(())
+}
 
+/// Decodes one page, materialising all four columns.
+///
+/// This is the scalar reference oracle used by tests, compaction and the
+/// differential suite. Scan paths should use [`decode_page_into`].
+pub fn decode_page(page: &[u8]) -> Result<DecodedPage, String> {
+    let mut buffers = PageBuffers::new();
+    decode_page_into(page, ColumnMask::ALL, &mut buffers)?;
     Ok(DecodedPage {
-        timestamps,
-        values: value_bits
-            .into_iter()
-            .map(|v| f64::from_bits(v as u64))
-            .collect(),
-        sequences: sequence_bits.into_iter().map(|v| v as u64).collect(),
-        reserved: reserved_bits.into_iter().map(|v| v as u64).collect(),
+        timestamps: buffers.timestamps,
+        values: buffers.values,
+        sequences: buffers.sequences,
+        reserved: buffers.reserved,
     })
 }
 
@@ -267,11 +504,18 @@ fn payload(page: &[u8], offset_field: usize) -> Result<&[u8], String> {
     Ok(&page[offset..end])
 }
 
-fn decode_i64s(src: &[u8], codec_id: u8, first: i64, count: usize) -> Result<Vec<i64>, String> {
+fn decode_i64s_into_vec(
+    dst: &mut Vec<i64>,
+    src: &[u8],
+    codec_id: u8,
+    first: i64,
+    count: usize,
+) -> Result<(), String> {
+    dst.clear();
     if codec_id == 0 {
-        let mut dst = vec![0i64; count];
+        dst.resize(count, 0);
         dst[0] = first;
-        let tail = unmarshal_var_int64s(&mut dst[1..], src)
+        let tail = crate::tsf::codec::simd::unmarshal_var_int64s_4way(&mut dst[1..], src)
             .map_err(|e| format!("cannot decode plain varint payload: {e}"))?;
         if !tail.is_empty() {
             return Err(format!(
@@ -279,21 +523,20 @@ fn decode_i64s(src: &[u8], codec_id: u8, first: i64, count: usize) -> Result<Vec
                 tail.len()
             ));
         }
-        return Ok(dst);
+        return Ok(());
     }
     let mt =
         MarshalType::from_u8(codec_id).ok_or_else(|| format!("unknown codec id {codec_id}"))?;
-    let mut dst = Vec::with_capacity(count);
     if matches!(mt, MarshalType::Const | MarshalType::DeltaConst) {
         // Value codecs.
-        unmarshal_values(&mut dst, src, mt, first, count)
+        unmarshal_values(dst, src, mt, first, count)
             .map_err(|e| format!("cannot decode value payload: {e}"))?;
     } else {
         // Nearest-delta codecs are the same for timestamps and values.
-        unmarshal_timestamps(&mut dst, src, mt, first, count)
+        unmarshal_timestamps(dst, src, mt, first, count)
             .map_err(|e| format!("cannot decode timestamp payload: {e}"))?;
     }
-    Ok(dst)
+    Ok(())
 }
 
 /// Encodes `values` with the plain varint codec (id 0). Kept for completeness
@@ -367,7 +610,96 @@ mod tests {
         let values: Vec<i64> = (0..500).map(|i| i * 3 - 700).collect();
         let mut payload = Vec::new();
         encode_plain_varint(&mut payload, &values);
-        let decoded = decode_i64s(&payload, 0, values[0], values.len()).unwrap();
+        let mut decoded = Vec::new();
+        decode_i64s_into_vec(&mut decoded, &payload, 0, values[0], values.len()).unwrap();
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_projection_decodes_only_requested_columns() {
+        let input = rows(1000, 15_000);
+        let (bytes, _) = encode_page(&input).unwrap();
+        let mut buffers = PageBuffers::new();
+
+        decode_page_into(&bytes, ColumnMask::SAMPLE, &mut buffers).unwrap();
+        assert_eq!(buffers.row_count, 1000);
+        assert_eq!(buffers.timestamps.len(), 1000);
+        assert_eq!(buffers.values.len(), 1000);
+        assert!(buffers.sequences.is_empty());
+        assert!(buffers.reserved.is_empty());
+
+        decode_page_into(&bytes, ColumnMask::NONE, &mut buffers).unwrap();
+        assert_eq!(buffers.row_count, 1000);
+        assert!(buffers.timestamps.is_empty());
+        assert!(buffers.values.is_empty());
+
+        decode_page_into(&bytes, ColumnMask::ALL, &mut buffers).unwrap();
+        for (i, row) in input.iter().enumerate() {
+            assert_eq!(buffers.timestamps[i], row.timestamp);
+            assert_eq!(buffers.values[i].to_bits(), row.value.to_bits());
+            assert_eq!(buffers.sequences[i], row.sequence);
+            assert_eq!(buffers.reserved[i], row.reserved);
+        }
+    }
+
+    #[test]
+    fn test_decode_page_into_reuses_buffers() {
+        let input = rows(512, 15_000);
+        let (bytes, _) = encode_page(&input).unwrap();
+        let mut buffers = PageBuffers::new();
+        decode_page_into(&bytes, ColumnMask::ALL, &mut buffers).unwrap();
+        let timestamps_ptr = buffers.timestamps.as_ptr();
+        let values_ptr = buffers.values.as_ptr();
+        decode_page_into(&bytes, ColumnMask::ALL, &mut buffers).unwrap();
+        // A warm context must not reallocate for the same page shape.
+        assert_eq!(buffers.timestamps.as_ptr(), timestamps_ptr);
+        assert_eq!(buffers.values.as_ptr(), values_ptr);
+        assert_eq!(buffers.row_count, 512);
+    }
+
+    #[test]
+    fn test_contiguous_time_slice() {
+        let ts: Vec<i64> = (0..100).map(|i| 1000 + i * 10).collect();
+        assert_eq!(contiguous_time_slice(&ts, 0, 2000), 0..100);
+        assert_eq!(contiguous_time_slice(&ts, 1050, 1100), 5..10);
+        assert_eq!(contiguous_time_slice(&ts, 1055, 1105), 6..11);
+        assert_eq!(contiguous_time_slice(&ts, 5000, 6000), 100..100);
+        assert_eq!(contiguous_time_slice(&[], 0, 10), 0..0);
+    }
+
+    #[test]
+    fn test_uncompressed_page_flag_roundtrip() {
+        // Constant-delta timestamps, constant values and constant sequence
+        // payloads use no zstd codec, so the page is flagged uncompressed.
+        let mut input = rows(256, 15_000);
+        for row in &mut input {
+            row.value = 42.5;
+        }
+        let (bytes, _) = encode_page(&input).unwrap();
+        let flags = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        assert_ne!(flags & FLAG_UNCOMPRESSED, 0);
+        assert_eq!(decode_page(&bytes).unwrap().len(), 256);
+    }
+
+    #[test]
+    fn test_uncompressed_flag_with_zstd_payload_is_rejected() {
+        // Counter-like values with small noise force a zstd-compressed
+        // nearest-delta2 payload.
+        let mut input = rows(1024, 15_000);
+        for (i, row) in input.iter_mut().enumerate() {
+            row.value = 1000.0 + (i as f64) * 10.0 + ((i % 3) as f64) * 0.001;
+        }
+        let (mut bytes, _) = encode_page(&input).unwrap();
+        let flags = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        assert_eq!(flags & FLAG_UNCOMPRESSED, 0);
+        // Claiming the page is uncompressed while a zstd codec is present must
+        // be treated as corruption.
+        let new_flags = flags | FLAG_UNCOMPRESSED;
+        bytes[4..6].copy_from_slice(&new_flags.to_le_bytes());
+        // Recompute the CRC so the failure comes from the flag check.
+        let crc = crc32c_multi(&[&bytes[..124], &bytes[PAGE_HEADER_SIZE..]]);
+        bytes[124..128].copy_from_slice(&crc.to_le_bytes());
+        let err = decode_page(&bytes).unwrap_err();
+        assert!(err.contains("uncompressed page"), "unexpected error: {err}");
     }
 }

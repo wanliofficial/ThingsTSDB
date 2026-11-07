@@ -24,6 +24,8 @@ pub mod codec;
 pub mod file;
 pub mod page;
 
+pub use page::{ColumnMask, PageBuffers};
+
 /// One row of the prototype schema `(i64 ts, f64 value, u64 seq, u64 reserved)`
 /// keyed by metric and series.
 #[derive(Clone, Copy, Debug, PartialEq)]
