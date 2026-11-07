@@ -20,7 +20,7 @@
 use bytes::Bytes;
 use columnar_storage::{
     manifest::Snapshot,
-    sst::{FileMeta, SstFile},
+    sst::{FileFormat, FileMeta, SstFile},
 };
 
 use crate::config::ManifestConfig;
@@ -36,9 +36,11 @@ impl EncodingBench {
             1,
             FileMeta {
                 max_sequence: 1,
+                min_sequence: 0,
                 num_rows: 1,
                 time_range: (1..2).into(),
                 size: 1,
+                format: FileFormat::Parquet,
             },
         );
         let sstfiles = vec![sstfile.clone(); config.record_count];

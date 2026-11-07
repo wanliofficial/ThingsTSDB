@@ -34,6 +34,17 @@ message SstMeta {
   uint32 num_rows = 2;
   uint32 size = 3;
   TimeRange time_range = 4;
+  // Minimum `__seq__` in this file. A missing field reads as 0, which is safe
+  // for legacy Parquet files.
+  uint64 min_sequence = 5;
+  // Data format of the referenced file. Defaults to PARQUET_V1 so that old
+  // manifests and deltas keep describing Parquet SSTs.
+  FileFormat format = 6;
+}
+
+enum FileFormat {
+  PARQUET_V1 = 0;
+  TSF_V1 = 1;
 }
 
 message SstFile {

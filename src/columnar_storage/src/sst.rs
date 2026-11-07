@@ -158,12 +158,94 @@ impl PartialEq for SstFile {
 
 impl Eq for SstFile {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Data format of a manifest entry. Mirrors `pb_types::FileFormat`; the
+/// `Parquet` default keeps old manifests and deltas describing Parquet SSTs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileFormat {
+    #[default]
+    Parquet,
+    Tsf,
+}
+
+impl From<pb_types::FileFormat> for FileFormat {
+    fn from(value: pb_types::FileFormat) -> Self {
+        match value {
+            pb_types::FileFormat::ParquetV1 => FileFormat::Parquet,
+            pb_types::FileFormat::TsfV1 => FileFormat::Tsf,
+        }
+    }
+}
+
+impl From<FileFormat> for pb_types::FileFormat {
+    fn from(value: FileFormat) -> Self {
+        match value {
+            FileFormat::Parquet => pb_types::FileFormat::ParquetV1,
+            FileFormat::Tsf => pb_types::FileFormat::TsfV1,
+        }
+    }
+}
+
+/// File metadata used by the manifest, the TTL drop and the format-aware
+/// reader.
+///
+/// `min_sequence` defaults to 0 for legacy Parquet entries and is populated by
+/// the flush and compaction writers; compaction never narrows the sequence
+/// span of its inputs (ADR-0002 §6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMeta {
     pub max_sequence: u64,
+    pub min_sequence: u64,
     pub num_rows: u32,
     pub size: u32,
     pub time_range: TimeRange,
+    pub format: FileFormat,
+}
+
+impl FileMeta {
+    /// Builds metadata for a file written from the given `rows`.
+    ///
+    /// The rows are expected to be sorted by `(metric_id, series_id,
+    /// timestamp)`.
+    pub fn from_rows<I>(rows: I, size: u32, format: FileFormat) -> Self
+    where
+        I: IntoIterator<Item = (u64, i64, u64)>,
+    {
+        let mut max_sequence = 0;
+        let mut min_sequence = u64::MAX;
+        let mut num_rows = 0;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for (_, ts, seq) in rows {
+            max_sequence = max_sequence.max(seq);
+            min_sequence = min_sequence.min(seq);
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            num_rows += 1;
+        }
+        if num_rows == 0 {
+            return Self {
+                max_sequence: 0,
+                min_sequence: 0,
+                num_rows: 0,
+                size,
+                time_range: TimeRange::new(Timestamp::MIN, Timestamp::MIN),
+                format,
+            };
+        }
+        Self {
+            max_sequence,
+            min_sequence,
+            num_rows,
+            size,
+            time_range: (min_ts..max_ts).into(),
+            format,
+        }
+    }
+
+    /// Whether a query must route this file to the TSF reader.
+    pub fn is_tsf(&self) -> bool {
+        self.format == FileFormat::Tsf
+    }
 }
 
 impl TryFrom<pb_types::SstMeta> for FileMeta {
@@ -175,9 +257,11 @@ impl TryFrom<pb_types::SstMeta> for FileMeta {
 
         Ok(Self {
             max_sequence: value.max_sequence,
+            min_sequence: value.min_sequence,
             num_rows: value.num_rows,
             size: value.size,
             time_range: TimeRange::new(time_range.start.into(), time_range.end.into()),
+            format: value.format().into(),
         })
     }
 }
@@ -186,8 +270,10 @@ impl From<FileMeta> for pb_types::SstMeta {
     fn from(value: FileMeta) -> Self {
         pb_types::SstMeta {
             max_sequence: value.max_sequence,
+            min_sequence: value.min_sequence,
             num_rows: value.num_rows,
             size: value.size,
+            format: pb_types::FileFormat::from(value.format) as i32,
             time_range: Some(pb_types::TimeRange {
                 start: *value.time_range.start,
                 end: *value.time_range.end,
@@ -206,7 +292,33 @@ impl SstPathGenerator {
         Self { prefix }
     }
 
+    /// Legacy Parquet path: `{root}/data/{file_id}.sst`.
     pub fn generate(&self, id: FileId) -> String {
         format!("{}/{}/{}.sst", self.prefix, PREFIX_PATH, id)
+    }
+
+    /// TSF path: `{root}/data/{YYYYMMDD}/{file_id}.tsf` (ADR-0002 §8.1).
+    ///
+    /// The partition directory comes from the file's time range start, which
+    /// is always the earliest timestamp in the file. Files that span a day
+    /// boundary are rejected by the flush path before reaching here.
+    pub fn generate_tsf(&self, id: FileId, partition_start_ms: i64) -> String {
+        use storage_kernel::tsf::partition::partition_label;
+        format!(
+            "{}/{}/{}/{}.tsf",
+            self.prefix,
+            PREFIX_PATH,
+            partition_label(partition_start_ms),
+            id
+        )
+    }
+
+    /// Resolves the object path described by a manifest entry.
+    pub fn generate_for(&self, id: FileId, meta: &FileMeta) -> String {
+        if meta.is_tsf() {
+            self.generate_tsf(id, *meta.time_range.start)
+        } else {
+            self.generate(id)
+        }
     }
 }

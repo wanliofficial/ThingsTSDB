@@ -162,6 +162,52 @@ impl Manifest {
         ssts.clone()
     }
 
+    /// Plans a TTL drop at `now_ms` for files in the given `partitions`.
+    ///
+    /// Returns the file IDs to delete. The caller removes the manifest entries
+    /// first, then deletes the objects (ADR-0002 §8.3). Partition membership is
+    /// derived from the file's `time_range.start`, matching the TSF directory
+    /// layout; Parquet files live in the `data/` root and are matched by their
+    /// start day too, so a legacy file is only dropped once it is fully outside
+    /// the retention window.
+    pub async fn plan_ttl_drop(&self, partitions: &[i64], now_ms: i64, ttl_ms: i64) -> Vec<FileId> {
+        let expired = storage_kernel::tsf::partition::plan_ttl_drop(
+            partitions.iter().copied(),
+            now_ms,
+            ttl_ms,
+        );
+        if expired.is_empty() {
+            return Vec::new();
+        }
+        let ssts = self.ssts.read().await;
+        ssts.iter()
+            .filter(|f| {
+                let idx =
+                    storage_kernel::tsf::partition::partition_index(*f.meta().time_range.start);
+                expired.binary_search(&idx).is_ok()
+            })
+            .map(|f| f.id())
+            .collect()
+    }
+
+    /// Executes a TTL drop: removes the manifest entries, then deletes the
+    /// objects. A failed object delete is logged but does not roll back the
+    /// manifest, matching the compaction delete semantics.
+    pub async fn drop_expired_partitions(
+        &self,
+        partitions: &[i64],
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<Vec<FileId>> {
+        let to_deletes = self.plan_ttl_drop(partitions, now_ms, ttl_ms).await;
+        if to_deletes.is_empty() {
+            return Ok(to_deletes);
+        }
+        self.update(ManifestUpdate::new(Vec::new(), to_deletes.clone()))
+            .await?;
+        Ok(to_deletes)
+    }
+
     pub async fn find_ssts(&self, time_range: &TimeRange) -> Vec<SstFile> {
         let ssts = self.ssts.read().await;
 
@@ -402,6 +448,7 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
+    use crate::sst::FileFormat;
 
     #[test]
     fn test_find_manifest() {
@@ -424,9 +471,11 @@ mod tests {
                 let time_range = (i..i + 1).into();
                 let meta = FileMeta {
                     max_sequence: i as u64,
+                    min_sequence: 0,
                     num_rows: i as u32,
                     size: i as u32,
                     time_range,
+                    format: FileFormat::Parquet,
                 };
                 manifest.add_file(i as u64, meta).await.unwrap();
             }
@@ -440,9 +489,11 @@ mod tests {
                     let time_range = (i..i + 1).into();
                     let meta = FileMeta {
                         max_sequence: i as u64,
+                        min_sequence: 0,
                         num_rows: i as u32,
                         size: i as u32,
                         time_range,
+                        format: FileFormat::Parquet,
                     };
                     SstFile::new(id, meta)
                 })
@@ -485,9 +536,11 @@ mod tests {
                 let time_range = (i..i + 1).into();
                 let meta = FileMeta {
                     max_sequence: i as u64,
+                    min_sequence: 0,
                     num_rows: i as u32,
                     size: i as u32,
                     time_range,
+                    format: FileFormat::Parquet,
                 };
                 manifest.add_file(i as u64, meta).await.unwrap();
             }
@@ -505,6 +558,57 @@ mod tests {
 
             let delta_paths = list_delta_paths(&store, &delta_dir).await.unwrap();
             assert!(delta_paths.is_empty());
+        })
+    }
+
+    #[test]
+    fn test_plan_and_drop_ttl_partitions() {
+        use storage_kernel::tsf::partition::DAY_MS;
+
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let rt = runtime.clone();
+        let store = Arc::new(LocalFileSystem::new());
+
+        rt.block_on(async move {
+            let manifest = Manifest::try_new(
+                root_dir.path().to_string_lossy().to_string(),
+                store,
+                runtime.clone(),
+                ManifestConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            // Three files, one per day 0, 1, 2 (timestamp == day index *
+            // DAY_MS). Make them TSF so the start day is the partition key.
+            for day in 0..3_i64 {
+                let ts = day * DAY_MS;
+                let meta = FileMeta {
+                    max_sequence: day as u64,
+                    min_sequence: 0,
+                    num_rows: 1,
+                    size: 1,
+                    time_range: (ts..ts + 1).into(),
+                    format: FileFormat::Tsf,
+                };
+                manifest.add_file(day as u64, meta).await.unwrap();
+            }
+
+            // now = day 5; ttl = 4 days -> expire_time = day 1 -> drop day 0.
+            let to_drop = manifest
+                .plan_ttl_drop(&[0, 1, 2], 5 * DAY_MS, 4 * DAY_MS)
+                .await;
+            assert_eq!(to_drop, vec![0]);
+
+            // Execute the drop: manifest entries go away.
+            let dropped = manifest
+                .drop_expired_partitions(&[0, 1, 2], 5 * DAY_MS, 4 * DAY_MS)
+                .await
+                .unwrap();
+            assert_eq!(dropped, vec![0]);
+            let remaining: Vec<u64> = manifest.all_ssts().await.iter().map(|f| f.id()).collect();
+            assert_eq!(remaining, vec![1, 2]);
         })
     }
 }

@@ -202,7 +202,7 @@ mod tests {
     use test_log::test;
 
     use super::*;
-    use crate::sst::FileMeta;
+    use crate::sst::{FileFormat, FileMeta};
 
     #[test]
     fn test_pick_candidate() {
@@ -215,9 +215,11 @@ mod tests {
                     i as u64,
                     FileMeta {
                         max_sequence: i as u64,
+                        min_sequence: 0,
                         num_rows: i as u32,
                         size: (100 - i) as u32, // size desc
                         time_range: (i * 10..(i * 10 + 10)).into(),
+                        format: FileFormat::Parquet,
                     },
                 )
             })
