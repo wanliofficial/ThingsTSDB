@@ -323,15 +323,16 @@ impl BatchBuilder {
             self.pending = Some(PendingColumns::from_columns(columns));
             return Ok(());
         }
+        // Flush before overflowing so a full batch is emitted intact instead of
+        // being sliced into a full batch plus a tiny remainder.
+        let pending_rows = self.pending.as_ref().map_or(0, PendingColumns::rows);
+        if pending_rows + rows > self.batch_rows {
+            self.flush_pending()?;
+            self.pending = Some(PendingColumns::from_columns(columns));
+            return Ok(());
+        }
         if let Some(pending) = self.pending.as_mut() {
             pending.extend(columns);
-        }
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.rows() >= self.batch_rows)
-        {
-            self.flush_pending()?;
         }
         Ok(())
     }
@@ -342,12 +343,7 @@ impl BatchBuilder {
             return Ok(());
         }
         self.flush_pending()?;
-        if batch.num_rows() >= self.batch_rows {
-            self.emit_sliced(&batch)
-        } else {
-            self.pending = None;
-            self.emit_sliced(&batch)
-        }
+        self.emit_sliced(&batch)
     }
 
     fn flush_pending(&mut self) -> Result<(), String> {
