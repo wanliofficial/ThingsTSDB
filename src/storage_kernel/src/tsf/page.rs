@@ -583,6 +583,107 @@ mod tests {
     }
 
     #[test]
+    fn test_page_header_golden_layout() {
+        // T1 gate: the on-disk header must stay at fixed byte offsets even as
+        // the decode path changes. The payloads are pinned to the independent
+        // codec output, and every length must partition `PAGE_HEADER_SIZE..`.
+        let input: Vec<Row> = (0..4)
+            .map(|i| Row {
+                metric_id: 9,
+                series_id: 11,
+                timestamp: 1_000_000 + 15_000 * i as i64,
+                value: 42.5,
+                sequence: 5 + i as u64,
+                reserved: 3,
+            })
+            .collect();
+        let timestamps: Vec<i64> = input.iter().map(|r| r.timestamp).collect();
+        let values: Vec<i64> = input.iter().map(|r| r.value.to_bits() as i64).collect();
+        let sequences: Vec<i64> = input.iter().map(|r| r.sequence as i64).collect();
+        let reserved: Vec<i64> = input.iter().map(|r| r.reserved as i64).collect();
+
+        let mut ts_payload = Vec::new();
+        let (ts_mt, first_ts) = marshal_timestamps(&mut ts_payload, &timestamps, PRECISION_BITS);
+        let mut value_payload = Vec::new();
+        let (value_mt, first_value) = marshal_values(&mut value_payload, &values, PRECISION_BITS);
+        let mut seq_payload = Vec::new();
+        let (seq_mt, first_seq) = marshal_values(&mut seq_payload, &sequences, PRECISION_BITS);
+        let mut reserved_payload = Vec::new();
+        let (reserved_mt, first_reserved) =
+            marshal_values(&mut reserved_payload, &reserved, PRECISION_BITS);
+
+        let (page, meta) = encode_page(&input).unwrap();
+        assert_eq!(page.len(), meta.page_size as usize);
+        assert_eq!(
+            page.len(),
+            PAGE_HEADER_SIZE
+                + ts_payload.len()
+                + value_payload.len()
+                + seq_payload.len()
+                + reserved_payload.len()
+        );
+
+        let le_u16 =
+            |range: std::ops::Range<usize>| u16::from_le_bytes(page[range].try_into().unwrap());
+        let le_u32 =
+            |range: std::ops::Range<usize>| u32::from_le_bytes(page[range].try_into().unwrap());
+        let le_u64 =
+            |range: std::ops::Range<usize>| u64::from_le_bytes(page[range].try_into().unwrap());
+        let le_i64 =
+            |range: std::ops::Range<usize>| i64::from_le_bytes(page[range].try_into().unwrap());
+
+        assert_eq!(le_u32(0..4), 4);
+        assert_eq!(le_u16(4..6), FLAG_UNCOMPRESSED);
+        assert_eq!(page[6], ts_mt.as_u8());
+        assert_eq!(page[7], value_mt.as_u8());
+        assert_eq!(page[8], seq_mt.as_u8());
+        assert_eq!(page[9], reserved_mt.as_u8());
+        assert_eq!(page[10], PRECISION_BITS);
+        assert_eq!(page[11], 0);
+
+        assert_eq!(le_i64(12..20), timestamps[0]);
+        assert_eq!(le_i64(20..28), *timestamps.last().unwrap());
+        assert_eq!(le_i64(28..36), first_ts);
+        assert_eq!(le_u64(36..44), first_value as u64);
+        assert_eq!(le_u64(44..52), 42.5f64.to_bits());
+        assert_eq!(le_u64(52..60), 42.5f64.to_bits());
+        assert_eq!(le_u64(60..68), *sequences.first().unwrap() as u64);
+        assert_eq!(le_u64(68..76), *sequences.last().unwrap() as u64);
+        assert_eq!(le_u64(76..84), first_seq as u64);
+        assert_eq!(le_u64(84..92), first_reserved as u64);
+
+        assert_eq!(le_u32(92..96) as usize, PAGE_HEADER_SIZE);
+        assert_eq!(le_u32(96..100) as usize, ts_payload.len());
+        assert_eq!(
+            le_u32(100..104) as usize,
+            PAGE_HEADER_SIZE + ts_payload.len()
+        );
+        assert_eq!(le_u32(104..108) as usize, value_payload.len());
+        assert_eq!(
+            le_u32(108..112) as usize,
+            PAGE_HEADER_SIZE + ts_payload.len() + value_payload.len()
+        );
+        assert_eq!(le_u32(112..116) as usize, seq_payload.len());
+        assert_eq!(
+            le_u32(116..120) as usize,
+            PAGE_HEADER_SIZE + ts_payload.len() + value_payload.len() + seq_payload.len()
+        );
+        assert_eq!(le_u32(120..124) as usize, reserved_payload.len());
+
+        let ts_offset = PAGE_HEADER_SIZE;
+        let value_offset = ts_offset + ts_payload.len();
+        let seq_offset = value_offset + value_payload.len();
+        let reserved_offset = seq_offset + seq_payload.len();
+        assert_eq!(page[ts_offset..value_offset], ts_payload[..]);
+        assert_eq!(page[value_offset..seq_offset], value_payload[..]);
+        assert_eq!(page[seq_offset..reserved_offset], seq_payload[..]);
+        assert_eq!(page[reserved_offset..], reserved_payload[..]);
+
+        let expected_crc = crc32c_multi(&[&page[..124], &page[PAGE_HEADER_SIZE..]]);
+        assert_eq!(le_u32(124..128), expected_crc);
+    }
+
+    #[test]
     fn test_page_nan_and_duplicate_flags() {
         let mut input = rows(4, 15_000);
         input[1].value = f64::NAN;
