@@ -257,6 +257,15 @@ impl ObjectBasedStorage {
         })
     }
 
+    /// Flushes buffered writes into data files and commits them to the
+    /// manifest.
+    ///
+    /// `scan` does this implicitly, but an explicit handle gives operators and
+    /// benchmarks a defined durable point without issuing a query.
+    pub async fn flush(&self) -> Result<()> {
+        self.flush_state.flush().await
+    }
+
     fn build_write_props(write_options: WriteConfig, num_primary_key: usize) -> WriterProperties {
         let sorting_columns = write_options.enable_sorting_columns.then(|| {
             (0..num_primary_key)

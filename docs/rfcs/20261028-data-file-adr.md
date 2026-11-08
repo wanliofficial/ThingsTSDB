@@ -951,7 +951,10 @@ Done:
   defeat the plan), and decodes only the intersection of the scan range and the file
   range (`test_ranged_read_fetches_only_touched_pages`,
   `test_staged_scan_planner_reads_only_touched_pages`). Files at or below 512 KiB are
-  still read whole, where the round trips cost more than the bytes they save.
+  still read whole, where the round trips cost more than the bytes they save. The
+  merge stream also emits batches of distinct primary keys in bulk instead of
+  slicing one batch per row (`test_merge_stream_bulk_path_for_distinct_keys`), which
+  was the full-scan bottleneck in the T5 benchmark (0.7 -> 24-57 M rows/s).
 - **T3 partition manager / GC:** `columnar_storage::partition::PartitionManager`
   discovers day partitions under `data/` with `list_with_delimiter` +
   `parse_partition_label`, drives TTL drops through `Manifest::drop_expired_partitions`
@@ -972,9 +975,22 @@ Done:
   nothing upward. Exposed as `ColumnarStorage::stats()`
   (`test_storage_stats_are_split_by_format`,
   `test_counting_store_counts_reads_but_not_heads`).
+- **T5 benchmarks:** `phase2_e2e_bench` measures both formats through
+  `ColumnarStorage::write`/`scan` on an 8.64 M-row, 30-day dataset (size, durable
+  write throughput, full-scan throughput, 1-day/30-day single-series p50/p99,
+  page pruning and restart). Results and analysis are in
+  `docs/rfcs/20261028-phase2-benchmark.md`. Full scan was 0.7 M rows/s before the
+  merge fast path and is 24-57 M rows/s after; the one target that still fails is
+  the 30-day single-series p99, because `TsfExec` has no series pushdown.
 
 Follow-up (not yet implemented):
 
+- **T2 series pushdown:** `TsfExec` decodes every series of a metric in the time
+  window and the `tsid` predicate is applied above the scan. Parquet's row-group
+  statistics prune to the target series, so the 30-day single-series query reads
+  9.1 MB and takes 39 ms there, against 62.5 MB and 263 ms for TSF. The series
+  index and `read_series_columns` already exist; what is missing is predicate
+  extraction and a series-scoped scan plan.
 - **T3 compaction policies:** small/big compaction-job selection beyond the current
   time-window strategy, and kill -9 crash-recovery tests (WAL replay and orphan
   cleanup are implemented, the fault-injection suite is not).
@@ -983,7 +999,6 @@ Follow-up (not yet implemented):
   nothing aggregates it), plus flush/commit latency and compaction write
   amplification. The rewrite job currently skips files that span more than one UTC
   day, since splitting them needs page-level work.
-- **T5:** the full size/write-throughput/query-p99/recovery benchmark matrix.
 
 Acceptance targets (from the roadmap, made measurable):
 
@@ -1011,6 +1026,11 @@ vectorized page decoding and direct Arrow emission are mandatory before T2 lands
 Write throughput is 70-99% of Parquet, below the 90% target on the noisiest gauge
 shape; buffer reuse and cheaper codec selection are the first optimizations. The
 decode follow-up is specified in `docs/rfcs/20261029-vectorized-decode-plan.md`.
+
+End-to-end results for the finished storage path (WAL, manifest, both formats, 30 day
+partitions) are in `docs/rfcs/20261028-phase2-benchmark.md`: full scan 24-57 M rows/s,
+durable ingest 1.4-1.9 M rows/s (above Parquet), 1-day query p99 under 25 ms. The open
+gap there is TSF series pushdown, which the 30-day single-series p99 reflects.
 
 ## 13. Observability
 
@@ -1148,6 +1168,7 @@ Implementation notes:
 
 - `docs/rfcs/20261028-mergeset-index-adr.md` (ADR-0001: TSID, indexDB, dual-read)
 - `docs/rfcs/20261029-vectorized-decode-plan.md` (Phase 2 decode plan)
+- `docs/rfcs/20261028-phase2-benchmark.md` (Phase 2 end-to-end benchmark)
 - `/media/wanli/WD_SSD1/home/wanli/workspace/esmetrics/crates/esm-encoding/src/`
 - `/media/wanli/WD_SSD1/home/wanli/workspace/esmetrics/crates/esm-storage/src/block_header.rs`
 - `/media/wanli/WD_SSD1/home/wanli/workspace/esmetrics/crates/esm-storage/src/metaindex_row.rs`
