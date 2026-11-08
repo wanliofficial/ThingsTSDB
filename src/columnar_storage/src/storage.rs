@@ -1089,6 +1089,131 @@ mod tests {
         });
     }
 
+    /// ADR-0002 §6.1: a segment that just closed is compacted even when it has
+    /// too few files for the count trigger, so a finished partition converges
+    /// to one file. A late sample written after that window must not rewrite it
+    /// again, which is what keeps the policy from adding write amplification.
+    #[test(test)]
+    fn test_compaction_merges_a_closed_partition() {
+        use crate::{config::DataFileFormat, types::Timestamp};
+
+        const STEP_MS: i64 = 15_000;
+        const SAMPLES: i64 = 4;
+        const HOUR_MS: i64 = 3_600_000;
+
+        /// Writes `SAMPLES` rows into one hour segment and flushes them into
+        /// their own file.
+        async fn write_chunk(storage: &ObjectBasedStorage, hour: i64, chunk: i64) {
+            let from = hour + chunk * SAMPLES * STEP_MS;
+            let batch = record_batch!(
+                ("metric_id", UInt64, vec![1, 1, 1, 1]),
+                ("tsid", UInt64, vec![10, 11, 10, 11]),
+                ("timestamp", Int64, vec![from, from + 1, from + 2, from + 3]),
+                ("value", Float64, vec![1.5, 2.5, 3.5, 4.5])
+            )
+            .unwrap();
+            storage
+                .write(WriteRequest {
+                    batch,
+                    time_range: (from..from + SAMPLES * STEP_MS).into(),
+                    enable_check: true,
+                })
+                .await
+                .unwrap();
+            storage.flush_state.flush().await.unwrap();
+        }
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let runtimes = build_runtimes();
+        runtimes.sst_compact_runtime.clone().block_on(async move {
+            let mut config = config_without_periodic_flush();
+            config.format = DataFileFormat::Tsf;
+            // Keep the count trigger out of the picture: only the segment that
+            // just closed may select these files.
+            config.scheduler.input_sst_min_num = 100;
+            // The loop could also fire on its own; a day-long interval makes
+            // `compact()` the only source of tasks.
+            config.scheduler.schedule_interval = common::ReadableDuration::days(1);
+
+            let storage = ObjectBasedStorage::try_new(
+                root_dir.path().to_string_lossy().to_string(),
+                Duration::from_millis(HOUR_MS as u64),
+                Arc::new(LocalFileSystem::new()),
+                schema,
+                3,
+                config,
+                runtimes,
+            )
+            .await
+            .unwrap();
+
+            // The segment is the hour that ended when the test started, so the
+            // partition-close trigger is active for the whole run.
+            let now = common::now();
+            let base = now / HOUR_MS * HOUR_MS - HOUR_MS;
+            let total_objects = |partitions: &[crate::partition::Partition]| {
+                partitions.iter().map(|p| p.objects).sum::<usize>()
+            };
+
+            for chunk in 0..2 {
+                write_chunk(&storage, base, chunk).await;
+            }
+            assert_eq!(
+                total_objects(&storage.partitions().await.unwrap()),
+                2,
+                "expected two flushed files"
+            );
+
+            storage.compact(CompactRequest {}).await.unwrap();
+            let mut objects = 2;
+            for _ in 0..200 {
+                objects = total_objects(&storage.partitions().await.unwrap());
+                if objects == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(objects, 1, "compaction did not merge the closed partition");
+
+            // The merge must keep every row and resolve the two files' keys.
+            let rows = collect_batch(
+                storage
+                    .scan(ScanRequest {
+                        range: TimeRange::new(Timestamp(base), Timestamp(base + HOUR_MS)),
+                        predicate: vec![],
+                        projections: None,
+                    })
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(rows.num_rows(), (2 * SAMPLES) as usize);
+
+            // A segment that closed more than one segment duration ago is left
+            // to the count and ratio rules: three similar-sized files are under
+            // both thresholds, so late samples must not rewrite it.
+            let old_base = base - 2 * HOUR_MS;
+            for chunk in 0..3 {
+                write_chunk(&storage, old_base, chunk).await;
+            }
+            assert_eq!(total_objects(&storage.partitions().await.unwrap()), 4);
+
+            storage.compact(CompactRequest {}).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                total_objects(&storage.partitions().await.unwrap()),
+                4,
+                "a partition that closed outside the window must not be recompacted"
+            );
+        });
+    }
+
     /// Migration dual-read: an old Parquet SST and a new TSF SST in the same
     /// root must both be read and merged (ADR-0002 §7.2, §10).
     #[test(test)]

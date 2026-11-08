@@ -72,17 +72,45 @@ where
         .reduce(|(lo, hi), (lo2, hi2)| (lo.min(lo2), hi.max(hi2)))
 }
 
-/// Applies the ADR-0002 §6.1 trigger: merge when a partition has more than
-/// [`SMALL_PART_COUNT_THRESHOLD`] small parts, or when small-part bytes exceed
-/// [`SMALL_PART_BYTES_RATIO`] of the partition, or at partition close.
-pub fn should_compact(part_count: usize, small_part_bytes: u64, total_bytes: u64) -> bool {
-    if part_count > SMALL_PART_COUNT_THRESHOLD {
-        return true;
-    }
+/// True when `small_part_bytes` is over [`SMALL_PART_BYTES_RATIO`] of the
+/// partition's `total_bytes`.
+pub fn small_part_bytes_exceed_ratio(small_part_bytes: u64, total_bytes: u64) -> bool {
     if total_bytes == 0 {
         return false;
     }
     small_part_bytes as f64 > total_bytes as f64 * SMALL_PART_BYTES_RATIO
+}
+
+/// Applies the ADR-0002 §6.1 count and byte triggers: merge when a partition
+/// has more than [`SMALL_PART_COUNT_THRESHOLD`] small parts, or when small-part
+/// bytes exceed [`SMALL_PART_BYTES_RATIO`] of the partition. The
+/// partition-close trigger is time-based and belongs to the caller (it needs a
+/// clock).
+pub fn should_compact(part_count: usize, small_part_bytes: u64, total_bytes: u64) -> bool {
+    part_count > SMALL_PART_COUNT_THRESHOLD
+        || small_part_bytes_exceed_ratio(small_part_bytes, total_bytes)
+}
+
+/// The ADR-0002 §6.1 byte trigger over a partition's part sizes.
+///
+/// A part only counts as the *big* part when it holds more than half the
+/// partition; without one the partition is still a pile of flush-sized files,
+/// and compacting it as soon as the bytes pass a quarter would rewrite
+/// everything after every flush. Those partitions are left to the count trigger
+/// ([`should_compact`]), so this returns `false` when no part dominates.
+pub fn small_parts_exceed_ratio<I>(sizes: I) -> bool
+where
+    I: IntoIterator<Item = u64>,
+{
+    let (total, largest) = sizes
+        .into_iter()
+        .fold((0u64, 0u64), |(total, largest), size| {
+            (total + size, largest.max(size))
+        });
+    if largest * 2 <= total {
+        return false;
+    }
+    small_part_bytes_exceed_ratio(total - largest, total)
 }
 
 /// Counts duplicate `(metric_id, series_id, timestamp)` keys without mutating
@@ -149,6 +177,23 @@ mod tests {
         assert!(should_compact(2, 26, 100));
         assert!(!should_compact(2, 25, 100));
         assert!(!should_compact(0, 0, 0));
+    }
+
+    /// The byte trigger needs a dominant big part: a pile of equal-sized
+    /// flushes is left to the count rule, otherwise every flush would rewrite
+    /// the partition.
+    #[test]
+    fn test_small_parts_exceed_ratio_needs_a_big_part() {
+        assert!(!small_parts_exceed_ratio([]));
+        assert!(!small_parts_exceed_ratio([100]));
+        // One part is exactly half the partition: not dominant.
+        assert!(!small_parts_exceed_ratio([100, 100]));
+        assert!(!small_parts_exceed_ratio([100, 100, 100, 100]));
+
+        // A 100 B big part next to 20 B of flushes: 20 is under a quarter.
+        assert!(!small_parts_exceed_ratio([100, 10, 10]));
+        // 40 B of flushes is over a quarter of 140 B.
+        assert!(small_parts_exceed_ratio([100, 20, 20]));
     }
 
     #[test]

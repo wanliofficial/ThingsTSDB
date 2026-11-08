@@ -592,6 +592,19 @@ data WAL append -> buffer -> TSF write -> fsync/upload -> manifest add -> WAL tr
 - Trigger policy: merge when a partition has more than 8 small parts, or when small-part
   bytes exceed 25% of the partition, or at partition close. The exact thresholds are
   configuration, not format.
+  - *Count* keeps the historical batch behaviour: a segment becomes a candidate once it
+    holds at least `input_sst_min_num` files, and the merge takes at least that many.
+  - *Bytes* needs a dominant big part (more than half the partition) before the ratio is
+    meaningful. `storage_kernel::tsf::compaction::small_parts_exceed_ratio` returns
+    `false` without one, so a pile of equally sized flushes is left to the count rule
+    instead of being rewritten after every flush.
+  - *Partition close* fires once, in the segment-length window after the segment ends,
+    and at least two files are needed. The picker remembers the segments whose close
+    trigger already ran (`close_compacted`), so a late sample that adds one more small
+    file does not rewrite the whole partition again. A segment that closed longer ago is
+    only recompacted by the count and ratio rules.
+  - All three triggers go through the same selection and memory limit, and the output
+    replaces only the files it merged, never a file another task is already compacting.
 
 ### 6.2 Deduplication semantics
 
@@ -992,6 +1005,18 @@ Done:
   `test_drop_expired_removes_manifest_first_then_objects`,
   `test_gc_orphans_keeps_live_files_and_bytes`,
   `test_storage_drop_expired_and_gc_orphans`).
+- **T3 compaction triggers:** the time-window picker now applies all three §6.1
+  policies — the existing `input_sst_min_num` count rule, the 25% small-part byte
+  ratio (only when one part holds more than half the partition) and a
+  partition-close trigger that runs once inside the segment-length window after a
+  segment ends (`close_compacted` remembers which segments already fired, so a late
+  sample does not rewrite the partition again). Covered by
+  `test_small_parts_exceed_ratio_needs_a_big_part`,
+  `test_small_part_ratio_trigger`,
+  `test_equal_sized_parts_wait_for_the_count_trigger`,
+  `test_partition_close_trigger` and the end-to-end
+  `test_compaction_merges_a_closed_partition`, which also checks that an old closed
+  partition is left to the count/ratio rules.
 
 - **T4 per-format metrics:** `columnar_storage::metrics` keeps `files_written`,
   `bytes_written`, `rows_written`, `files_read` and `bytes_read` per `FileFormat`.
@@ -1015,13 +1040,11 @@ Done:
 
 Follow-up (not yet implemented):
 
-- **T3 compaction policies:** small/big compaction-job selection beyond the current
-  time-window strategy (ADR §6.1's "small-part bytes > 25% of the partition" and
-  "partition close" triggers).
 - **Remaining observability:** codec selection and fallback counts, page/index-cache
   hit ratios and bloom rejections (the kernel already exposes `CacheStats`, but
   nothing aggregates it), plus flush/commit latency and compaction write
-  amplification. The rewrite job currently skips files that span more than one UTC
+  amplification.
+- **Rewrite across days:** the rewrite job skips files that span more than one UTC
   day, since splitting them needs page-level work.
 
 Acceptance targets (from the roadmap, made measurable):
