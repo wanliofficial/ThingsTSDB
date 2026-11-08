@@ -24,9 +24,10 @@
 //!
 //! The rewrite is deliberately conservative:
 //!
-//! - it only handles files that fit in one UTC day, because a TSF file belongs
-//!   to exactly one partition directory;
-//! - it commits the new file before deleting the old ones, so a crash leaves
+//! - a TSF file belongs to exactly one partition directory, so an input that
+//!   spans several UTC days is split by row timestamp into one output file per
+//!   day (ADR-0002 §8.1);
+//! - it commits the new files before deleting the old ones, so a crash leaves
 //!   duplicates (harmless under LWW) rather than data loss;
 //! - it never touches files that are already TSF.
 //!
@@ -38,13 +39,13 @@ use std::{collections::BTreeMap, sync::Arc};
 use anyhow::Context;
 use datafusion::{execution::TaskContext, physical_plan::execute_stream};
 use storage_kernel::tsf::partition::partition_index;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::{
     ensure,
     manifest::{ManifestRef, ManifestUpdate},
     read::ParquetReader,
-    sst::{FileFormat, FileMeta, SstFile, SstPathGenerator},
+    sst::{FileFormat, SstFile, SstPathGenerator},
     types::{ObjectStoreRef, StorageSchema},
     Result,
 };
@@ -54,9 +55,8 @@ use crate::{
 pub struct RewriteReport {
     /// Parquet files read and replaced by TSF files.
     pub rewritten_files: usize,
-    /// Parquet files left alone because they span more than one UTC day.
-    pub skipped_multi_day: usize,
-    /// TSF files produced.
+    /// TSF files produced. A Parquet file that spans several UTC days becomes
+    /// one TSF file per day, so this can exceed `rewritten_files`.
     pub output_files: usize,
     /// Rows written across all output files.
     pub output_rows: u64,
@@ -84,34 +84,24 @@ pub async fn rewrite_to_tsf(
 ) -> Result<RewriteReport> {
     let mut report = RewriteReport::default();
 
-    // Group Parquet files by the day of their start timestamp. A file whose
-    // range crosses a day boundary is skipped: splitting it would need page
-    // level work, which is a follow-up.
+    // Group Parquet files by the day their range starts in. The grouping only
+    // saves plans: the output is always split by row timestamp, so a file that
+    // crosses midnight is handled like any other.
     let mut by_day: BTreeMap<i64, Vec<SstFile>> = BTreeMap::new();
     for sst in ssts {
         if sst.meta().format != FileFormat::Parquet {
             continue;
         }
-        let day_start = partition_index(*sst.meta().time_range.start);
-        let day_end = partition_index(*sst.meta().time_range.end - 1);
-        if day_start != day_end {
-            report.skipped_multi_day += 1;
-            debug!(
-                id = sst.id(),
-                range = ?sst.meta().time_range,
-                "Skip multi-day Parquet file in TSF rewrite"
-            );
-            continue;
-        }
-        by_day.entry(day_start).or_default().push(sst);
+        by_day
+            .entry(partition_index(*sst.meta().time_range.start))
+            .or_default()
+            .push(sst);
     }
 
     for (day, inputs) in by_day {
         let mut time_range = inputs[0].meta().time_range.clone();
-        let mut min_sequence = inputs[0].meta().min_sequence;
         for f in &inputs[1..] {
             time_range.merge(&f.meta().time_range);
-            min_sequence = min_sequence.min(f.meta().min_sequence);
         }
 
         let plan = reader.build_df_plan(
@@ -123,52 +113,41 @@ pub async fn rewrite_to_tsf(
         let mut stream = execute_stream(plan, Arc::new(TaskContext::default()))
             .context("execute rewrite plan")?;
 
-        let file_id = SstFile::allocate_id();
-        let (size, num_rows, written_min_sequence) = crate::tsf::write::write_stream(
+        // One output file per UTC day. A single Parquet file that spans several
+        // days therefore becomes several TSF files, each in its own partition
+        // directory (ADR-0002 §8.1).
+        let outputs = crate::tsf::write::write_batches_by_day(
             store,
             path_gen,
             schema,
-            file_id,
             &mut stream,
             &time_range,
         )
         .await
-        .with_context(|| format!("rewrite Parquet files for day {day}"))?;
-
-        let file_meta = FileMeta {
-            max_sequence: file_id,
-            // The encoded file is authoritative: LWW dedup at encode time can
-            // drop rows, so the header's minimum wins over the input minimum.
-            min_sequence: written_min_sequence.min(min_sequence),
-            num_rows: num_rows as u32,
-            size: size as u32,
-            time_range,
-            format: FileFormat::Tsf,
-        };
+        .with_context(|| format!("rewrite Parquet files starting on day {day}"))?;
         ensure!(
-            num_rows > 0,
-            "TSF rewrite produced an empty file for day {day}"
+            !outputs.is_empty(),
+            "TSF rewrite produced no file for day {day}"
         );
+        let num_rows: u64 = outputs.iter().map(|f| f.meta().num_rows as u64).sum();
 
         let to_deletes = inputs.iter().map(|f| f.id()).collect::<Vec<_>>();
-        // Commit the new file first: a crash here leaves both copies, which
+        // Commit the new files first: a crash here leaves both copies, which
         // LWW resolves, instead of losing data.
         manifest
-            .update(ManifestUpdate::new(
-                vec![SstFile::new(file_id, file_meta)],
-                to_deletes.clone(),
-            ))
+            .update(ManifestUpdate::new(outputs.clone(), to_deletes))
             .await?;
 
         info!(
             day,
             inputs = inputs.len(),
+            outputs = outputs.len(),
             num_rows,
             "Rewrote Parquet files to TSF"
         );
         report.rewritten_files += inputs.len();
-        report.output_files += 1;
-        report.output_rows += num_rows as u64;
+        report.output_files += outputs.len();
+        report.output_rows += num_rows;
     }
 
     Ok(report)
@@ -197,6 +176,7 @@ mod tests {
         config::ManifestConfig,
         manifest::Manifest,
         read::ParquetReader,
+        sst::FileMeta,
         types::{StorageSchema, TimeRange},
     };
 
@@ -317,7 +297,6 @@ mod tests {
             assert_eq!(report.rewritten_files, 1);
             assert_eq!(report.output_files, 1);
             assert_eq!(report.output_rows, 2);
-            assert_eq!(report.skipped_multi_day, 0);
             assert!(report.made_progress());
 
             let ssts = manifest.all_ssts().await;
@@ -357,10 +336,11 @@ mod tests {
         });
     }
 
-    /// A Parquet file whose range crosses a UTC day boundary cannot become one
-    /// TSF file, so the rewrite must leave it alone and report it.
+    /// A Parquet file whose range crosses a UTC day boundary becomes one TSF
+    /// file per day, because a TSF file must live in exactly one partition
+    /// directory.
     #[test_log::test(test)]
-    fn test_rewrite_skips_multi_day_parquet() {
+    fn test_rewrite_splits_multi_day_parquet() {
         let root = temp_dir::TempDir::new().unwrap();
         let store: ObjectStoreRef = Arc::new(LocalFileSystem::new());
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
@@ -410,14 +390,43 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(report.skipped_multi_day, 1);
-            assert_eq!(report.rewritten_files, 0);
-            assert!(!report.made_progress());
+            assert_eq!(report.rewritten_files, 1);
+            assert_eq!(report.output_files, 2);
+            assert_eq!(report.output_rows, 2);
+            assert!(report.made_progress());
 
-            // The original file is untouched.
+            // Both days are now TSF, each file in its own partition directory;
+            // the Parquet file is gone from the manifest.
             let ssts = manifest.all_ssts().await;
-            assert_eq!(ssts.len(), 1);
-            assert_eq!(ssts[0].meta().format, FileFormat::Parquet);
+            assert_eq!(ssts.len(), 2);
+            let mut paths = Vec::new();
+            for sst in &ssts {
+                assert_eq!(sst.meta().format, FileFormat::Tsf);
+                // The path directory is the UTC day of the file's start.
+                let expected = path_gen.generate_tsf(
+                    sst.id(),
+                    storage_kernel::tsf::partition::partition_start(*sst.meta().time_range.start),
+                );
+                let path = path_gen.generate_for(sst.id(), sst.meta());
+                assert_eq!(path, expected, "TSF file landed in the wrong partition");
+                store
+                    .get(&object_store::path::Path::from(path.clone()))
+                    .await
+                    .expect("rewritten TSF object must exist");
+                paths.push(path);
+            }
+            assert_ne!(paths[0], paths[1]);
+
+            // The two files still read back through the shared plan.
+            let plan = reader
+                .build_df_plan(manifest.all_ssts().await, None, Vec::new(), true)
+                .unwrap();
+            let mut stream = execute_stream(plan, Arc::new(TaskContext::default())).unwrap();
+            let mut rows = 0;
+            while let Some(batch) = stream.next().await {
+                rows += batch.unwrap().num_rows();
+            }
+            assert_eq!(rows, 2);
         });
     }
 }

@@ -79,7 +79,8 @@ pub trait ColumnarStorage {
     /// (ADR-0002 §10 step 4). A no-op when the table is already all-TSF.
     ///
     /// Safe to call repeatedly: rewritten files are skipped on later passes.
-    /// Files that span more than one UTC day are left as Parquet and reported.
+    /// A file that spans more than one UTC day becomes one TSF file per day,
+    /// because a TSF file must live in exactly one partition directory.
     async fn rewrite_legacy_files(&self) -> Result<crate::tsf::RewriteReport> {
         Err(anyhow::anyhow!("rewrite_legacy_files is not supported by this storage").into())
     }

@@ -847,9 +847,10 @@ Migration procedure:
 4. `tsf::rewrite_to_tsf` (exposed as `ColumnarStorage::rewrite_legacy_files`) reads
    Parquet files, writes TSF files, and swaps them in the manifest. It is not a
    background job yet: the caller decides when to run it, and repeated passes
-   converge because TSF files are skipped. Files that span more than one UTC day are
-   skipped and counted, since splitting them needs page-level work. Once no Parquet
-   file remains, the Parquet reader can be removed.
+   converge because TSF files are skipped. A Parquet file that spans more than one UTC
+   day is split by row timestamp into one TSF file per day, since a TSF file must live
+   in exactly one partition directory. Once no Parquet file remains, the Parquet
+   reader can be removed.
 5. Rollback to Parquet is safe only while dual-read is enabled and new TSF files can
    still be read. After TSF-only data exists, a rollback needs a rewrite, not a flag
    flip. This mirrors the index migration caveat.
@@ -968,6 +969,9 @@ Done:
   Parquet SSTs left behind by a format switch, exposed as
   `ColumnarStorage::rewrite_legacy_files`, and converges when repeated
   (`test_rewrite_parquet_files_to_tsf`, `test_storage_rewrite_legacy_files`).
+  A Parquet file whose range crosses midnight is split by row timestamp into one
+  TSF file per UTC day and committed with all its inputs' deletes in one manifest
+  update (`test_rewrite_splits_multi_day_parquet`).
 - **T2 range reads:** `TsfReader` is built from byte segments (`from_segments`), so a
   reader can hold any subset of a file. `FooterLayout` parses the footer alone and
   names the header/bloom/index ranges; `next_scan_ranges` then walks chunk-group
@@ -1044,8 +1048,6 @@ Follow-up (not yet implemented):
   hit ratios and bloom rejections (the kernel already exposes `CacheStats`, but
   nothing aggregates it), plus flush/commit latency and compaction write
   amplification.
-- **Rewrite across days:** the rewrite job skips files that span more than one UTC
-  day, since splitting them needs page-level work.
 
 Acceptance targets (from the roadmap, made measurable):
 

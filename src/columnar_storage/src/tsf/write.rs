@@ -196,37 +196,6 @@ pub fn day_partition(time_range: &TimeRange) -> crate::Result<(i64, i64)> {
     Ok((start, end))
 }
 
-/// Streams sorted batches into one TSF object.
-///
-/// Shared by the Parquet-to-TSF rewrite job, which handles one day per file
-/// and needs the `(size, rows, min_sequence)` triple. Callers that may see a
-/// range crossing a day boundary use [`write_batches_by_day`] instead.
-pub(crate) async fn write_stream(
-    store: &crate::types::ObjectStoreRef,
-    path_gen: &crate::sst::SstPathGenerator,
-    schema: &StorageSchema,
-    file_id: crate::sst::FileId,
-    stream: &mut datafusion::execution::SendableRecordBatchStream,
-    time_range: &TimeRange,
-) -> crate::Result<(u64, usize, u64)> {
-    use futures::StreamExt;
-
-    let mut rows = Vec::new();
-    let mut written_rows = 0;
-    while let Some(batch) = stream.next().await {
-        let batch = batch.context("get sorted batch")?;
-        written_rows += batch.num_rows();
-        rows.extend(
-            batch_to_rows(&batch, schema)
-                .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
-        );
-    }
-    // `encode_file` re-sorts and dedups, so the stored row count and minimum
-    // sequence can differ from the input; read them back rather than guessing.
-    let encoded = encode_and_put(store, path_gen, file_id, rows, time_range).await?;
-    Ok((encoded.size, written_rows, encoded.min_sequence))
-}
-
 /// Streams sorted batches into one TSF object per UTC day.
 ///
 /// A TSF file must belong to exactly one partition directory (ADR-0002 §8.1),
