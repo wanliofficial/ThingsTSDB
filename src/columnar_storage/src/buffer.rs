@@ -54,7 +54,7 @@ use tracing::{debug, error};
 
 use crate::{
     config::BufferConfig,
-    manifest::ManifestRef,
+    manifest::{ManifestRef, ManifestUpdate},
     sst::{FileFormat, FileId, FileMeta, SstFile, SstPathGenerator},
     storage::WriteRequest,
     types::{ObjectStoreRef, RuntimeRef, StorageSchema, TimeRange, SEQ_COLUMN_NAME},
@@ -320,23 +320,46 @@ impl FlushState {
         let num_rows = combined.num_rows();
         let mut sorted = sort_batch(&self.schema, combined, true).await?;
 
-        let file_id = SstFile::allocate_id();
-        let (object_size, written_rows, min_seq) = match self.format {
-            FileFormat::Parquet => self.write_parquet(file_id, &mut sorted).await?,
-            FileFormat::Tsf => self.write_tsf(file_id, &mut sorted, &time_range).await?,
-        };
-
-        let file_meta = FileMeta {
-            max_sequence: max_seq,
-            min_sequence: min_seq,
-            num_rows: written_rows as u32,
-            size: object_size as u32,
-            time_range,
-            format: self.format,
-        };
-        self.manifest.add_file(file_id, file_meta).await?;
+        match self.format {
+            FileFormat::Parquet => {
+                let file_id = SstFile::allocate_id();
+                let (object_size, written_rows, min_seq) =
+                    self.write_parquet(file_id, &mut sorted).await?;
+                let file_meta = FileMeta {
+                    max_sequence: max_seq,
+                    min_sequence: min_seq,
+                    num_rows: written_rows as u32,
+                    size: object_size as u32,
+                    time_range,
+                    format: FileFormat::Parquet,
+                };
+                self.manifest.add_file(file_id, file_meta).await?;
+            }
+            FileFormat::Tsf => {
+                // A segment can straddle UTC midnight, so this may yield more
+                // than one file. Commit them in a single manifest update: a
+                // half-applied flush would be retried from the WAL and could
+                // duplicate rows.
+                let files = crate::tsf::write::write_batches_by_day(
+                    &self.store,
+                    &self.sst_path_gen,
+                    &self.schema,
+                    &mut sorted,
+                    &time_range,
+                )
+                .await?;
+                let to_adds = files
+                    .into_iter()
+                    .inspect(|f| {
+                        debug!(file_meta = ?f.meta(), segment, "Flushed TSF segment");
+                    })
+                    .collect::<Vec<_>>();
+                self.manifest
+                    .update(ManifestUpdate::new(to_adds, Vec::new()))
+                    .await?;
+            }
+        }
         debug!(
-            file_id,
             segment,
             frames = frames.len(),
             num_rows,
@@ -379,26 +402,6 @@ impl FlushState {
             written_rows,
             if written_rows == 0 { 0 } else { min_seq },
         ))
-    }
-
-    /// Encodes the sorted batches into one TSF object. TSF is single-file, so
-    /// the whole segment is materialized before writing. Returns
-    /// `(size_bytes, rows, min_sequence)`.
-    async fn write_tsf(
-        &self,
-        file_id: FileId,
-        sorted: &mut SendableRecordBatchStream,
-        time_range: &TimeRange,
-    ) -> Result<(u64, usize, u64)> {
-        crate::tsf::write::write_stream(
-            &self.store,
-            &self.sst_path_gen,
-            &self.schema,
-            file_id,
-            sorted,
-            time_range,
-        )
-        .await
     }
 
     pub(crate) fn buffer_is_empty(&self) -> bool {

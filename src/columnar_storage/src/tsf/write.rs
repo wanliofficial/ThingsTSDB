@@ -198,9 +198,9 @@ pub fn day_partition(time_range: &TimeRange) -> crate::Result<(i64, i64)> {
 
 /// Streams sorted batches into one TSF object.
 ///
-/// Shared by the flush path, compaction and the Parquet-to-TSF rewrite job so
-/// the encoding and day-boundary rules stay in one place. Returns
-/// `(object_size, rows, min_sequence)`.
+/// Shared by the Parquet-to-TSF rewrite job, which handles one day per file
+/// and needs the `(size, rows, min_sequence)` triple. Callers that may see a
+/// range crossing a day boundary use [`write_batches_by_day`] instead.
 pub(crate) async fn write_stream(
     store: &crate::types::ObjectStoreRef,
     path_gen: &crate::sst::SstPathGenerator,
@@ -210,8 +210,6 @@ pub(crate) async fn write_stream(
     time_range: &TimeRange,
 ) -> crate::Result<(u64, usize, u64)> {
     use futures::StreamExt;
-
-    let (start, end) = day_partition(time_range)?;
 
     let mut rows = Vec::new();
     let mut written_rows = 0;
@@ -223,16 +221,140 @@ pub(crate) async fn write_stream(
                 .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
         );
     }
+    // `encode_file` re-sorts and dedups, so the stored row count and minimum
+    // sequence can differ from the input; read them back rather than guessing.
+    let encoded = encode_and_put(store, path_gen, file_id, rows, time_range).await?;
+    Ok((encoded.size, written_rows, encoded.min_sequence))
+}
+
+/// Streams sorted batches into one TSF object per UTC day.
+///
+/// A TSF file must belong to exactly one partition directory (ADR-0002 §8.1),
+/// but both flush and compaction group writes by time segment, and a segment
+/// can straddle midnight unless the segment duration divides a day. Splitting
+/// here keeps that invariant at every write site.
+pub(crate) async fn write_batches_by_day(
+    store: &crate::types::ObjectStoreRef,
+    path_gen: &crate::sst::SstPathGenerator,
+    schema: &StorageSchema,
+    stream: &mut datafusion::execution::SendableRecordBatchStream,
+    time_range: &TimeRange,
+) -> crate::Result<Vec<crate::sst::SstFile>> {
+    use futures::StreamExt;
+
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.context("get sorted batch")?;
+        rows.extend(
+            batch_to_rows(&batch, schema)
+                .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
+        );
+    }
+
+    let mut out = Vec::new();
+    for (day, day_rows) in split_rows_by_day(rows, time_range)? {
+        let file_id = crate::sst::SstFile::allocate_id();
+        out.push(write_rows(store, path_gen, file_id, day_rows, &day).await?);
+    }
+    Ok(out)
+}
+
+/// Groups rows by the UTC day of their timestamp.
+///
+/// A TSF file belongs to exactly one partition directory, so a caller that
+/// merges files from several days must split before writing. Returns
+/// `(day_range, rows)` in ascending day order. Every input row must fall inside
+/// `time_range`, which bounds the result.
+pub fn split_rows_by_day(
+    rows: Vec<storage_kernel::tsf::Row>,
+    time_range: &TimeRange,
+) -> crate::Result<Vec<(TimeRange, Vec<storage_kernel::tsf::Row>)>> {
+    use std::collections::BTreeMap;
+
+    use storage_kernel::tsf::partition::{partition_index, partition_start};
+
+    let mut by_day: BTreeMap<i64, Vec<storage_kernel::tsf::Row>> = BTreeMap::new();
+    for row in rows {
+        crate::ensure!(
+            *time_range.start <= row.timestamp && row.timestamp < *time_range.end,
+            "row timestamp {} is outside the compaction range {:?}",
+            row.timestamp,
+            time_range
+        );
+        by_day
+            .entry(partition_index(row.timestamp))
+            .or_default()
+            .push(row);
+    }
+
+    let mut out = Vec::with_capacity(by_day.len());
+    for (day, rows) in by_day {
+        let start = partition_start(day * storage_kernel::tsf::partition::DAY_MS);
+        let end = start + storage_kernel::tsf::partition::DAY_MS;
+        out.push((TimeRange::new(start.into(), end.into()), rows));
+    }
+    Ok(out)
+}
+
+/// Writes already-converted rows for one UTC day as a TSF object.
+pub(crate) async fn write_rows(
+    store: &crate::types::ObjectStoreRef,
+    path_gen: &crate::sst::SstPathGenerator,
+    file_id: crate::sst::FileId,
+    rows: Vec<storage_kernel::tsf::Row>,
+    day: &TimeRange,
+) -> crate::Result<crate::sst::SstFile> {
+    // Record the tightest range the rows actually cover. The manifest uses it
+    // for pruning and for the whole-file TTL check, so a file that happens to
+    // hold only the first hour of a day must not claim the whole day.
+    let min_ts = rows.iter().map(|r| r.timestamp).min().unwrap_or(0);
+    let max_ts = rows.iter().map(|r| r.timestamp).max().unwrap_or(0);
+    let time_range = TimeRange::new(
+        crate::types::Timestamp(min_ts),
+        crate::types::Timestamp(max_ts + 1),
+    );
+
+    let encoded = encode_and_put(store, path_gen, file_id, rows, day).await?;
+    Ok(crate::sst::SstFile::new(
+        file_id,
+        crate::sst::FileMeta {
+            max_sequence: encoded.max_sequence,
+            min_sequence: encoded.min_sequence,
+            num_rows: encoded.rows as u32,
+            size: encoded.size as u32,
+            time_range,
+            format: crate::sst::FileFormat::Tsf,
+        },
+    ))
+}
+
+/// What an encoded TSF object stores, read back from its own header.
+pub(crate) struct EncodedObject {
+    pub size: u64,
+    pub rows: u64,
+    pub min_sequence: u64,
+    pub max_sequence: u64,
+}
+
+/// Encodes `rows` for one day and puts the object.
+async fn encode_and_put(
+    store: &crate::types::ObjectStoreRef,
+    path_gen: &crate::sst::SstPathGenerator,
+    file_id: crate::sst::FileId,
+    rows: Vec<storage_kernel::tsf::Row>,
+    day: &TimeRange,
+) -> crate::Result<EncodedObject> {
+    let (start, end) = day_partition(day)?;
+    crate::ensure!(!rows.is_empty(), "cannot write a TSF file without rows");
     let (bytes, _stats) = encode_file(rows, (start, end), &WriterOptions::default())
         .map_err(|e| anyhow::anyhow!("encode TSF file: {e}"))?;
     let object_size = bytes.len() as u64;
 
-    // Read the sequence span back from the encoded header instead of tracking
-    // it while streaming: `encode_file` dedups by LWW first, so the stored
-    // minimum is the authoritative one.
+    // Read the row count and sequence span back from the encoded header:
+    // `encode_file` dedups by LWW first, so only the header is authoritative.
     let reader = storage_kernel::tsf::file::TsfReader::from_bytes(bytes.clone())
         .map_err(|e| anyhow::anyhow!("reopen encoded TSF file: {e}"))?;
-    let min_sequence = reader.header().min_sequence;
+    let header = reader.header();
 
     let object_path = object_store::path::Path::from(path_gen.generate_tsf(file_id, start));
     store
@@ -242,7 +364,12 @@ pub(crate) async fn write_stream(
         )
         .await
         .context("write TSF object")?;
-    Ok((object_size, written_rows, min_sequence))
+    Ok(EncodedObject {
+        size: object_size,
+        rows: header.row_count,
+        min_sequence: header.min_sequence,
+        max_sequence: header.max_sequence,
+    })
 }
 
 #[cfg(test)]

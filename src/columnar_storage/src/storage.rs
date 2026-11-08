@@ -907,6 +907,111 @@ mod tests {
         });
     }
 
+    /// A segment duration that does not divide a UTC day makes a flush cover
+    /// two days. Each TSF output file must still live in exactly one day
+    /// partition and both halves must be committed (ADR-0002 §8.1).
+    #[test(test)]
+    fn test_storage_tsf_flush_splits_on_day_boundary() {
+        use object_store::path::Path;
+        use storage_kernel::tsf::partition::{partition_label, DAY_MS};
+
+        use crate::sst::FileFormat;
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let runtimes = build_runtimes();
+        runtimes.sst_compact_runtime.clone().block_on(async move {
+            let mut config = config_without_periodic_flush();
+            config.format = crate::config::DataFileFormat::Tsf;
+            // 5 hours does not divide 24, so a segment starting at 20:00 UTC
+            // runs into the next day.
+            let storage = ObjectBasedStorage::try_new(
+                root_dir.path().to_string_lossy().to_string(),
+                Duration::from_hours(5),
+                store,
+                schema.clone(),
+                3, // metric_id, tsid, timestamp
+                config,
+                runtimes,
+            )
+            .await
+            .unwrap();
+
+            let day = 20_000 * DAY_MS;
+            // 22:00 and 00:30 UTC the next day both fall in the 5-hour segment
+            // starting at 20:00, so they flush together but belong to
+            // different day partitions.
+            let t0 = day + 22 * 3_600_000;
+            let t1 = day + 24 * 3_600_000 + 30 * 60_000;
+            for (ts, tsid, value) in [(t0, 10u64, 1.5), (t1, 11, 2.5)] {
+                let batch = record_batch!(
+                    ("metric_id", UInt64, vec![1]),
+                    ("tsid", UInt64, vec![tsid]),
+                    ("timestamp", Int64, vec![ts]),
+                    ("value", Float64, vec![value])
+                )
+                .unwrap();
+                storage
+                    .write(WriteRequest {
+                        batch,
+                        time_range: (ts..ts + 1).into(),
+                        enable_check: true,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            storage.flush_state.flush().await.unwrap();
+
+            let ssts = storage.manifest.all_ssts().await;
+            assert_eq!(ssts.len(), 2, "one TSF file per UTC day");
+            let mut labels = Vec::new();
+            for sst in &ssts {
+                assert_eq!(sst.meta().format, FileFormat::Tsf);
+                let path = storage.sst_path_gen.generate_for(sst.id(), sst.meta());
+                labels.push(path.clone());
+                assert!(
+                    path.contains(&format!(
+                        "/data/{}/",
+                        partition_label(*sst.meta().time_range.start)
+                    )),
+                    "TSF file not in the day partition of its own rows: {path}"
+                );
+                storage
+                    .store
+                    .get(&Path::from(path))
+                    .await
+                    .expect("TSF object must exist");
+            }
+            assert!(labels.iter().any(|p| p.contains(&partition_label(t0))));
+            assert!(labels.iter().any(|p| p.contains(&partition_label(t1))));
+
+            let result_stream = storage
+                .scan(ScanRequest {
+                    range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                    predicate: vec![],
+                    projections: None,
+                })
+                .await
+                .unwrap();
+            let actual = collect_batch(result_stream).await;
+            let expected = record_batch!(
+                ("metric_id", UInt64, vec![1, 1]),
+                ("tsid", UInt64, vec![10, 11]),
+                ("timestamp", Int64, vec![t0, t1]),
+                ("value", Float64, vec![1.5, 2.5])
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+        });
+    }
+
     #[test]
     fn test_storage_sort_batch() {
         let schema = arrow_schema!(("a", UInt8), ("b", UInt8), ("c", UInt8), ("c", UInt8));
