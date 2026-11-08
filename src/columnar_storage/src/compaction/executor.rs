@@ -275,7 +275,9 @@ impl Executor {
                 Ok(vec![SstFile::new(file_id, file_meta)])
             }
             FileFormat::Tsf => {
-                let files = crate::tsf::write::write_batches_by_day(
+                // Compaction is not a flush, so the encode/upload timings are
+                // not attributed to any flush stage.
+                let (files, _timings) = crate::tsf::write::write_batches_by_day(
                     &self.inner.store,
                     &self.inner.sst_path_gen,
                     &self.inner.schema,

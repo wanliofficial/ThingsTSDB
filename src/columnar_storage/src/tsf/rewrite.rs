@@ -116,7 +116,8 @@ pub async fn rewrite_to_tsf(
         // One output file per UTC day. A single Parquet file that spans several
         // days therefore becomes several TSF files, each in its own partition
         // directory (ADR-0002 §8.1).
-        let outputs = crate::tsf::write::write_batches_by_day(
+        // The rewrite is not a flush; its timings are not attributed anywhere.
+        let (outputs, _timings) = crate::tsf::write::write_batches_by_day(
             store,
             path_gen,
             schema,

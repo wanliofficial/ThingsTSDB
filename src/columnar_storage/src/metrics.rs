@@ -148,6 +148,8 @@ pub struct FlushCounters {
     max_millis: AtomicU64,
     sort_millis: AtomicU64,
     write_millis: AtomicU64,
+    encode_millis: AtomicU64,
+    upload_millis: AtomicU64,
     commit_millis: AtomicU64,
     wal_millis: AtomicU64,
     wal_lag_total_millis: AtomicU64,
@@ -156,12 +158,21 @@ pub struct FlushCounters {
 
 /// Where the time inside one flush went. The stages are disjoint and `write`
 /// no longer includes the manifest commit of the produced files.
+///
+/// `encode` and `upload` are a breakdown of `write`, not extra stages: they are
+/// always within it and `write - encode - upload` is Arrow conversion and other
+/// per-segment bookkeeping. The Parquet writer interleaves page encoding and
+/// the object PUT in its streaming writer, so it reports both as zero.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FlushStages {
     /// Merging and sorting the buffered batches of every segment.
     pub sort: Duration,
     /// Encoding and uploading the segment files.
     pub write: Duration,
+    /// CPU part of `write`: Arrow conversion, page encoding, header read-back.
+    pub encode: Duration,
+    /// Object-store PUT part of `write`.
+    pub upload: Duration,
     /// Committing the produced files to the manifest.
     pub commit: Duration,
     /// Removing the WAL files that the flush made durable.
@@ -189,6 +200,10 @@ impl FlushCounters {
             .fetch_add(stages.sort.as_millis() as u64, Ordering::Relaxed);
         self.write_millis
             .fetch_add(stages.write.as_millis() as u64, Ordering::Relaxed);
+        self.encode_millis
+            .fetch_add(stages.encode.as_millis() as u64, Ordering::Relaxed);
+        self.upload_millis
+            .fetch_add(stages.upload.as_millis() as u64, Ordering::Relaxed);
         self.commit_millis
             .fetch_add(stages.commit.as_millis() as u64, Ordering::Relaxed);
         self.wal_millis
@@ -207,6 +222,8 @@ impl FlushCounters {
             max_millis: self.max_millis.load(Ordering::Relaxed),
             sort_millis: self.sort_millis.load(Ordering::Relaxed),
             write_millis: self.write_millis.load(Ordering::Relaxed),
+            encode_millis: self.encode_millis.load(Ordering::Relaxed),
+            upload_millis: self.upload_millis.load(Ordering::Relaxed),
             commit_millis: self.commit_millis.load(Ordering::Relaxed),
             wal_millis: self.wal_millis.load(Ordering::Relaxed),
             wal_lag_total_millis: self.wal_lag_total_millis.load(Ordering::Relaxed),
@@ -230,6 +247,11 @@ pub struct FlushStats {
     pub sort_millis: u64,
     /// Time spent encoding and uploading files.
     pub write_millis: u64,
+    /// CPU part of `write_millis`: Arrow conversion, page encoding and header
+    /// read-back. Always zero for the Parquet writer (see [`FlushStages`]).
+    pub encode_millis: u64,
+    /// Object-store PUT part of `write_millis`. Always zero for Parquet.
+    pub upload_millis: u64,
     /// Time spent committing files to the manifest.
     pub commit_millis: u64,
     /// Time spent removing the flushed WAL files.
@@ -277,6 +299,19 @@ impl FlushStats {
                 self.wal_millis as f64 / total,
             ))
         }
+    }
+
+    /// Splits `write_millis` into its encode and upload parts. Returns `None`
+    /// when the format reports no split (Parquet) or nothing was written.
+    pub fn write_split(&self) -> Option<(f64, f64)> {
+        if self.write_millis == 0 || self.encode_millis + self.upload_millis == 0 {
+            return None;
+        }
+        let total = self.write_millis as f64;
+        Some((
+            self.encode_millis as f64 / total,
+            self.upload_millis as f64 / total,
+        ))
     }
 }
 
@@ -714,11 +749,14 @@ mod tests {
             FlushStages {
                 sort: Duration::from_millis(5),
                 write: Duration::from_millis(20),
+                encode: Duration::from_millis(12),
+                upload: Duration::from_millis(6),
                 commit: Duration::from_millis(2),
                 wal: Duration::from_millis(1),
             },
             Duration::from_millis(900),
         );
+        // A Parquet flush reports no encode/upload split.
         stats.record_flush(
             2_000,
             Duration::from_millis(90),
@@ -727,6 +765,7 @@ mod tests {
                 write: Duration::from_millis(70),
                 commit: Duration::from_millis(3),
                 wal: Duration::from_millis(4),
+                ..Default::default()
             },
             Duration::from_millis(1_500),
         );
@@ -739,11 +778,16 @@ mod tests {
         assert_eq!(snapshot.flush.average_millis(), 60.0);
         assert_eq!(snapshot.flush.sort_millis, 15);
         assert_eq!(snapshot.flush.write_millis, 90);
+        assert_eq!(snapshot.flush.encode_millis, 12);
+        assert_eq!(snapshot.flush.upload_millis, 6);
         assert_eq!(snapshot.flush.commit_millis, 5);
         assert_eq!(snapshot.flush.wal_millis, 5);
         assert_eq!(snapshot.flush.wal_lag_total_millis, 2_400);
         assert_eq!(snapshot.flush.wal_lag_max_millis, 1_500);
         assert_eq!(snapshot.flush.average_wal_lag_millis(), 1_200.0);
+        let (encode, upload) = snapshot.flush.write_split().unwrap();
+        assert!((encode - 12.0 / 90.0).abs() < 1e-9);
+        assert!((upload - 6.0 / 90.0).abs() < 1e-9);
         let (sort, write, commit, wal) = snapshot.flush.stage_ratio().unwrap();
         assert!((sort - 15.0 / 115.0).abs() < 1e-9);
         assert!((write - 90.0 / 115.0).abs() < 1e-9);
@@ -786,6 +830,7 @@ mod tests {
         assert_eq!(CompactionStats::default().deduplicated_rows(), 0);
         assert_eq!(FlushStats::default().average_millis(), 0.0);
         assert_eq!(FlushStats::default().stage_ratio(), None);
+        assert_eq!(FlushStats::default().write_split(), None);
     }
 
     #[test]

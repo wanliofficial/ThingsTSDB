@@ -323,6 +323,8 @@ impl FlushState {
             let timing = self.persist_segment(segment, &frames).await?;
             stages.sort += timing.sort;
             stages.write += timing.write;
+            stages.encode += timing.encode;
+            stages.upload += timing.upload;
             stages.commit += timing.commit;
         }
         Ok(stages)
@@ -353,7 +355,9 @@ impl FlushState {
         let sort = sort_started.elapsed();
 
         let write_started = Instant::now();
-        let (write, commit) = match self.format {
+        // The TSF writer can split `write` into encode (CPU) and upload (PUT);
+        // the streaming Parquet writer cannot, so it reports both as zero.
+        let (write, encode, upload, commit) = match self.format {
             FileFormat::Parquet => {
                 let file_id = SstFile::allocate_id();
                 let (object_size, written_rows, min_seq) =
@@ -369,14 +373,19 @@ impl FlushState {
                 };
                 let commit_started = Instant::now();
                 self.manifest.add_file(file_id, file_meta).await?;
-                (write, commit_started.elapsed())
+                (
+                    write,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    commit_started.elapsed(),
+                )
             }
             FileFormat::Tsf => {
                 // A segment can straddle UTC midnight, so this may yield more
                 // than one file. Commit them in a single manifest update: a
                 // half-applied flush would be retried from the WAL and could
                 // duplicate rows.
-                let files = crate::tsf::write::write_batches_by_day(
+                let (files, timings) = crate::tsf::write::write_batches_by_day(
                     &self.store,
                     &self.sst_path_gen,
                     &self.schema,
@@ -395,7 +404,12 @@ impl FlushState {
                 self.manifest
                     .update(ManifestUpdate::new(to_adds, Vec::new()))
                     .await?;
-                (write, commit_started.elapsed())
+                (
+                    write,
+                    timings.encode,
+                    timings.upload,
+                    commit_started.elapsed(),
+                )
             }
         };
         debug!(
@@ -407,6 +421,8 @@ impl FlushState {
         Ok(FlushStages {
             sort,
             write,
+            encode,
+            upload,
             commit,
             wal: Duration::ZERO,
         })

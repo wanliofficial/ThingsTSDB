@@ -196,6 +196,17 @@ pub fn day_partition(time_range: &TimeRange) -> crate::Result<(i64, i64)> {
     Ok((start, end))
 }
 
+/// Wall time spent inside the TSF write path.
+///
+/// `encode` is CPU work (Arrow conversion, page encoding, header read-back);
+/// `upload` is the object-store PUT. Keeping them apart tells an operator
+/// whether a slow flush is a codec problem or a network problem.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WriteTimings {
+    pub encode: std::time::Duration,
+    pub upload: std::time::Duration,
+}
+
 /// Streams sorted batches into one TSF object per UTC day.
 ///
 /// A TSF file must belong to exactly one partition directory (ADR-0002 §8.1),
@@ -208,9 +219,11 @@ pub(crate) async fn write_batches_by_day(
     schema: &StorageSchema,
     stream: &mut datafusion::execution::SendableRecordBatchStream,
     time_range: &TimeRange,
-) -> crate::Result<Vec<crate::sst::SstFile>> {
+) -> crate::Result<(Vec<crate::sst::SstFile>, WriteTimings)> {
     use futures::StreamExt;
 
+    let mut timings = WriteTimings::default();
+    let encode_started = std::time::Instant::now();
     let mut rows = Vec::new();
     while let Some(batch) = stream.next().await {
         let batch = batch.context("get sorted batch")?;
@@ -219,13 +232,17 @@ pub(crate) async fn write_batches_by_day(
                 .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
         );
     }
+    timings.encode += encode_started.elapsed();
 
     let mut out = Vec::new();
     for (day, day_rows) in split_rows_by_day(rows, time_range)? {
         let file_id = crate::sst::SstFile::allocate_id();
-        out.push(write_rows(store, path_gen, file_id, day_rows, &day).await?);
+        let (file, written) = write_rows(store, path_gen, file_id, day_rows, &day).await?;
+        timings.encode += written.encode;
+        timings.upload += written.upload;
+        out.push(file);
     }
-    Ok(out)
+    Ok((out, timings))
 }
 
 /// Groups rows by the UTC day of their timestamp.
@@ -272,7 +289,7 @@ pub(crate) async fn write_rows(
     file_id: crate::sst::FileId,
     rows: Vec<storage_kernel::tsf::Row>,
     day: &TimeRange,
-) -> crate::Result<crate::sst::SstFile> {
+) -> crate::Result<(crate::sst::SstFile, WriteTimings)> {
     // Record the tightest range the rows actually cover. The manifest uses it
     // for pruning and for the whole-file TTL check, so a file that happens to
     // hold only the first hour of a day must not claim the whole day.
@@ -283,17 +300,20 @@ pub(crate) async fn write_rows(
         crate::types::Timestamp(max_ts + 1),
     );
 
-    let encoded = encode_and_put(store, path_gen, file_id, rows, day).await?;
-    Ok(crate::sst::SstFile::new(
-        file_id,
-        crate::sst::FileMeta {
-            max_sequence: encoded.max_sequence,
-            min_sequence: encoded.min_sequence,
-            num_rows: encoded.rows as u32,
-            size: encoded.size as u32,
-            time_range,
-            format: crate::sst::FileFormat::Tsf,
-        },
+    let (encoded, timings) = encode_and_put(store, path_gen, file_id, rows, day).await?;
+    Ok((
+        crate::sst::SstFile::new(
+            file_id,
+            crate::sst::FileMeta {
+                max_sequence: encoded.max_sequence,
+                min_sequence: encoded.min_sequence,
+                num_rows: encoded.rows as u32,
+                size: encoded.size as u32,
+                time_range,
+                format: crate::sst::FileFormat::Tsf,
+            },
+        ),
+        timings,
     ))
 }
 
@@ -312,7 +332,8 @@ async fn encode_and_put(
     file_id: crate::sst::FileId,
     rows: Vec<storage_kernel::tsf::Row>,
     day: &TimeRange,
-) -> crate::Result<EncodedObject> {
+) -> crate::Result<(EncodedObject, WriteTimings)> {
+    let encode_started = std::time::Instant::now();
     let (start, end) = day_partition(day)?;
     crate::ensure!(!rows.is_empty(), "cannot write a TSF file without rows");
     let (bytes, _stats) = encode_file(rows, (start, end), &WriterOptions::default())
@@ -324,7 +345,9 @@ async fn encode_and_put(
     let reader = storage_kernel::tsf::file::TsfReader::from_bytes(bytes.clone())
         .map_err(|e| anyhow::anyhow!("reopen encoded TSF file: {e}"))?;
     let header = reader.header();
+    let encode = encode_started.elapsed();
 
+    let upload_started = std::time::Instant::now();
     let object_path = object_store::path::Path::from(path_gen.generate_tsf(file_id, start));
     store
         .put(
@@ -333,12 +356,17 @@ async fn encode_and_put(
         )
         .await
         .context("write TSF object")?;
-    Ok(EncodedObject {
-        size: object_size,
-        rows: header.row_count,
-        min_sequence: header.min_sequence,
-        max_sequence: header.max_sequence,
-    })
+    let upload = upload_started.elapsed();
+
+    Ok((
+        EncodedObject {
+            size: object_size,
+            rows: header.row_count,
+            min_sequence: header.min_sequence,
+            max_sequence: header.max_sequence,
+        },
+        WriteTimings { encode, upload },
+    ))
 }
 
 #[cfg(test)]

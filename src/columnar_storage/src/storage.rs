@@ -922,6 +922,18 @@ mod tests {
                     stats.flush.wal_lag_total_millis,
                     stats.flush.wal_lag_max_millis
                 );
+                // TSF splits its write stage into encode and upload; both are
+                // subsets of `write`, up to millisecond truncation. A tiny
+                // flush can round both to zero.
+                assert!(
+                    stats.flush.encode_millis + stats.flush.upload_millis
+                        <= stats.flush.write_millis + 2,
+                    "encode + upload must stay inside write: {:?}",
+                    stats.flush
+                );
+                if stats.flush.encode_millis + stats.flush.upload_millis > 0 {
+                    assert!(stats.flush.write_split().is_some());
+                }
                 // The flush committed one delta; the commit is timed
                 // separately.
                 assert_eq!(stats.manifest.commits, 1);
@@ -975,6 +987,11 @@ mod tests {
                 assert!(stats.parquet.bytes_written > 0);
                 assert_eq!(stats.parquet.rows_written, 4);
                 assert_eq!(stats.tsf, Default::default());
+                // The streaming Parquet writer cannot separate encode from
+                // upload, so both stay zero.
+                assert_eq!(stats.flush.encode_millis, 0);
+                assert_eq!(stats.flush.upload_millis, 0);
+                assert_eq!(stats.flush.write_split(), None);
 
                 let stream = storage
                     .scan(ScanRequest {

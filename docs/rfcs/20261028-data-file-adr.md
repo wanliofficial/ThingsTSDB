@@ -1064,10 +1064,10 @@ Done:
   17.3 ms (gauge) and 9.5 ms (counter) against a 50 ms target, after series
   pushdown replaced a whole-metric decode with a one-series read.
 
-Follow-up (not yet implemented):
-
-- **Remaining observability:** a split of the flush write stage into page encoding
-  and object upload (the streaming Parquet writer interleaves them).
+Follow-up: none. The last item, splitting the flush write stage into page encoding
+and object upload, is implemented for TSF (`FlushStats::encode_millis` /
+`upload_millis`); the streaming Parquet writer interleaves page encoding with the
+object PUT, so it reports both as zero. Phase 2 is complete.
 
 Acceptance targets (from the roadmap, made measurable):
 
@@ -1140,7 +1140,11 @@ Implementation notes:
   reports rows, total and max milliseconds, plus disjoint stage totals: `sort`
   (concat and sort of the buffered batches), `write` (encode and upload), `commit`
   (manifest delta) and `wal` (removal of the flushed WAL files);
-  `FlushStats::stage_ratio` turns them into a profile. Each buffered frame carries
+  `FlushStats::stage_ratio` turns them into a profile. `write` is further split for
+  TSF into `encode` (Arrow conversion, page encoding, header read-back) and `upload`
+  (the object PUT), exposed as `FlushStats::encode_millis` / `upload_millis` and
+  `write_split`; the Parquet streaming writer cannot separate the two, so it leaves
+  both at zero. Each buffered frame carries
   its enqueue instant, so the same record reports `wal_lag` — the age of the oldest
   frame when its WAL file was removed — which is the real
   acknowledged-to-truncated delay; replayed frames start at recovery time, since
