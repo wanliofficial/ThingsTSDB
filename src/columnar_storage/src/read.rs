@@ -56,7 +56,7 @@ use crate::{
     compare_primitive_columns,
     config::UpdateMode,
     operator::{BytesMergeOperator, LastValueOperator, MergeOperator, MergeOperatorRef},
-    sst::{SstFile, SstPathGenerator},
+    sst::{FileFormat, SstFile, SstPathGenerator},
     types::{
         ObjectStoreRef, StorageSchema, BUILTIN_COLUMN_NUM, RESERVED_COLUMN_NAME, SEQ_COLUMN_NAME,
     },
@@ -407,6 +407,10 @@ pub struct ParquetReader {
     store: ObjectStoreRef,
     schema: StorageSchema,
     sst_path_gen: Arc<SstPathGenerator>,
+    /// Per-format read counters (ADR-0002 §13). Only the query reader has one:
+    /// compaction and rewrite build their own readers, whose reads are write
+    /// amplification rather than query traffic.
+    metrics: Option<Arc<crate::metrics::StorageMetrics>>,
 }
 
 impl ParquetReader {
@@ -419,7 +423,14 @@ impl ParquetReader {
             store,
             schema,
             sst_path_gen,
+            metrics: None,
         }
+    }
+
+    /// Attaches per-format read counters to the plans this reader builds.
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::StorageMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     fn build_sort_exprs(&self, df_schema: &DFSchema, sort_seq: bool) -> Result<LexOrdering> {
@@ -453,6 +464,16 @@ impl ParquetReader {
         let df_schema =
             DFSchema::try_from(self.schema.arrow_schema.clone()).context("build DFSchema")?;
         let sort_exprs = self.build_sort_exprs(&df_schema, true /* sort_seq */)?;
+
+        // One read per selected file, per format.
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .for_format(FileFormat::Parquet)
+                .record_file_read_many(parquet_ssts.len() as u64);
+            metrics
+                .for_format(FileFormat::Tsf)
+                .record_file_read_many(tsf_ssts.len() as u64);
+        }
 
         // Build one physical plan per format and merge under the sort.
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -498,6 +519,10 @@ impl ParquetReader {
                     projection.clone(),
                     sort_exprs.clone(),
                 )
+                .map(|exec| match &self.metrics {
+                    Some(metrics) => exec.with_metrics(metrics.clone()),
+                    None => exec,
+                })
                 .map_err(|e| anyhow::anyhow!("build TSF plan: {e}"))?,
             ));
         }
@@ -568,8 +593,18 @@ impl ParquetReader {
             .with_file_groups(file_groups)
             .with_projection(projection);
 
+        // Count Parquet reads at the object store: `ParquetExec` owns its
+        // reader and reports nothing upward.
+        let read_store = match &self.metrics {
+            Some(metrics) => Arc::new(crate::metrics::CountingStore::new(
+                self.store.clone(),
+                metrics.clone(),
+                FileFormat::Parquet,
+            )) as ObjectStoreRef,
+            None => self.store.clone(),
+        };
         let mut builder = ParquetExec::builder(scan_config).with_parquet_file_reader_factory(
-            Arc::new(DefaultParquetFileReaderFactory::new(self.store.clone())),
+            Arc::new(DefaultParquetFileReaderFactory::new(read_store)),
         );
         match conjunction(predicates) {
             Some(expr) => {

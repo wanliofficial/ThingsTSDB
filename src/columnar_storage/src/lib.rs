@@ -22,6 +22,7 @@ mod compaction;
 pub mod config;
 mod macros;
 pub mod manifest;
+pub mod metrics;
 pub mod operator;
 pub mod partition;
 mod read;

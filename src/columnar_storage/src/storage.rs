@@ -98,6 +98,14 @@ pub trait ColumnarStorage {
     async fn gc_orphans(&self) -> Result<crate::partition::GcReport> {
         Err(anyhow::anyhow!("gc_orphans is not supported by this storage").into())
     }
+
+    /// Per-format I/O counters (ADR-0002 §13).
+    ///
+    /// Write counters come from the manifest commit, read counters from the
+    /// query plans, so both reflect real file content and real fetched bytes.
+    fn stats(&self) -> crate::metrics::StorageStats {
+        crate::metrics::StorageStats::default()
+    }
 }
 
 pub type ColumnarStorageRef = Arc<dyn ColumnarStorage + Send + Sync>;
@@ -132,6 +140,8 @@ pub struct ObjectBasedStorage {
     manifest: ManifestRef,
     runtimes: StorageRuntimes,
     parquet_reader: Arc<ParquetReader>,
+    /// Per-format write/read counters (ADR-0002 §13).
+    metrics: Arc<crate::metrics::StorageMetrics>,
     write_props: WriterProperties,
     sst_path_gen: Arc<SstPathGenerator>,
     compact_scheduler: CompactionScheduler,
@@ -171,14 +181,17 @@ impl ObjectBasedStorage {
         )
         .await?;
         let manifest = Arc::new(manifest);
+        let metrics = Arc::new(crate::metrics::StorageMetrics::default());
+        // Every file commit funnels through the manifest, so this is the one
+        // place that sees all writes: flush, compaction and rewrite alike.
+        manifest.attach_metrics(metrics.clone());
         let write_props = Self::build_write_props(storage_opts.write, num_primary_keys);
         let format = storage_opts.format.clone().into();
         let sst_path_gen = Arc::new(SstPathGenerator::new(path.clone()));
-        let parquet_reader = Arc::new(ParquetReader::new(
-            store.clone(),
-            schema.clone(),
-            sst_path_gen.clone(),
-        ));
+        let parquet_reader = Arc::new(
+            ParquetReader::new(store.clone(), schema.clone(), sst_path_gen.clone())
+                .with_metrics(metrics.clone()),
+        );
         let compact_scheduler = CompactionScheduler::new(
             runtimes.sst_compact_runtime.clone(),
             manifest.clone(),
@@ -233,6 +246,7 @@ impl ObjectBasedStorage {
             store,
             manifest,
             parquet_reader,
+            metrics,
             runtimes,
             write_props,
             sst_path_gen,
@@ -378,6 +392,10 @@ impl ColumnarStorage for ObjectBasedStorage {
 
     async fn gc_orphans(&self) -> Result<crate::partition::GcReport> {
         self.partition_manager.gc_orphans().await
+    }
+
+    fn stats(&self) -> crate::metrics::StorageStats {
+        self.metrics.snapshot()
     }
 }
 
@@ -801,6 +819,141 @@ mod tests {
             // A second pass has nothing left to do.
             assert!(!storage.gc_orphans().await.unwrap().made_progress());
         });
+    }
+
+    /// Per-format I/O counters must attribute writes and reads to the format
+    /// that served them (ADR-0002 §13).
+    #[test(test)]
+    fn test_storage_stats_are_split_by_format() {
+        use crate::{config::DataFileFormat, metrics::StorageStats, types::Timestamp};
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        async fn write_rows(storage: &ObjectBasedStorage, ts: i64, value: f64) {
+            let batch = record_batch!(
+                ("metric_id", UInt64, vec![1, 1]),
+                ("tsid", UInt64, vec![10, 11]),
+                ("timestamp", Int64, vec![ts, ts]),
+                ("value", Float64, vec![value, value])
+            )
+            .unwrap();
+            storage
+                .write(WriteRequest {
+                    batch,
+                    time_range: (ts..ts + 1).into(),
+                    enable_check: true,
+                })
+                .await
+                .unwrap();
+        }
+
+        // A TSF root: writes and reads land in the TSF counters only.
+        {
+            let root_dir = temp_dir::TempDir::new().unwrap();
+            let runtimes = build_runtimes();
+            let tsf_schema = schema.clone();
+            runtimes.sst_compact_runtime.clone().block_on(async move {
+                let mut config = config_without_periodic_flush();
+                config.format = DataFileFormat::Tsf;
+                let storage = ObjectBasedStorage::try_new(
+                    root_dir.path().to_string_lossy().to_string(),
+                    Duration::from_hours(2),
+                    Arc::new(LocalFileSystem::new()),
+                    tsf_schema,
+                    3,
+                    config,
+                    runtimes,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(storage.stats(), StorageStats::default());
+
+                let t0 = 1_700_000_000_000i64;
+                write_rows(&storage, t0, 1.0).await;
+                write_rows(&storage, t0 + 1, 2.0).await;
+                // Writes are buffered, so nothing has been committed yet.
+                assert_eq!(storage.stats().tsf.files_written, 0);
+                storage.flush_state.flush().await.unwrap();
+
+                let stats = storage.stats();
+                assert_eq!(stats.tsf.files_written, 1);
+                assert!(stats.tsf.bytes_written > 0);
+                assert_eq!(stats.tsf.rows_written, 4);
+                assert_eq!(stats.parquet, Default::default());
+                assert_eq!(stats.tsf.files_read, 0);
+
+                let stream = storage
+                    .scan(ScanRequest {
+                        range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                        predicate: vec![],
+                        projections: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(collect_batch(stream).await.num_rows(), 4);
+
+                let stats = storage.stats();
+                assert_eq!(stats.tsf.files_read, 1);
+                // The whole file has to be read to return every row.
+                assert_eq!(stats.tsf.bytes_read, stats.tsf.bytes_written);
+                assert_eq!(stats.parquet, Default::default());
+            });
+        }
+
+        // A Parquet root: the same counters, on the other side.
+        {
+            let root_dir = temp_dir::TempDir::new().unwrap();
+            let runtimes = build_runtimes();
+            runtimes.sst_compact_runtime.clone().block_on(async move {
+                let storage = ObjectBasedStorage::try_new(
+                    root_dir.path().to_string_lossy().to_string(),
+                    Duration::from_hours(2),
+                    Arc::new(LocalFileSystem::new()),
+                    schema.clone(),
+                    3,
+                    config_without_periodic_flush(),
+                    runtimes,
+                )
+                .await
+                .unwrap();
+
+                let t0 = 1_700_000_000_000i64;
+                write_rows(&storage, t0, 1.0).await;
+                write_rows(&storage, t0 + 1, 2.0).await;
+                assert_eq!(storage.stats().parquet.files_written, 0);
+                storage.flush_state.flush().await.unwrap();
+
+                let stats = storage.stats();
+                assert_eq!(stats.parquet.files_written, 1);
+                assert!(stats.parquet.bytes_written > 0);
+                assert_eq!(stats.parquet.rows_written, 4);
+                assert_eq!(stats.tsf, Default::default());
+
+                let stream = storage
+                    .scan(ScanRequest {
+                        range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                        predicate: vec![],
+                        projections: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(collect_batch(stream).await.num_rows(), 4);
+
+                let stats = storage.stats();
+                assert_eq!(stats.parquet.files_read, 1);
+                assert!(stats.parquet.bytes_read > 0);
+                // A full scan reads the footer and the row group, not
+                // necessarily every byte, so compare against the file size
+                // rather than requiring equality.
+                assert!(stats.parquet.bytes_read <= stats.parquet.bytes_written);
+                assert_eq!(stats.tsf, Default::default());
+            });
+        }
     }
 
     /// Migration dual-read: an old Parquet SST and a new TSF SST in the same

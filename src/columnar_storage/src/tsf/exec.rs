@@ -48,6 +48,8 @@ use storage_kernel::tsf::{
 };
 
 use crate::{
+    metrics::StorageMetrics,
+    sst::FileFormat,
     tsf::scan::{decoded_columns_to_batch, tsf_schema},
     types::{ObjectStoreRef, StorageSchema, TimeRange},
 };
@@ -211,6 +213,8 @@ pub struct TsfExec {
     /// Files at or below this size are read whole; see
     /// [`WHOLE_FILE_THRESHOLD`]. Tests set it to zero to force ranged reads.
     min_ranged_bytes: u64,
+    /// Per-format read counters (ADR-0002 §13), when the caller attached them.
+    metrics: Option<Arc<StorageMetrics>>,
     cache: PlanProperties,
 }
 
@@ -268,8 +272,16 @@ impl TsfExec {
             projection,
             output_schema,
             min_ranged_bytes: WHOLE_FILE_THRESHOLD,
+            metrics: None,
             cache,
         })
+    }
+
+    /// Attaches per-format read counters. Every byte fetched for a TSF file is
+    /// added to the TSF read counter.
+    pub fn with_metrics(mut self, metrics: Arc<StorageMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Forces ranged reads for files larger than `bytes`.
@@ -333,6 +345,7 @@ impl TsfExec {
                 .bytes()
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            self.record_bytes_read(bytes.len() as u64);
             return TsfReader::from_bytes(bytes.to_vec())
                 .map_err(|e| DataFusionError::Execution(format!("open TSF file {path}: {e}")));
         }
@@ -412,7 +425,20 @@ impl TsfExec {
             .buffered(FETCH_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
+        let bytes = fetched.iter().map(|(_, data)| data.len() as u64).sum();
+        self.record_bytes_read(bytes);
         Ok(fetched)
+    }
+
+    /// Adds bytes actually fetched from the object store to the TSF read
+    /// counter. Both the whole-object path and the ranged path call it; a
+    /// `head` carries no bytes and is never counted.
+    fn record_bytes_read(&self, bytes: u64) {
+        if bytes > 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.for_format(FileFormat::Tsf).record_bytes_read(bytes);
+            }
+        }
     }
 
     fn project(&self, batch: RecordBatch) -> DfResult<RecordBatch> {
@@ -478,6 +504,7 @@ impl ExecutionPlan for TsfExec {
             projection: self.projection.clone(),
             output_schema: self.output_schema.clone(),
             min_ranged_bytes: self.min_ranged_bytes,
+            metrics: self.metrics.clone(),
             cache: self.cache.clone(),
         };
         // One partition per file keeps every emitted stream sorted, which is

@@ -19,7 +19,7 @@ mod encoding;
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, LazyLock,
+        Arc, LazyLock, RwLock as StdRwLock,
     },
     time::{Duration, SystemTime},
 };
@@ -40,6 +40,7 @@ use tracing::{debug, error, info, trace};
 
 use crate::{
     config::ManifestConfig,
+    metrics::StorageMetrics,
     sst::{FileId, FileMeta, SstFile},
     types::{ObjectStoreRef, RuntimeRef, TimeRange},
     AnyhowError, Result,
@@ -70,6 +71,9 @@ pub struct Manifest {
     merger: Arc<ManifestMerger>,
 
     ssts: RwLock<Vec<SstFile>>,
+    /// Optional per-format write counters. Attached by the storage layer, so
+    /// that tests and tools can build a manifest without one.
+    metrics: StdRwLock<Option<Arc<StorageMetrics>>>,
 }
 
 impl Manifest {
@@ -109,7 +113,17 @@ impl Manifest {
             store,
             merger,
             ssts: RwLock::new(ssts),
+            metrics: StdRwLock::new(None),
         })
+    }
+
+    /// Attaches per-format write counters.
+    ///
+    /// Called once by the storage layer after construction. Every file commit
+    /// funnels through [`Self::update_inner`], so this is the single place that
+    /// sees all writes: flush, compaction and the Parquet-to-TSF rewrite.
+    pub fn attach_metrics(&self, metrics: Arc<StorageMetrics>) {
+        *self.metrics.write().unwrap() = Some(metrics);
     }
 
     pub async fn add_file(&self, id: FileId, meta: FileMeta) -> Result<()> {
@@ -144,6 +158,16 @@ impl Manifest {
 
         // 2. Update cached payload
         {
+            if let Some(metrics) = self.metrics.read().unwrap().as_ref() {
+                for file in &update.to_adds {
+                    let meta = file.meta();
+                    metrics.for_format(meta.format).record_write(
+                        1,
+                        meta.size as u64,
+                        meta.num_rows as u64,
+                    );
+                }
+            }
             let mut ssts = self.ssts.write().await;
             for file in update.to_adds {
                 ssts.push(file);

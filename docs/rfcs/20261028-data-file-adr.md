@@ -962,14 +962,27 @@ Done:
   `test_gc_orphans_keeps_live_files_and_bytes`,
   `test_storage_drop_expired_and_gc_orphans`).
 
+- **T4 per-format metrics:** `columnar_storage::metrics` keeps `files_written`,
+  `bytes_written`, `rows_written`, `files_read` and `bytes_read` per `FileFormat`.
+  Writes are counted at the one point every commit passes through
+  (`Manifest::update_inner`), so flush, compaction and the rewrite all report real
+  `FileMeta` sizes. TSF reads are counted by `TsfExec` from the bytes it actually
+  fetches (both the whole-object and the ranged path); Parquet reads go through a
+  `CountingStore` decorator, because `ParquetExec` owns its reader and reports
+  nothing upward. Exposed as `ColumnarStorage::stats()`
+  (`test_storage_stats_are_split_by_format`,
+  `test_counting_store_counts_reads_but_not_heads`).
+
 Follow-up (not yet implemented):
 
 - **T3 compaction policies:** small/big compaction-job selection beyond the current
   time-window strategy, and kill -9 crash-recovery tests (WAL replay and orphan
   cleanup are implemented, the fault-injection suite is not).
-- **T4 per-format metrics:** write/read counters are not split by format yet. The
-  rewrite job currently skips files that span more than one UTC day, since splitting
-  them needs page-level work.
+- **Remaining observability:** codec selection and fallback counts, page/index-cache
+  hit ratios and bloom rejections (the kernel already exposes `CacheStats`, but
+  nothing aggregates it), plus flush/commit latency and compaction write
+  amplification. The rewrite job currently skips files that span more than one UTC
+  day, since splitting them needs page-level work.
 - **T5:** the full size/write-throughput/query-p99/recovery benchmark matrix.
 
 Acceptance targets (from the roadmap, made measurable):
@@ -1011,6 +1024,29 @@ Expose from T1/T2:
 - flush duration, fsync/upload duration, manifest commit latency, WAL truncation lag;
 - partition drop count and duration, orphan files GCed;
 - corrupt files, CRC failures, late writes outside retention.
+
+Implementation notes:
+
+- **Per-format split is deliberate.** During migration a single "bytes read" number
+  hides how much traffic still reaches Parquet and how a format switch changes the
+  write/read volume, so every counter lives in a `FormatCounters` chosen by
+  `FileFormat`. `StorageStats::{parquet, tsf}` snapshots both, and `total()` /
+  `for_format()` are conveniences over them.
+- **Writes are counted once, at commit.** `Manifest::update_inner` is the single
+  chokepoint for flush, compaction and rewrite output, and it reads the counters off
+  the `FileMeta` being committed, so bytes and rows are file content rather than an
+  estimate. A file that is written but never committed is not counted.
+- **Reads are counted where the bytes are known.** TSF reads are counted by
+  `TsfExec::fetch` (and by its whole-object path for small files), which is also what
+  the ranged-read tests inspect; `head` requests carry no bytes and are skipped.
+  Parquet reads are counted by `CountingStore`, an `ObjectStore` decorator that wraps
+  only the query path — compaction and rewrite build their own readers, and their
+  traffic is write amplification, not query traffic.
+- **Counters are relaxed atomics.** They are advisory (dashboards, migration
+  tracking) and must not become a synchronization point on the read path.
+- Not yet aggregated: kernel `CacheStats` (page/index cache hits, evictions, bloom
+  rejects) and per-codec counters. They exist at the file level; surfacing them needs
+  a storage-wide registry.
 
 # Drawbacks
 
