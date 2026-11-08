@@ -27,6 +27,8 @@ members = [
     "src/server",
     "src/storage_kernel"
 ]
+# `cargo fuzz` keeps its own workspace and a nightly-only dependency.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "2.2.0-alpha"

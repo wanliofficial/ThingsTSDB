@@ -929,7 +929,10 @@ Done:
   projected decode buffers, reusable page buffers, a golden page-header layout test,
   a 1M-row round-trip test and the §4.8 uncompressed-page flag. The randomized
   differential suite runs 128 pages per commit and 100k pages as an ignored nightly
-  test; `cargo-fuzz` targets are not wired yet.
+  test. `cargo-fuzz` targets are wired in `fuzz/` (`page_decode`, `page_roundtrip`,
+  `file_read`, `checksum_differential`); a 15-30 s smoke run of each is clean
+  (27k-328k executions, no crash or sanitizer report), and `fuzz/README.md` records
+  the longer run commands.
 - **T2 boundary** in `columnar_storage::tsf`: `DecodedColumns`, zero-copy Arrow
   emission, Arrow sequence filtering and the 2x-plus full-scan result measured in
   the decode plan.

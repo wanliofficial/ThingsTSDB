@@ -1,0 +1,45 @@
+[package]
+name = "storage-kernel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.storage_kernel]
+path = "../src/storage_kernel"
+
+[[bin]]
+name = "page_decode"
+path = "fuzz_targets/page_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "page_roundtrip"
+path = "fuzz_targets/page_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_read"
+path = "fuzz_targets/file_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checksum_differential"
+path = "fuzz_targets/checksum_differential.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
