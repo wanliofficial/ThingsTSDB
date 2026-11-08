@@ -707,6 +707,14 @@ format-aware path generator maps `(partition, file_id, format)` to the path, and
 manifest's `format` decides which reader is used. New Parquet files are written only
 while `format = "parquet"`. The manifest remains the source of truth.
 
+The partition directory comes from the file's first row, so every file must hold rows
+from exactly one UTC day. Neither the flush nor the compaction write path can rely on
+its input being that narrow: both group work by time **segment**, and a segment aligns
+with a day only when the segment duration divides 24 hours. Both therefore split their
+output by UTC day (`tsf::write::write_batches_by_day`) and may produce several files
+from one segment. The manifest `time_range` of each output stays the real row coverage,
+not the day bounds, so pruning and whole-file TTL remain accurate.
+
 ### 8.2 Manifest changes
 
 `FileMeta` gains two fields:
@@ -802,9 +810,12 @@ Migration procedure:
    index migration split from ADR-0001 is orthogonal: the index path is chosen by
    `__seq__`, while the data reader is chosen by `FileMeta.format`. A query may
    therefore combine a legacy index with a TSF file or a new index with a Parquet file.
-4. A background rewrite reads Parquet files within retention, writes TSF files, and
-   swaps them in the manifest. Once no Parquet file remains, the Parquet reader can be
-   removed.
+4. `tsf::rewrite_to_tsf` (exposed as `ColumnarStorage::rewrite_legacy_files`) reads
+   Parquet files, writes TSF files, and swaps them in the manifest. It is not a
+   background job yet: the caller decides when to run it, and repeated passes
+   converge because TSF files are skipped. Files that span more than one UTC day are
+   skipped and counted, since splitting them needs page-level work. Once no Parquet
+   file remains, the Parquet reader can be removed.
 5. Rollback to Parquet is safe only while dual-read is enabled and new TSF files can
    still be read. After TSF-only data exists, a rollback needs a rewrite, not a flag
    flip. This mirrors the index migration caveat.
@@ -890,22 +901,29 @@ Done:
 - **T2 flush path**: `FlushState` writes either Parquet or TSF per
   `StorageConfig::format`; `columnar_storage::tsf::write::{batch_to_rows,
   encode_batch}` converts sorted batches and rejects schemas other than the sample
-  `(metric_id, tsid, timestamp, value)`. TSF output must stay inside one UTC day and
-  is written to `{root}/data/{YYYYMMDD}/{file_id}.tsf`. Covered by
-  `test_storage_tsf_flush_and_scan`.
+  `(metric_id, tsid, timestamp, value)`. TSF output is written to
+  `{root}/data/{YYYYMMDD}/{file_id}.tsf`. Because flush groups frames by segment and
+  a segment only aligns with a day when the duration divides 24h,
+  `write_batches_by_day` splits a straddling segment into one file per UTC day and
+  commits them in a single manifest update. Covered by
+  `test_storage_tsf_flush_and_scan` and `test_storage_tsf_flush_splits_on_day_boundary`.
 - **T3** in `storage_kernel::tsf`: pure UTC-day partition/TTL helpers and pure
   compaction policy/LWW-dedup helpers; `Manifest::plan_ttl_drop` and
   `drop_expired_partitions` drive a manifest-first, object-delete-after TTL drop
   (`test_plan_and_drop_ttl_partitions`). Compaction output honors the configured
-  format, refuses TSF output that would span a day, and carries `min_sequence`
-  across its inputs.
+  format, splits TSF output by UTC day for the same segment-straddling reason, and
+  never narrows or widens the `(min_sequence, max_sequence)` span of its inputs
+  (`test_merge_inputs_splits_tsf_output_by_day`).
 - **T4** in `pb_types`/`columnar_storage`: `SstMeta` gained `min_sequence` (5) and
   `format` (6) with the new `FileFormat` enum, defaulting to `PARQUET_V1` so old
   manifests and deltas still parse. Snapshot records are versioned (v1 = 32 bytes,
   v2 = 44 bytes) with v1 dual-read that upgrades on the next rewrite. The query path
   partitions SSTs by format in `build_df_plan` and unions `ParquetExec` with the new
   `TsfExec`, so a root written by both formats scans as one merge stream
-  (`test_storage_dual_read_parquet_and_tsf`).
+  (`test_storage_dual_read_parquet_and_tsf`). `tsf::rewrite_to_tsf` migrates the
+  Parquet SSTs left behind by a format switch, exposed as
+  `ColumnarStorage::rewrite_legacy_files`, and converges when repeated
+  (`test_rewrite_parquet_files_to_tsf`, `test_storage_rewrite_legacy_files`).
 
 Follow-up (not yet implemented):
 
@@ -913,7 +931,9 @@ Follow-up (not yet implemented):
   are still pending.
 - **T3 partition manager:** automatic partition discovery, small/big compaction job
   policies, crash recovery and orphan GC beyond the pure helpers and the TTL drop.
-- **T4 rewrite job:** a background Parquet-to-TSF rewrite, and per-format metrics.
+- **T4 per-format metrics:** write/read counters are not split by format yet. The
+  rewrite job currently skips files that span more than one UTC day, since splitting
+  them needs page-level work.
 - **T5:** the full size/write-throughput/query-p99/recovery benchmark matrix.
 
 The remaining work is mostly operational plumbing (partition manager, GC, rewrite
