@@ -954,7 +954,21 @@ Done:
   still read whole, where the round trips cost more than the bytes they save. The
   merge stream also emits batches of distinct primary keys in bulk instead of
   slicing one batch per row (`test_merge_stream_bulk_path_for_distinct_keys`), which
-  was the full-scan bottleneck in the T5 benchmark (0.7 -> 24-57 M rows/s).
+  was the full-scan bottleneck in the T5 benchmark (0.7 -> 20-42 M rows/s).
+- **T2 series pushdown:** `TsfExec::with_pushdown` takes a `TsfPushdown` extracted
+  from the scan predicates by `TsfPushdown::from_predicates`: `metric_id` and
+  `tsid` equality or non-negated `IN` lists, intersected when a column is
+  constrained more than once. Anything else (ranges, `OR`, `NOT IN`, a cast on the
+  column) is dropped, so the pushed set is always a superset of the matching rows
+  and the `FilterExec` above the scan stays authoritative. The kernel planner
+  (`next_scan_ranges`, `page_ranges_for_metrics`) takes a `SeriesFilter` and skips
+  series-index blocks that cover no requested ID and series chunks of other series;
+  the decode path calls `read_series_columns` per requested series instead of
+  `read_metric_columns` for all of them. A 30-day single-series query therefore
+  reads one series chunk per file instead of the whole file
+  (`test_pushdown_extracts_id_constraints`,
+  `test_pushdown_filters_metrics_and_series`,
+  `test_series_filter_plans_only_requested_series`).
 - **T3 partition manager / GC:** `columnar_storage::partition::PartitionManager`
   discovers day partitions under `data/` with `list_with_delimiter` +
   `parse_partition_label`, drives TTL drops through `Manifest::drop_expired_partitions`
@@ -980,17 +994,13 @@ Done:
   write throughput, full-scan throughput, 1-day/30-day single-series p50/p99,
   page pruning and restart). Results and analysis are in
   `docs/rfcs/20261028-phase2-benchmark.md`. Full scan was 0.7 M rows/s before the
-  merge fast path and is 24-57 M rows/s after; the one target that still fails is
-  the 30-day single-series p99, because `TsfExec` has no series pushdown.
+  merge fast path and is 20-42 M rows/s after. Every latency target now passes:
+  the 30-day single-series p99 is 20.3 ms (gauge) and 12.7 ms (counter) against a
+  50 ms target, after series pushdown replaced a whole-metric decode with a
+  one-series read.
 
 Follow-up (not yet implemented):
 
-- **T2 series pushdown:** `TsfExec` decodes every series of a metric in the time
-  window and the `tsid` predicate is applied above the scan. Parquet's row-group
-  statistics prune to the target series, so the 30-day single-series query reads
-  9.1 MB and takes 39 ms there, against 62.5 MB and 263 ms for TSF. The series
-  index and `read_series_columns` already exist; what is missing is predicate
-  extraction and a series-scoped scan plan.
 - **T3 compaction policies:** small/big compaction-job selection beyond the current
   time-window strategy, and kill -9 crash-recovery tests (WAL replay and orphan
   cleanup are implemented, the fault-injection suite is not).
@@ -1028,9 +1038,10 @@ shape; buffer reuse and cheaper codec selection are the first optimizations. The
 decode follow-up is specified in `docs/rfcs/20261029-vectorized-decode-plan.md`.
 
 End-to-end results for the finished storage path (WAL, manifest, both formats, 30 day
-partitions) are in `docs/rfcs/20261028-phase2-benchmark.md`: full scan 24-57 M rows/s,
-durable ingest 1.4-1.9 M rows/s (above Parquet), 1-day query p99 under 25 ms. The open
-gap there is TSF series pushdown, which the 30-day single-series p99 reflects.
+partitions) are in `docs/rfcs/20261028-phase2-benchmark.md`: full scan 20-42 M rows/s,
+durable ingest 1.3-1.8 M rows/s (above Parquet), 1-day query p99 2-5 ms, 30-day
+single-series p99 13-20 ms. Size is 2.3x smaller than Parquet on gauge and 200x on
+counter; the remaining size miss is the incompressible f64 mantissa, not the format.
 
 ## 13. Observability
 

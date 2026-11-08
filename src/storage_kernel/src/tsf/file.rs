@@ -144,6 +144,55 @@ impl DecodedColumns {
     }
 }
 
+/// A sorted, deduplicated set of series IDs that a scan may decode.
+///
+/// A query usually knows its series before it reads: the metric engine resolves
+/// label matchers to `tsid`s and pushes them down as `tsid IN (...)`. Passing
+/// that set to the planner turns "read every series of the metric" into "read
+/// these series chunks only", which is the difference between a full-metric
+/// decode and a single-series one.
+///
+/// An empty filter matches no series. It is distinct from "no filter", which
+/// [`TsfReader::next_scan_ranges`] expresses as `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeriesFilter {
+    ids: Vec<u64>,
+}
+
+impl SeriesFilter {
+    /// Builds a filter from any ID order; duplicates are removed.
+    pub fn new(ids: impl IntoIterator<Item = u64>) -> Self {
+        let mut ids = ids.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        Self { ids }
+    }
+
+    pub fn contains(&self, series_id: u64) -> bool {
+        self.ids.binary_search(&series_id).is_ok()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// The IDs, ascending and deduplicated.
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    /// True when the closed interval `[first, last]` holds a filtered ID. Used
+    /// to skip whole series-index blocks, which cover a contiguous ID range.
+    fn intersects_block(&self, first: u64, last: u64) -> bool {
+        let idx = self.ids.partition_point(|&id| id < first);
+        matches!(self.ids.get(idx), Some(&id) if id <= last)
+    }
+}
+
 /// Counters exposed for ADR-0002 §13 observability.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -969,7 +1018,15 @@ impl TsfReader {
     /// them, and calls again. Every level only requests ranges that overlap the
     /// query, so a narrow scan touches few series and, in the last level, few
     /// pages (see [`TsfReader::page_ranges_for_metrics`]).
-    pub fn next_scan_ranges(&self, metrics: &[(u64, TimeRange)]) -> Option<Vec<(u64, u64)>> {
+    ///
+    /// `series` restricts the plan to a set of series IDs: series-index blocks
+    /// that cover no filtered ID and series chunks for other series are never
+    /// requested. `None` plans for every series of the metric.
+    pub fn next_scan_ranges(
+        &self,
+        metrics: &[(u64, TimeRange)],
+        series: Option<&SeriesFilter>,
+    ) -> Option<Vec<(u64, u64)>> {
         let mut wanted: Vec<(u64, u64)> = Vec::new();
         let note = |wanted: &mut Vec<(u64, u64)>, offset: u64, size: u64| {
             let end = offset + size;
@@ -1005,6 +1062,11 @@ impl TsfReader {
                 continue;
             };
             for row in &rows {
+                if let Some(filter) = series {
+                    if !filter.intersects_block(row.first_series_id, row.last_series_id) {
+                        continue;
+                    }
+                }
                 if !self.has_range(row.block_offset, row.block_size as u64) {
                     note(&mut wanted, row.block_offset, row.block_size as u64);
                 }
@@ -1019,6 +1081,11 @@ impl TsfReader {
                 for entry in entries {
                     if entry.max_timestamp < range.start || entry.min_timestamp >= range.end {
                         continue;
+                    }
+                    if let Some(filter) = series {
+                        if !filter.contains(entry.series_id) {
+                            continue;
+                        }
                     }
                     let chunk_header_size = SERIES_CHUNK_HEADER_SIZE as u64;
                     if !self.has_range(entry.chunk_offset, chunk_header_size) {
@@ -1059,8 +1126,13 @@ impl TsfReader {
     ///
     /// Requires the metadata that [`TsfReader::next_scan_ranges`] asks for to
     /// be loaded. Pages whose time bounds miss `range` are skipped, so this is
-    /// the finest pruning the format allows.
-    pub fn page_ranges_for_metrics(&self, metrics: &[(u64, TimeRange)]) -> Vec<(u64, u64)> {
+    /// the finest pruning the format allows. `series` skips the chunks of every
+    /// series the query did not ask for.
+    pub fn page_ranges_for_metrics(
+        &self,
+        metrics: &[(u64, TimeRange)],
+        series: Option<&SeriesFilter>,
+    ) -> Vec<(u64, u64)> {
         let mut wanted: Vec<(u64, u64)> = Vec::new();
         for &(metric_id, range) in metrics {
             let Ok(Some(group)) = self.group_for(metric_id) else {
@@ -1078,6 +1150,11 @@ impl TsfReader {
             for entry in &entries {
                 if entry.max_timestamp < range.start || entry.min_timestamp >= range.end {
                     continue;
+                }
+                if let Some(filter) = series {
+                    if !filter.contains(entry.series_id) {
+                        continue;
+                    }
                 }
                 let Ok(chunk) = self.series_chunk_header(entry) else {
                     continue;
@@ -2670,7 +2747,7 @@ mod tests {
 
         // Round 3: the staged planner, until it has everything it needs.
         let metrics = [(1u64, TimeRange::new(i64::MIN, i64::MAX))];
-        let (ranged, _, _) = plan_ranged_scan(&bytes, &metrics);
+        let (ranged, _, _) = plan_ranged_scan(&bytes, &metrics, None);
 
         let whole = TsfReader::from_bytes(bytes.clone()).unwrap();
         let mut ctx = ReadContext::new();
@@ -2718,17 +2795,17 @@ mod tests {
 
         // Metric absent from the file index: the planner asks for nothing.
         assert!(reader
-            .next_scan_ranges(&[(99, TimeRange::new(i64::MIN, i64::MAX))])
+            .next_scan_ranges(&[(99, TimeRange::new(i64::MIN, i64::MAX))], None)
             .is_none());
 
         // A range that misses the metric's chunk group asks for nothing too.
         assert!(reader
-            .next_scan_ranges(&[(1, TimeRange::new(1, 2))])
+            .next_scan_ranges(&[(1, TimeRange::new(1, 2))], None)
             .is_none());
 
         // A metric that is present needs its chunk group.
         let wanted = reader
-            .next_scan_ranges(&[(1, TimeRange::new(i64::MIN, i64::MAX))])
+            .next_scan_ranges(&[(1, TimeRange::new(i64::MIN, i64::MAX))], None)
             .unwrap();
         assert!(!wanted.is_empty());
         for pair in wanted.windows(2) {
@@ -2741,21 +2818,25 @@ mod tests {
 
     /// Fetches whatever `next_scan_ranges` asks for until it stops asking,
     /// the way the object-store reader does.
-    fn plan_ranged_scan(data: &[u8], metrics: &[(u64, TimeRange)]) -> (TsfReader, u64, usize) {
+    fn plan_ranged_scan(
+        data: &[u8],
+        metrics: &[(u64, TimeRange)],
+        series: Option<&SeriesFilter>,
+    ) -> (TsfReader, u64, usize) {
         let len = data.len() as u64;
         let footer = TsfReader::footer_layout(&data[data.len() - FOOTER_SIZE..], len).unwrap();
         let mut ranges = footer.index_ranges(len);
         let mut rounds = 0;
         loop {
             let reader = ranged_reader(data, &ranges);
-            let Some(more) = reader.next_scan_ranges(metrics) else {
+            let Some(more) = reader.next_scan_ranges(metrics, series) else {
                 break;
             };
             rounds += 1;
             assert!(rounds < 16, "planner did not converge: {more:?}");
             ranges.extend(more);
         }
-        ranges.extend(ranged_reader(data, &ranges).page_ranges_for_metrics(metrics));
+        ranges.extend(ranged_reader(data, &ranges).page_ranges_for_metrics(metrics, series));
         ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::new();
         for (start, end) in ranges {
@@ -2797,15 +2878,18 @@ mod tests {
         // metadata is a fixed floor: the check is that the bytes fetched track
         // the window, not the file.
         let narrow = TimeRange::new(base + 100 * 1_000, base + 100 * 1_000 + 1);
-        let (reader, fetched, rounds) = plan_ranged_scan(&bytes, &[(1, narrow)]);
+        let (reader, fetched, rounds) = plan_ranged_scan(&bytes, &[(1, narrow)], None);
         assert!(rounds >= 1, "expected several planning rounds");
         assert!(
             fetched * 5 < len * 2,
             "narrow scan fetched {fetched} of {len} bytes"
         );
         // Exactly one page per series is needed.
-        let (planner, _, _) = plan_ranged_scan(&bytes, &[(1, narrow)]);
-        assert_eq!(planner.page_ranges_for_metrics(&[(1, narrow)]).len(), 50);
+        let (planner, _, _) = plan_ranged_scan(&bytes, &[(1, narrow)], None);
+        assert_eq!(
+            planner.page_ranges_for_metrics(&[(1, narrow)], None).len(),
+            50
+        );
 
         let mut ctx = ReadContext::new();
         let decoded = reader
@@ -2822,7 +2906,7 @@ mod tests {
         // A whole-file window must still be correct, and it fetches
         // everything.
         let wide = TimeRange::new(i64::MIN, i64::MAX);
-        let (reader, fetched, _) = plan_ranged_scan(&bytes, &[(1, wide)]);
+        let (reader, fetched, _) = plan_ranged_scan(&bytes, &[(1, wide)], None);
         assert_eq!(fetched, len);
         let mut ctx = ReadContext::new();
         let decoded = reader
@@ -2830,6 +2914,85 @@ mod tests {
             .unwrap();
         let rows_read: usize = decoded.iter().map(|c| c.len()).sum();
         assert_eq!(rows_read, stats.rows as usize);
+    }
+
+    /// A series filter must plan the requested series only, and decode only
+    /// them: this is the difference between a single-series query and a
+    /// whole-metric scan.
+    #[test]
+    fn test_series_filter_plans_only_requested_series() {
+        let base = 1_700_000_000_000;
+        let mut rows = Vec::new();
+        for series in 0..50u64 {
+            for i in 0..400i64 {
+                rows.push(row(
+                    1,
+                    series,
+                    base + i * 1_000,
+                    series as f64 + i as f64,
+                    0,
+                ));
+            }
+        }
+        let (bytes, _) = encode_file(
+            rows,
+            (base, base + 86_400_000),
+            &WriterOptions { page_rows: 64 },
+        )
+        .unwrap();
+
+        // One series, one page: the whole dataset is 50 series x 7 pages.
+        let narrow = TimeRange::new(base + 100 * 1_000, base + 100 * 1_000 + 1);
+        let filter = SeriesFilter::new([7]);
+        let (planner, fetched, _) = plan_ranged_scan(&bytes, &[(1, narrow)], Some(&filter));
+        assert_eq!(
+            planner
+                .page_ranges_for_metrics(&[(1, narrow)], Some(&filter))
+                .len(),
+            1
+        );
+        // A three-series filter plans three pages, not fifty.
+        let three = SeriesFilter::new([0, 25, 49]);
+        let (planner, _, _) = plan_ranged_scan(&bytes, &[(1, narrow)], Some(&three));
+        assert_eq!(
+            planner
+                .page_ranges_for_metrics(&[(1, narrow)], Some(&three))
+                .len(),
+            3
+        );
+
+        // The unfiltered plan of the same window needs all fifty pages, so the
+        // filtered read must fetch dramatically fewer bytes.
+        let (_, unfiltered, _) = plan_ranged_scan(&bytes, &[(1, narrow)], None);
+        assert!(
+            fetched * 10 < unfiltered,
+            "filtered read fetched {fetched} vs {unfiltered} bytes"
+        );
+
+        // The planned reader holds the filtered metadata only, and decoding
+        // those series works.
+        let mut ctx = ReadContext::new();
+        let mut decoded = Vec::new();
+        for id in three.ids() {
+            decoded.push(
+                planner
+                    .read_series_columns(1, *id, narrow, ColumnMask::ALL, &mut ctx)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(decoded.len(), 3);
+        for column in &decoded {
+            assert_eq!(column.len(), 1);
+            assert_eq!(column.timestamps[0], base + 100 * 1_000);
+            assert_eq!(column.values[0], column.series_id as f64 + 100.0);
+        }
+
+        // An empty filter matches no series, so nothing is planned.
+        let empty = SeriesFilter::new([]);
+        let (planner, _, _) = plan_ranged_scan(&bytes, &[(1, narrow)], Some(&empty));
+        assert!(planner
+            .page_ranges_for_metrics(&[(1, narrow)], Some(&empty))
+            .is_empty());
     }
 
     #[test]
@@ -2844,13 +3007,13 @@ mod tests {
         let footer = TsfReader::footer_layout(&bytes[bytes.len() - FOOTER_SIZE..], len).unwrap();
         let index_only = ranged_reader(&bytes, &footer.index_ranges(len));
         assert!(index_only
-            .next_scan_ranges(&[(42, TimeRange::new(i64::MIN, i64::MAX))])
+            .next_scan_ranges(&[(42, TimeRange::new(i64::MIN, i64::MAX))], None)
             .is_none());
         assert!(index_only
-            .next_scan_ranges(&[(1, TimeRange::new(1, 2))])
+            .next_scan_ranges(&[(1, TimeRange::new(1, 2))], None)
             .is_none());
         assert!(index_only
-            .page_ranges_for_metrics(&[(42, TimeRange::new(i64::MIN, i64::MAX))])
+            .page_ranges_for_metrics(&[(42, TimeRange::new(i64::MIN, i64::MAX))], None)
             .is_empty());
     }
 }

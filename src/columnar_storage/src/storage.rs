@@ -965,6 +965,130 @@ mod tests {
         }
     }
 
+    /// A `tsid` predicate must cut what the TSF scan reads, not only what it
+    /// returns: without pushdown a one-series query decodes every series of the
+    /// metric (ADR-0002 §12 T2).
+    #[test(test)]
+    fn test_tsf_series_pushdown_cuts_read_volume() {
+        use crate::{config::DataFileFormat, types::Timestamp};
+
+        const SERIES: u64 = 50;
+        const SAMPLES: i64 = 5_760;
+        const STEP_MS: i64 = 15_000;
+        const TARGET: u64 = 17;
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let runtimes = build_runtimes();
+        runtimes.sst_compact_runtime.clone().block_on(async move {
+            let mut config = config_without_periodic_flush();
+            config.format = DataFileFormat::Tsf;
+            // Keep the whole day in one buffer, so the test reasons about one
+            // file per day rather than an auto-flush schedule.
+            config.buffer.max_rows = (SERIES * SAMPLES as u64) as usize + 1;
+            let storage = ObjectBasedStorage::try_new(
+                root_dir.path().to_string_lossy().to_string(),
+                Duration::from_hours(24),
+                Arc::new(LocalFileSystem::new()),
+                schema,
+                3,
+                config,
+                runtimes,
+            )
+            .await
+            .unwrap();
+
+            // A whole, day-aligned day at a 15 s scrape interval. Day-aligned
+            // so the write stays inside one 24 h segment.
+            let base = 1_700_000_000_000i64.div_euclid(86_400_000) * 86_400_000;
+            let mut metric_id = Vec::new();
+            let mut tsid = Vec::new();
+            let mut timestamp = Vec::new();
+            let mut value = Vec::new();
+            for series in 0..SERIES {
+                for i in 0..SAMPLES {
+                    metric_id.push(1u64);
+                    tsid.push(series);
+                    timestamp.push(base + i * STEP_MS);
+                    // Noisy values: a regular ramp would compress so well that
+                    // the whole file would fit in a single page.
+                    value.push((series as f64) * 0.001 + ((i as f64) * 0.01).sin());
+                }
+            }
+            let batch = record_batch!(
+                ("metric_id", UInt64, metric_id),
+                ("tsid", UInt64, tsid),
+                ("timestamp", Int64, timestamp),
+                ("value", Float64, value)
+            )
+            .unwrap();
+            storage
+                .write(WriteRequest {
+                    batch,
+                    time_range: (base..base + SAMPLES * STEP_MS).into(),
+                    enable_check: true,
+                })
+                .await
+                .unwrap();
+            storage.flush_state.flush().await.unwrap();
+
+            // Full scan: every series.
+            let before = storage.stats().tsf.bytes_read;
+            let rows = collect_batch(
+                storage
+                    .scan(ScanRequest {
+                        range: TimeRange::new(Timestamp(base), Timestamp(base + SAMPLES * STEP_MS)),
+                        predicate: vec![],
+                        projections: None,
+                    })
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(rows.num_rows(), (SERIES * SAMPLES as u64) as usize);
+            let all_bytes = storage.stats().tsf.bytes_read - before;
+
+            // One series: the same rows for `TARGET`, out of the same file.
+            let range = TimeRange::new(Timestamp(base), Timestamp(base + SAMPLES * STEP_MS));
+            let before = storage.stats().tsf.bytes_read;
+            let rows = collect_batch(
+                storage
+                    .scan(ScanRequest {
+                        range,
+                        predicate: vec![
+                            col("tsid").eq(lit(TARGET)),
+                            col("timestamp").gt_eq(lit(base)),
+                            col("timestamp").lt(lit(base + SAMPLES * STEP_MS)),
+                        ],
+                        projections: None,
+                    })
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(rows.num_rows(), SAMPLES as usize);
+            assert!(rows
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .all(|id| *id == TARGET));
+            let one_bytes = storage.stats().tsf.bytes_read - before;
+
+            assert!(
+                one_bytes * 4 < all_bytes,
+                "one-series query read {one_bytes} of {all_bytes} bytes"
+            );
+        });
+    }
+
     /// Migration dual-read: an old Parquet SST and a new TSF SST in the same
     /// root must both be read and merged (ADR-0002 §7.2, §10).
     #[test(test)]

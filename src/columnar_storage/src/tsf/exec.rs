@@ -31,9 +31,10 @@ use arrow::{
     datatypes::{Schema, SchemaRef},
 };
 use datafusion::{
-    common::internal_err,
+    common::{internal_err, ScalarValue},
     error::{DataFusionError, Result as DfResult},
     execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::{Expr, Operator},
     physical_expr::{EquivalenceProperties, LexOrdering},
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
@@ -43,7 +44,7 @@ use datafusion::{
 use futures::{stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use storage_kernel::tsf::{
-    file::{TsfReader, FOOTER_SIZE},
+    file::{SeriesFilter, TsfReader, FOOTER_SIZE},
     ColumnMask,
 };
 
@@ -61,16 +62,137 @@ fn file_scan_range(scan: &TimeRange, file: &TimeRange) -> storage_kernel::tsf::f
     storage_kernel::tsf::file::TimeRange::new(start, end.max(start))
 }
 
-/// Every metric in `reader`, paired with the scan range to prune against.
-fn metric_queries(
-    reader: &TsfReader,
-    range: storage_kernel::tsf::file::TimeRange,
-) -> Vec<(u64, storage_kernel::tsf::file::TimeRange)> {
-    reader
-        .metric_ids()
-        .into_iter()
-        .map(|id| (id, range))
-        .collect()
+/// ID constraints a scan can push into the file, extracted from its
+/// predicates.
+///
+/// The TSF file groups rows by metric and, inside a group, by series. The query
+/// above the scan still applies the full predicate; this only narrows what is
+/// fetched and decoded. Every set is therefore allowed to be a *superset* of
+/// the rows the predicate accepts: a constraint the extractor does not
+/// understand is dropped, never guessed at.
+#[derive(Debug, Clone, Default)]
+pub struct TsfPushdown {
+    /// `metric_id = lit` / `metric_id IN (...)`, sorted and deduplicated.
+    /// `None` means every metric; `Some(empty)` means no metric.
+    metric_ids: Option<Vec<u64>>,
+    /// The same for `tsid`. `None` means every series of the metric.
+    series_ids: Option<SeriesFilter>,
+}
+
+impl TsfPushdown {
+    /// Extracts the ID constraints from a conjunctive predicate list.
+    ///
+    /// Only equality and non-negated `IN` lists are understood, combined with
+    /// `AND`. Everything else — ranges, `OR`, `NOT IN`, a cast on the column —
+    /// is left to the filter above the scan.
+    pub fn from_predicates(predicates: &[Expr]) -> Self {
+        Self {
+            metric_ids: id_constraints(predicates, METRIC_COLUMN),
+            series_ids: series_constraints(predicates, TSID_COLUMN),
+        }
+    }
+
+    pub fn metric_ids(&self) -> Option<&[u64]> {
+        self.metric_ids.as_deref()
+    }
+
+    pub fn series_ids(&self) -> Option<&SeriesFilter> {
+        self.series_ids.as_ref()
+    }
+
+    /// True when no predicate narrowed the scan.
+    pub fn is_empty(&self) -> bool {
+        self.metric_ids.is_none() && self.series_ids.is_none()
+    }
+}
+
+/// The TSF primary-key column names, fixed by [`tsf_schema`].
+const METRIC_COLUMN: &str = "metric_id";
+const TSID_COLUMN: &str = "tsid";
+
+/// Intersects the ID constraints on `column` across all predicates.
+fn id_constraints(predicates: &[Expr], column: &str) -> Option<Vec<u64>> {
+    let mut acc: Option<Vec<u64>> = None;
+    for predicate in predicates {
+        let Some(mut values) = id_values(predicate, column) else {
+            continue;
+        };
+        values.sort_unstable();
+        values.dedup();
+        acc = Some(match acc {
+            Some(previous) => previous
+                .into_iter()
+                .filter(|id| values.binary_search(id).is_ok())
+                .collect(),
+            None => values,
+        });
+    }
+    acc
+}
+
+fn series_constraints(predicates: &[Expr], column: &str) -> Option<SeriesFilter> {
+    id_constraints(predicates, column).map(SeriesFilter::new)
+}
+
+/// IDs an expression restricts `column` to, or `None` when it does not
+/// restrict it in a way this extractor understands.
+fn id_values(expr: &Expr, column: &str) -> Option<Vec<u64>> {
+    match expr {
+        Expr::Alias(alias) => id_values(&alias.expr, column),
+        Expr::Cast(cast) => id_values(&cast.expr, column),
+        // `a AND b` is two constraints on the same scan, so it is an
+        // intersection. A side that restricts nothing simply drops out.
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            let left = id_values(&binary.left, column);
+            let right = id_values(&binary.right, column);
+            match (left, right) {
+                (Some(left), Some(right)) => Some(
+                    left.into_iter()
+                        .filter(|id| right.contains(id))
+                        .collect::<Vec<_>>(),
+                ),
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            }
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            if is_column(&binary.left, column) {
+                id_literal(&binary.right).map(|id| vec![id])
+            } else if is_column(&binary.right, column) {
+                id_literal(&binary.left).map(|id| vec![id])
+            } else {
+                None
+            }
+        }
+        Expr::InList(list) if !list.negated => {
+            if !is_column(&list.expr, column) {
+                return None;
+            }
+            list.list.iter().map(id_literal).collect()
+        }
+        _ => None,
+    }
+}
+
+fn is_column(expr: &Expr, name: &str) -> bool {
+    matches!(expr, Expr::Column(column) if column.name == name)
+}
+
+fn id_literal(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Literal(scalar) => match scalar {
+            ScalarValue::UInt64(Some(v)) => Some(*v),
+            ScalarValue::UInt32(Some(v)) => Some(*v as u64),
+            ScalarValue::UInt16(Some(v)) => Some(*v as u64),
+            ScalarValue::UInt8(Some(v)) => Some(*v as u64),
+            ScalarValue::Int64(Some(v)) => u64::try_from(*v).ok(),
+            ScalarValue::Int32(Some(v)) => u64::try_from(*v).ok(),
+            _ => None,
+        },
+        Expr::Cast(cast) => id_literal(&cast.expr),
+        _ => None,
+    }
 }
 
 /// Largest gap a single request may read over to avoid a second request.
@@ -215,6 +337,8 @@ pub struct TsfExec {
     min_ranged_bytes: u64,
     /// Per-format read counters (ADR-0002 §13), when the caller attached them.
     metrics: Option<Arc<StorageMetrics>>,
+    /// ID constraints pushed down from the predicates; see [`TsfPushdown`].
+    pushdown: Arc<TsfPushdown>,
     cache: PlanProperties,
 }
 
@@ -224,6 +348,7 @@ impl fmt::Debug for TsfExec {
             .field("files", &self.files.len())
             .field("range", &self.range)
             .field("projection", &self.projection)
+            .field("pushdown", &self.pushdown)
             .finish()
     }
 }
@@ -273,6 +398,7 @@ impl TsfExec {
             output_schema,
             min_ranged_bytes: WHOLE_FILE_THRESHOLD,
             metrics: None,
+            pushdown: Arc::new(TsfPushdown::default()),
             cache,
         })
     }
@@ -281,6 +407,13 @@ impl TsfExec {
     /// added to the TSF read counter.
     pub fn with_metrics(mut self, metrics: Arc<StorageMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Pushes ID constraints into the scan: metrics and series that the
+    /// predicates exclude are never fetched or decoded.
+    pub fn with_pushdown(mut self, pushdown: TsfPushdown) -> Self {
+        self.pushdown = Arc::new(pushdown);
         self
     }
 
@@ -308,23 +441,62 @@ impl TsfExec {
         // for nothing.
         let kernel_range = file_scan_range(&self.range, &file.time_range);
         let reader = self.open_ranged(file).await?;
-        let metrics = reader
-            .metric_ids()
-            .into_iter()
-            .map(|id| (id, kernel_range))
-            .collect::<Vec<_>>();
         let mut ctx = storage_kernel::tsf::file::ReadContext::new();
-        for (metric_id, range) in metrics {
-            let columns = reader
-                .read_metric_columns(metric_id, range, ColumnMask::ALL, &mut ctx)
-                .map_err(DataFusionError::Execution)?;
-            for decoded in columns {
-                let batch =
-                    decoded_columns_to_batch(decoded).map_err(DataFusionError::Execution)?;
-                batches.push(self.project(batch)?);
+        for (metric_id, range) in self.metric_queries(&reader, kernel_range) {
+            match self.pushdown.series_ids() {
+                // One series at a time: `read_series_columns` uses the bloom
+                // filter and the series index to jump straight to that chunk.
+                Some(filter) => {
+                    for &series_id in filter.ids() {
+                        let decoded = reader
+                            .read_series_columns(
+                                metric_id,
+                                series_id,
+                                range,
+                                ColumnMask::ALL,
+                                &mut ctx,
+                            )
+                            .map_err(DataFusionError::Execution)?;
+                        if decoded.is_empty() {
+                            continue;
+                        }
+                        let batch = decoded_columns_to_batch(decoded)
+                            .map_err(DataFusionError::Execution)?;
+                        batches.push(self.project(batch)?);
+                    }
+                }
+                None => {
+                    let columns = reader
+                        .read_metric_columns(metric_id, range, ColumnMask::ALL, &mut ctx)
+                        .map_err(DataFusionError::Execution)?;
+                    for decoded in columns {
+                        let batch = decoded_columns_to_batch(decoded)
+                            .map_err(DataFusionError::Execution)?;
+                        batches.push(self.project(batch)?);
+                    }
+                }
             }
         }
         Ok(batches)
+    }
+
+    /// Every metric the scan may read in `reader`, paired with the range to
+    /// prune against. Metrics the predicates exclude are dropped here, before
+    /// any of their metadata is fetched.
+    fn metric_queries(
+        &self,
+        reader: &TsfReader,
+        range: storage_kernel::tsf::file::TimeRange,
+    ) -> Vec<(u64, storage_kernel::tsf::file::TimeRange)> {
+        reader
+            .metric_ids()
+            .into_iter()
+            .filter(|id| match self.pushdown.metric_ids() {
+                Some(wanted) => wanted.binary_search(id).is_ok(),
+                None => true,
+            })
+            .map(|id| (id, range))
+            .collect()
     }
 
     /// Opens `file` with the minimum set of byte ranges needed for the scan.
@@ -365,8 +537,8 @@ impl TsfExec {
             .await?;
         let kernel_range = file_scan_range(&self.range, &file.time_range);
         loop {
-            let metrics = metric_queries(&reader, kernel_range);
-            let Some(more) = reader.next_scan_ranges(&metrics) else {
+            let metrics = self.metric_queries(&reader, kernel_range);
+            let Some(more) = reader.next_scan_ranges(&metrics, self.pushdown.series_ids()) else {
                 break;
             };
             rounds += 1;
@@ -379,7 +551,10 @@ impl TsfExec {
         }
 
         // Final level: the pages themselves.
-        let pages = reader.page_ranges_for_metrics(&metric_queries(&reader, kernel_range));
+        let pages = reader.page_ranges_for_metrics(
+            &self.metric_queries(&reader, kernel_range),
+            self.pushdown.series_ids(),
+        );
         if pages.is_empty() {
             return Ok(reader);
         }
@@ -505,6 +680,7 @@ impl ExecutionPlan for TsfExec {
             output_schema: self.output_schema.clone(),
             min_ranged_bytes: self.min_ranged_bytes,
             metrics: self.metrics.clone(),
+            pushdown: self.pushdown.clone(),
             cache: self.cache.clone(),
         };
         // One partition per file keeps every emitted stream sorted, which is
@@ -749,6 +925,164 @@ mod tests {
                 .unwrap();
             let batches = collect_stream(stream).await;
             assert_eq!(count_rows(&batches), expected_rows);
+        });
+    }
+
+    /// Equality and `IN` constraints are extracted; everything else is left to
+    /// the filter above the scan.
+    #[test]
+    fn test_pushdown_extracts_id_constraints() {
+        use datafusion::prelude::{col, lit};
+
+        let none = TsfPushdown::from_predicates(&[]);
+        assert!(none.is_empty());
+
+        let eq = TsfPushdown::from_predicates(&[col("tsid").eq(lit(7u64))]);
+        assert_eq!(eq.series_ids().unwrap().ids(), &[7]);
+        assert!(eq.metric_ids().is_none());
+
+        // Operand order does not matter.
+        let reversed = TsfPushdown::from_predicates(&[lit(7u64).eq(col("tsid"))]);
+        assert_eq!(reversed.series_ids().unwrap().ids(), &[7]);
+
+        let list = TsfPushdown::from_predicates(&[
+            col("tsid").in_list(vec![lit(9u64), lit(3u64), lit(3u64)], false)
+        ]);
+        assert_eq!(list.series_ids().unwrap().ids(), &[3, 9]);
+
+        // Two constraints on one column intersect.
+        let both = TsfPushdown::from_predicates(&[
+            col("metric_id").eq(lit(1u64)),
+            col("tsid").in_list(vec![lit(1u64), lit(2u64), lit(3u64)], false),
+            col("tsid").gt_eq(lit(2u64)),
+        ]);
+        assert_eq!(both.metric_ids().unwrap(), &[1]);
+        assert_eq!(both.series_ids().unwrap().ids(), &[1, 2, 3]);
+
+        // Unsupported forms must not narrow anything.
+        for predicate in [
+            col("tsid").gt(lit(5u64)),
+            col("tsid").in_list(vec![lit(1u64)], true), // NOT IN
+            col("tsid").not_eq(lit(5u64)),
+            col("value").eq(lit(5u64)),
+        ] {
+            assert!(
+                TsfPushdown::from_predicates(std::slice::from_ref(&predicate)).is_empty(),
+                "unexpected pushdown for {predicate}"
+            );
+        }
+
+        // An empty IN list matches nothing, which is different from no filter.
+        let empty = TsfPushdown::from_predicates(&[col("tsid").in_list(Vec::new(), false)]);
+        assert!(empty.series_ids().unwrap().is_empty());
+    }
+
+    /// A metric and series filter must cut the rows read, not just the rows
+    /// returned, and must never drop a row the predicate accepts.
+    #[test]
+    fn test_pushdown_filters_metrics_and_series() {
+        use datafusion::prelude::{col, lit};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let root_dir = temp_dir::TempDir::new().unwrap();
+            let path = format!("{}/data/20231114/1.tsf", root_dir.path().to_string_lossy());
+            let base = 1_700_000_000_000i64;
+            let mut rows = Vec::new();
+            for metric in 1..=2u64 {
+                for series in 0..10u64 {
+                    for i in 0..128i64 {
+                        rows.push(Row {
+                            metric_id: metric,
+                            series_id: series,
+                            timestamp: base + i * 1_000,
+                            value: metric as f64 * 1_000.0 + series as f64 + i as f64,
+                            sequence: 0,
+                            reserved: 0,
+                        });
+                    }
+                }
+            }
+            let (bytes, _) = encode_file(
+                rows,
+                (base, base + 128_000),
+                &WriterOptions { page_rows: 32 },
+            )
+            .unwrap();
+
+            let inner: ObjectStoreRef = Arc::new(LocalFileSystem::new());
+            inner
+                .put(&Path::from(path.clone()), bytes.into())
+                .await
+                .unwrap();
+            let counting = Arc::new(CountingStore {
+                inner,
+                bytes: AtomicU64::new(0),
+            });
+            let store: ObjectStoreRef = counting.clone();
+            let file = TsfFile {
+                path: Path::from(path.clone()),
+                time_range: TimeRange::new(Timestamp(base), Timestamp(base + 128_000)),
+            };
+            let range = TimeRange::new(Timestamp(base), Timestamp(base + 128_000));
+
+            let run = |predicates: Vec<Expr>, expected: usize| {
+                let store = store.clone();
+                let file = file.clone();
+                let range = range.clone();
+                let counting = counting.clone();
+                async move {
+                    let before = counting.bytes.load(Ordering::Relaxed);
+                    let exec = TsfExec::try_new(
+                        store,
+                        sample_schema(),
+                        vec![file],
+                        range,
+                        None,
+                        LexOrdering::default(),
+                    )
+                    .unwrap()
+                    .with_pushdown(TsfPushdown::from_predicates(&predicates))
+                    // Force the ranged path even though the file is small.
+                    .with_min_ranged_bytes(0);
+                    let plan = Arc::new(exec) as Arc<dyn ExecutionPlan>;
+                    let stream = plan
+                        .execute(0, datafusion::execution::TaskContext::default().into())
+                        .unwrap();
+                    let batches = collect_stream(stream).await;
+                    assert_eq!(count_rows(&batches), expected);
+                    counting.bytes.load(Ordering::Relaxed) - before
+                }
+            };
+
+            // Everything: 2 metrics x 10 series x 128 samples.
+            let all_bytes = run(Vec::new(), 2 * 10 * 128).await;
+
+            // One metric: half the rows.
+            let metric_bytes = run(vec![col("metric_id").eq(lit(1u64))], 10 * 128).await;
+
+            // Two series of one metric: 256 of 2,560 rows.
+            let narrow_bytes = run(
+                vec![
+                    col("metric_id").eq(lit(2u64)),
+                    col("tsid").in_list(vec![lit(3u64), lit(4u64)], false),
+                ],
+                2 * 128,
+            )
+            .await;
+
+            assert!(
+                narrow_bytes * 4 < all_bytes,
+                "series-filtered read fetched {narrow_bytes} of {all_bytes} bytes"
+            );
+            assert!(
+                metric_bytes < all_bytes,
+                "metric-filtered read fetched {metric_bytes} of {all_bytes} bytes"
+            );
+
+            // A filter for a series the file does not hold returns nothing and
+            // reads almost nothing.
+            run(vec![col("tsid").in_list(vec![lit(999u64)], false)], 0).await;
         });
     }
 

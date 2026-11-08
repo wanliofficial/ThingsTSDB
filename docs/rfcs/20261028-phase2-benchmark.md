@@ -66,6 +66,11 @@ Queries, all against a single target series (`tsid = series/2`) unless noted:
 | 30-day query | whole dataset | single series across all partitions |
 | Pruning | one hour vs whole dataset | `bytes_read` delta from the per-format counters |
 
+The `tsid = lit` / `tsid IN (...)` form is pushed into the TSF scan
+(`TsfPushdown`), so the file plan fetches one series chunk per file instead of
+every series of the metric. The predicate itself still runs above the scan, and
+every form the extractor does not understand is simply left there.
+
 Latency is one warm-up scan followed by 20 measured scans; p50/p99 are over those 20.
 Restart is measured cold: drop the storage, reopen it (manifest load, WAL replay) and run
 one full scan.
@@ -77,39 +82,51 @@ one full scan.
 | Metric | Parquet | TSF |
 |---|---:|---:|
 | Files written | 30 | 30 |
-| File bytes | 144,370,171 | 62,213,028 |
+| File bytes | 144,371,928 | 62,213,000 |
 | Bytes/sample | 16.71 | **7.20** |
-| Ingest, WAL + buffer | 2.7 M rows/s | 5.2 M rows/s |
-| Flush + manifest commit | 6.65 s | 4.67 s |
-| Ingest to durable (write + flush) | 0.9 M rows/s | **1.4 M rows/s** |
-| Flush share of durable ingest | 67% | 74% |
-| Full scan | 376 ms (24.6 M rows/s) | 302 ms (**29.7 M rows/s**) |
-| 1-day query p50 / p99 | 5.01 / 5.32 ms | 21.91 / 24.46 ms |
-| 30-day query p50 / p99 | 32.94 / 38.66 ms | 246.58 / 262.58 ms |
+| Ingest, WAL + buffer | 2.3 M rows/s | 4.7 M rows/s |
+| Flush + manifest commit | 5.90 s | 5.05 s |
+| Ingest to durable (write + flush) | 0.9 M rows/s | **1.3 M rows/s** |
+| Flush share of durable ingest | 61% | 73% |
+| Full scan | 500 ms (19.7 M rows/s) | 393 ms (**25.2 M rows/s**) |
+| 1-day query p50 / p99 | 6.90 / 9.28 ms | 2.76 / 4.55 ms |
+| 30-day query p50 / p99 | 44.21 / 49.45 ms | 17.06 / 20.27 ms |
+| 30-day query read volume | 9.1 MB (pruned row groups) | 1.27 MB (1 of 50 series) |
 | 1 h / 30 d read volume | 3.33% | 3.34% |
-| Restart (reopen + first scan) | 399 ms | 298 ms |
+| Restart (reopen + first scan) | 472 ms | 351 ms |
 
 ## Counter: 50 series x 30 days (8.64 M rows)
 
 | Metric | Parquet | TSF |
 |---|---:|---:|
 | Files written | 30 | 30 |
-| File bytes | 111,021,706 | 493,645 |
+| File bytes | 111,022,509 | 493,664 |
 | Bytes/sample | 12.85 | **0.06** |
-| Ingest, WAL + buffer | 4.1 M rows/s | 9.0 M rows/s |
-| Flush + manifest commit | 3.24 s | 3.69 s |
-| Ingest to durable (write + flush) | 1.6 M rows/s | **1.9 M rows/s** |
-| Full scan | 362 ms (25.0 M rows/s) | 165 ms (**57.3 M rows/s**) |
-| 1-day query p50 / p99 | 5.25 / 5.95 ms | 8.45 / 8.65 ms |
-| 30-day query p50 / p99 | 34.51 / 37.07 ms | 103.41 / 113.12 ms |
+| Ingest, WAL + buffer | 3.3 M rows/s | 7.7 M rows/s |
+| Flush + manifest commit | 4.55 s | 3.61 s |
+| Ingest to durable (write + flush) | 1.2 M rows/s | **1.8 M rows/s** |
+| Flush share of durable ingest | 63% | 76% |
+| Full scan | 565 ms (17.9 M rows/s) | 235 ms (**41.7 M rows/s**) |
+| 1-day query p50 / p99 | 8.06 / 11.22 ms | 1.42 / 2.34 ms |
+| 30-day query p50 / p99 | 58.24 / 78.06 ms | 10.96 / 12.73 ms |
+| 30-day query read volume | 7.2 MB (pruned row groups) | 494 KB (whole files, see below) |
 | 1 h / 30 d read volume | 3.31% | 3.26% |
-| Restart (reopen + first scan) | 360 ms | 162 ms |
+| Restart (reopen + first scan) | 551 ms | 220 ms |
 
 The counter shape is deliberately regular: consecutive values differ by exactly 10 and
 timestamps by exactly 15,000 ms, and each page holds one series' day. GORILLA/CHIMP and
 delta-of-delta compress it to almost nothing (0.06 B/sample). Phase 0's counter workload
 interleaved series inside a page and stored a per-row sequence, which cost 1.57 B/sample;
 real device data sits between the two, so treat 0.06 as a lower bound, not a typical value.
+
+A counter day file is 16 KB, below the 512 KiB whole-object threshold, so its scans read
+the object whole rather than planning byte ranges: the 30-day series query therefore reads
+494 KB, the dataset size, and still finishes in 13 ms. For gauge the files are 2 MB each
+and the series filter buys real pruning (1.27 MB instead of 62.2 MB).
+
+Throughput varies by 20-30% between runs on this laptop (thermal and background load); the
+numbers above come from one gauge run and one counter run, back to back, on the build that
+includes the series pushdown.
 
 ## Kernel decode reference
 
@@ -129,12 +146,12 @@ real device data sits between the two, so treat 0.06 as a lower bound, not a typ
 | Target (ADR-0002 §12) | Measured | Verdict |
 |---|---|---|
 | Size ≤ 2.5 B/sample (15 s scrape) | 7.20 B/sample gauge; 0.06 counter | Gauge misses (incompressible f64; Phase 0 measured 8.14 too); counter passes |
-| Write throughput ≥ 90% of Parquet | 155% (gauge), 119% (counter) | Pass |
-| Full scan ≥ 15 M rows/s, TSF within 2x of Parquet | 24.6-57.3 M rows/s; TSF 1.2x faster on gauge, 2.3x on counter | Pass |
-| 1-day Grafana query p99 < 50 ms | 24.5 ms gauge, 8.7 ms counter | Pass |
-| 30-day single-series query p99 < 50 ms | 263 ms gauge, 113 ms counter | **Fail**; Parquet passes at 39 ms |
+| Write throughput ≥ 90% of Parquet | 144% (gauge), 150% (counter) | Pass |
+| Full scan ≥ 15 M rows/s, TSF within 2x of Parquet | 19.7-41.7 M rows/s; TSF 1.3x faster on gauge, 2.3x on counter | Pass |
+| 1-day Grafana query p99 < 50 ms | 4.6 ms gauge, 2.3 ms counter | Pass |
+| 30-day single-series query p99 < 50 ms | 20.3 ms gauge, 12.7 ms counter | **Pass** (Parquet: 49.5 / 78.1 ms) |
 | Page pruning ≤ 5% of pages for a 1 h query | 3.34% gauge, 3.26% counter | Pass (granularity-limited, see below) |
-| `kill -9` recovery < 30 s | 298-399 ms clean restart; fault injection not run here | Not verified |
+| `kill -9` recovery < 30 s | 220-551 ms clean restart; fault injection not run here | Not verified |
 | TTL drop = one manifest delta, no query-visible data | Covered by the T3 tests, not this benchmark | Out of scope here |
 
 ## Findings
@@ -144,19 +161,25 @@ sliced one `RecordBatch` per primary-key group and called the merge operator onc
 group; with one timestamp per row that is one slice, one dynamic key comparison and one
 operator call per row. A full scan managed 0.7 M rows/s. The fast path added in
 `fc97ec9d` proves "no adjacent duplicate keys" with one vector comparison per primary-key
-column and emits the batch in bulk. That took the full scan to 24-30 M rows/s, in line with
-the 35.6 M rows/s Arrow boundary and within 2x of it in both directions. The general,
-duplicate-key path is unchanged.
+column and emits the batch in bulk. That took the full scan to 20-42 M rows/s across runs
+and value shapes, in line with the 35.6 M rows/s Arrow boundary and within 2x of it in
+both directions. The general, duplicate-key path is unchanged.
 
-**TSF has no series predicate pushdown, and it is the one target that fails.** `TsfExec`
-decodes every series of a metric inside the time window; the `tsid` predicate is applied
-above the scan. Parquet does not have per-series pages either, but row-group statistics let
-it skip row groups that cannot contain the target series: the 30-day single-series query
-reads 9.1 MB instead of 62.5 MB and finishes in 39 ms, while TSF reads the whole 62.5 MB
-and needs 263 ms. The gap grows linearly with series-per-day, because TSF currently pays
-for every series to serve one. The series index already exists and the kernel can read a
-single series chunk; what is missing is predicate extraction and a series-scoped scan plan
-in `TsfExec`.
+**Series pushdown closed the 30-day gap.** Before it, `TsfExec` decoded every series of a
+metric inside the time window and the `tsid` predicate was applied above the scan: the
+30-day single-series query read all 62.5 MB and needed 263 ms, the one target that failed.
+Now `TsfPushdown::from_predicates` extracts `metric_id` and `tsid` equality and non-negated
+`IN` constraints from the scan predicates (intersecting repeats, dropping anything it does
+not understand), and `TsfExec` passes the series set to the staged planner, which skips
+series-index blocks and series chunks for every other series. The same query now reads
+1.27 MB, one fiftieth of the file, and takes 20 ms. The 1-day query went from 24.5 ms to
+4.6 ms. Parquet reaches the same shape through row-group statistics but stays at 49.5 ms,
+because it still decodes whole row groups of fifty series.
+
+The pushdown is a narrowing hint, never a replacement for the predicate: it only ever
+returns a superset of the matching rows, and the `FilterExec` above the scan still applies
+everything. That is why an unsupported form (`tsid > 5`, `NOT IN`, `OR`, a cast on the
+column) leaves the scan unfiltered rather than guessing.
 
 **Pruning is page-granular, and the page is one day here.** 5,760 samples per series per
 day fit in one 8,192-row page, so a one-hour window must read the whole day page for every
@@ -164,9 +187,9 @@ selected series. The measured 3.3% is the 1-day/30-day floor, which still meets 
 target. With more samples per day (or smaller pages) the hour window would prune below
 that floor; with fewer, it would rise, because the granule is a page, not an hour.
 
-**Flush dominates durable ingest.** Sorting, encoding and committing is 61-79% of the
+**Flush dominates durable ingest.** Sorting, encoding and committing is 61-76% of the
 write path, so the ingest-to-durable number is mostly a flush throughput number. TSF
-encodes faster than the Parquet writer (4.67 s vs 6.65 s for the gauge set) even though it
+encodes faster than the Parquet writer (5.05 s vs 5.90 s for the gauge set) even though it
 produces 2.3x fewer bytes.
 
 **Size is shape-dependent.** On the noisy gauge, TSF is 2.3x smaller than Parquet
@@ -175,7 +198,7 @@ dominated by the gauge mantissa, which no codec compresses; the counter is where
 TSF-specific delta encodings pay off.
 
 **Restart is manifest-bound and sub-second.** Reopening 30 files and running the first full
-scan takes 162-399 ms, well inside the 30 s target. This is a clean restart; the fault
+scan takes 220-551 ms, well inside the 30 s target. This is a clean restart; the fault
 injection suite (`SIGKILL` mid-flush and mid-commit) is still a T3 follow-up.
 
 # Reproduce

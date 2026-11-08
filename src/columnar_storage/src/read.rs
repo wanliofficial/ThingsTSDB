@@ -538,6 +538,11 @@ impl ParquetReader {
         let (parquet_ssts, tsf_ssts): (Vec<SstFile>, Vec<SstFile>) =
             ssts.into_iter().partition(|f| !f.meta().is_tsf());
 
+        // The same predicates are applied above the scan, but the ID ones
+        // decide what the TSF plan fetches: without this a single-series query
+        // decodes every series of the metric.
+        let pushdown = crate::tsf::exec::TsfPushdown::from_predicates(&predicates);
+
         let df_schema =
             DFSchema::try_from(self.schema.arrow_schema.clone()).context("build DFSchema")?;
         let sort_exprs = self.build_sort_exprs(&df_schema, true /* sort_seq */)?;
@@ -596,6 +601,7 @@ impl ParquetReader {
                     projection.clone(),
                     sort_exprs.clone(),
                 )
+                .map(|exec| exec.with_pushdown(pushdown))
                 .map(|exec| match &self.metrics {
                     Some(metrics) => exec.with_metrics(metrics.clone()),
                     None => exec,
