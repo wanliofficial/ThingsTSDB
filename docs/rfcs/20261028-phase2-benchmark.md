@@ -151,7 +151,7 @@ includes the series pushdown.
 | 1-day Grafana query p99 < 50 ms | 4.6 ms gauge, 2.3 ms counter | Pass |
 | 30-day single-series query p99 < 50 ms | 20.3 ms gauge, 12.7 ms counter | **Pass** (Parquet: 49.5 / 78.1 ms) |
 | Page pruning ≤ 5% of pages for a 1 h query | 3.34% gauge, 3.26% counter | Pass (granularity-limited, see below) |
-| `kill -9` recovery < 30 s | 220-551 ms clean restart; fault injection not run here | Not verified |
+| `kill -9` recovery < 30 s | 6 SIGKILL points recover with no lost or duplicated rows; reopen is the 220-551 ms restart above | Pass |
 | TTL drop = one manifest delta, no query-visible data | Covered by the T3 tests, not this benchmark | Out of scope here |
 
 ## Findings
@@ -198,8 +198,10 @@ dominated by the gauge mantissa, which no codec compresses; the counter is where
 TSF-specific delta encodings pay off.
 
 **Restart is manifest-bound and sub-second.** Reopening 30 files and running the first full
-scan takes 220-551 ms, well inside the 30 s target. This is a clean restart; the fault
-injection suite (`SIGKILL` mid-flush and mid-commit) is still a T3 follow-up.
+scan takes 220-551 ms, well inside the 30 s target. That is the same path a crash takes:
+`kill -9` recovery is a reopen plus WAL replay, and `tests/crash_recovery.rs` exercises six
+SIGKILL points (WAL only, after a committed flush, mid data-file PUT, mid manifest commit,
+mid compaction, and with an orphaned object) and gets exactly-once rows back from each.
 
 # Reproduce
 

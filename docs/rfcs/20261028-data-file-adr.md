@@ -550,8 +550,12 @@ data WAL append -> buffer -> TSF write -> fsync/upload -> manifest add -> WAL tr
 - If the process dies before the manifest add, the WAL replays the batch and a new file
   is written. The orphaned TSF file is deleted by GC.
 - If the process dies after the manifest add but before WAL truncation, replay writes a
-  duplicate file. The duplicate is harmless: both files contain the same rows and the
-  query deduplicates by `__seq__`. GC can merge/remove it later.
+  duplicate file. That is safe: both files are live, the merge stream sorts by primary
+  key and then `__seq__` and keeps the last row of each key, so the replay's newer
+  sequence wins and the query still returns one row per key. Compaction merges the two
+  files later; GC must not remove either, because the manifest references both.
+- Both windows are covered by `tests/crash_recovery.rs`, which kills a helper process
+  with `SIGKILL` exactly at each PUT boundary.
 - A manifest delta is atomic (temp + rename for local FS; a single object PUT for object
   storage). Readers see either the old or the new file list.
 
@@ -931,6 +935,16 @@ Done:
   format, splits TSF output by UTC day for the same segment-straddling reason, and
   never narrows or widens the `(min_sequence, max_sequence)` span of its inputs
   (`test_merge_inputs_splits_tsf_output_by_day`).
+- **T3 crash recovery:** `tests/crash_recovery.rs` runs a real storage in a child
+  process (`tests/support/crash_helper.rs`, a test-only `[[bin]]`) and sends
+  `SIGKILL` at six points: WAL only, after a committed flush, with an unreferenced
+  object, after the data-file PUT but before the manifest commit, after the
+  manifest delta PUT but before the WAL truncation, and during compaction with
+  its output written but not committed. Every case is reopened in-process and
+  checked for exactly-once rows, a truncated WAL and a GC sweep that removes the
+  crash's leftover objects and nothing else. The two mid-commit cases are only
+  deterministic because the child's object store pauses after the matching PUT,
+  so the kill lands in the window the test names.
 - **T4** in `pb_types`/`columnar_storage`: `SstMeta` gained `min_sequence` (5) and
   `format` (6) with the new `FileFormat` enum, defaulting to `PARQUET_V1` so old
   manifests and deltas still parse. Snapshot records are versioned (v1 = 32 bytes,
@@ -1002,8 +1016,8 @@ Done:
 Follow-up (not yet implemented):
 
 - **T3 compaction policies:** small/big compaction-job selection beyond the current
-  time-window strategy, and kill -9 crash-recovery tests (WAL replay and orphan
-  cleanup are implemented, the fault-injection suite is not).
+  time-window strategy (ADR §6.1's "small-part bytes > 25% of the partition" and
+  "partition close" triggers).
 - **Remaining observability:** codec selection and fallback counts, page/index-cache
   hit ratios and bloom rejections (the kernel already exposes `CacheStats`, but
   nothing aggregates it), plus flush/commit latency and compaction write
