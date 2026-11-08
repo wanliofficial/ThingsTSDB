@@ -374,8 +374,12 @@ The decode work above lands in the storage engine as follows:
 | Compaction writes TSF and carries `min_sequence` | `compaction/executor.rs` | `test_storage_dual_read_parquet_and_tsf` |
 | `format` + `min_sequence` in the manifest | `pb_types` `SstMeta` 5/6, snapshot record v2 | `test_snapshot_record_v2_round_trip`, `test_snapshot_record_v1_dual_read`, `test_snapshot_v1_upgrade` |
 | Dual-read execution plan | `read::build_df_plan` + `tsf::exec::TsfExec` | `test_storage_dual_read_parquet_and_tsf` |
+| Ranged page reads | `TsfReader::{from_segments,next_scan_ranges,page_ranges_for_metrics}` | `test_ranged_reader_matches_whole_file`, `test_staged_scan_planner_reads_only_touched_pages`, `test_ranged_read_fetches_only_touched_pages` |
 | Partition TTL drop | `Manifest::{plan_ttl_drop,drop_expired_partitions}` | `test_plan_and_drop_ttl_partitions` |
 
 `TsfExec` runs one partition per file so `SortPreservingMergeExec` above it sees
-sorted streams; each partition decodes only its own file's time range. Whole-object
-fetches are still used, so range reads remain the next decode-adjacent follow-up.
+sorted streams; each partition decodes only the intersection of the scan range and
+its own file range. Reads are planned in stages against the object store
+(`TsfReader::{footer_layout,next_scan_ranges,page_ranges_for_metrics}`), so a narrow
+window fetches the footer, the index, and only the pages it touches instead of the
+whole object. Files below 512 KiB are still fetched whole.

@@ -927,8 +927,15 @@ Done:
 
 Follow-up (not yet implemented):
 
-- **T2 range reads:** `TsfExec` fetches whole objects; footer/first-page range reads
-  are still pending.
+- **T2 range reads (landed):** `TsfReader` is built from byte segments
+  (`from_segments`), so a reader can hold any subset of a file. `FooterLayout`
+  parses the footer alone and names the header/bloom/index ranges; then
+  `next_scan_ranges` walks chunk-group header -> series index -> series chunk
+  header -> page index one level per round, and `page_ranges_for_metrics` returns
+  the exact pages a window needs. `TsfExec` drives those rounds against the object
+  store and decodes only the intersection of the scan range and the file range
+  (`test_ranged_read_fetches_only_touched_pages`). Files at or below 512 KiB are
+  still read whole, where round trips cost more than the bytes saved.
 - **T3 partition manager:** automatic partition discovery, small/big compaction job
   policies, crash recovery and orphan GC beyond the pure helpers and the TTL drop.
 - **T4 per-format metrics:** write/read counters are not split by format yet. The

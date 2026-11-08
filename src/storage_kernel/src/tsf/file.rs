@@ -18,8 +18,9 @@
 //! TSF v1 file writer and reader.
 //!
 //! The prototype writes the exact header/footer/index structures described in
-//! ADR-0002 and keeps the whole file in memory. Object-store ranged reads and
-//! caches are deferred; the encode/decode and pruning costs are the same.
+//! ADR-0002. A reader can be built either from the whole file or from a set of
+//! fetched byte ranges ([`TsfReader::from_segments`]), which is what the object
+//! store path uses so a narrow query does not download the whole file.
 
 use std::{collections::HashMap, hash::Hash, path::Path, sync::Arc};
 
@@ -735,13 +736,83 @@ pub fn write_file(
 
 /// A TSF file opened for reads.
 pub struct TsfReader {
-    data: Vec<u8>,
+    /// Byte ranges of the file that were fetched, in ascending `offset` order.
+    /// A whole-file reader has exactly one segment covering the entire file.
+    segments: Vec<Segment>,
+    /// Total file length, needed to validate offsets and to derive identity.
+    len: u64,
     header: FileHeader,
     groups: Vec<ChunkGroupEntry>,
     bloom: Option<Vec<u8>>,
     /// Identity used as the index-cache key prefix. Files are immutable, so a
     /// rewrite produces a different header CRC and/or size.
     identity: u64,
+}
+
+/// Layout of a TSF file's index section, parsed from its footer.
+///
+/// A ranged reader fetches this first (the last [`FOOTER_SIZE`] bytes of the
+/// file), then the header and the index ranges it names, and only afterwards
+/// the chunk groups a query actually touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FooterLayout {
+    pub file_index_offset: u64,
+    pub file_index_size: u32,
+    pub bloom_offset: u64,
+    pub bloom_size: u32,
+    pub chunk_group_count: u32,
+    pub row_count: u64,
+}
+
+impl FooterLayout {
+    /// Byte ranges to fetch after the footer so that
+    /// [`TsfReader::from_segments`] can rebuild the reader: the file header,
+    /// the bloom filter (when the file has one) and the file index, plus the
+    /// footer itself. Adjacent ranges are merged.
+    ///
+    /// Fetching these and nothing else gives a reader that can answer
+    /// [`TsfReader::missing_ranges_for_metrics`], i.e. that can tell a caller
+    /// exactly which chunk groups a query needs.
+    pub fn index_ranges(&self, file_len: u64) -> Vec<(u64, u64)> {
+        let mut ranges = vec![(0u64, FILE_HEADER_SIZE as u64)];
+        if self.bloom_size > 0 {
+            ranges.push((
+                self.bloom_offset,
+                self.bloom_offset + self.bloom_size as u64,
+            ));
+        }
+        ranges.push((
+            self.file_index_offset,
+            self.file_index_offset + self.file_index_size as u64,
+        ));
+        let footer_start = file_len.saturating_sub(FOOTER_SIZE as u64);
+        ranges.push((footer_start, file_len));
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if start >= end {
+                continue;
+            }
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+}
+
+/// One contiguous run of bytes that a reader holds.
+#[derive(Clone)]
+struct Segment {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+impl Segment {
+    fn end(&self) -> u64 {
+        self.offset + self.data.len() as u64
+    }
 }
 
 impl TsfReader {
@@ -752,8 +823,41 @@ impl TsfReader {
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
-        let header = parse_file_header(&data)?;
-        let footer = parse_footer(&data)?;
+        Self::from_segments(vec![(0, data)])
+    }
+
+    /// Builds a reader from arbitrary byte ranges of a file of length `len`.
+    ///
+    /// Ranges may be given in any order and must not overlap; gaps are allowed.
+    /// Every access that touches a gap fails with an error naming the missing
+    /// range, so a caller that under-fetches gets a clear failure rather than
+    /// wrong data. This is what the object-store query path uses: fetch the
+    /// tail (footer + file index), then only the chunks the predicate needs.
+    pub fn from_segments<I>(segments: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (u64, Vec<u8>)>,
+    {
+        let mut segments = segments
+            .into_iter()
+            .map(|(offset, data)| Segment { offset, data })
+            .collect::<Vec<_>>();
+        segments.sort_unstable_by_key(|s| s.offset);
+        for pair in segments.windows(2) {
+            if pair[0].end() > pair[1].offset {
+                return Err("TSF reader segments overlap".to_string());
+            }
+        }
+        let len = segments.last().map(|s| s.end()).unwrap_or(0);
+
+        let header_bytes = read_segments(&segments, 0, FILE_HEADER_SIZE as u64)?;
+        let header = parse_file_header(&header_bytes)?;
+
+        let footer_offset = len
+            .checked_sub(FOOTER_SIZE as u64)
+            .ok_or_else(|| format!("TSF file is too small: {len} bytes"))?;
+        let footer_bytes = read_segments(&segments, footer_offset, FOOTER_SIZE as u64)?;
+        let footer = parse_footer(&footer_bytes, len)?;
+
         if footer.chunk_group_count != header.chunk_group_count {
             return Err(format!(
                 "chunk group count mismatch: header={} footer={}",
@@ -761,7 +865,7 @@ impl TsfReader {
             ));
         }
         let file_index = decompress_at(
-            &data,
+            &segments,
             footer.file_index_offset,
             footer.file_index_size,
             0,
@@ -778,26 +882,266 @@ impl TsfReader {
             if footer.bloom_size == 0 {
                 return Err("bloom flag set but bloom size is zero".to_string());
             }
-            let filter = slice(&data, footer.bloom_offset, footer.bloom_size as usize)?;
-            if crc32c(filter) != footer.bloom_crc32c {
+            let filter = read_segments(&segments, footer.bloom_offset, footer.bloom_size as u64)?;
+            if crc32c(&filter) != footer.bloom_crc32c {
                 return Err("bloom filter CRC32C mismatch".to_string());
             }
-            Some(filter.to_vec())
+            Some(filter.into_owned())
         } else {
             None
         };
         // The header CRC changes whenever the file contents change, and the
         // length disambiguates CRC collisions; together they form a stable
         // identity for the immutable file.
-        let header_crc = u32::from_le_bytes(data[124..128].try_into().unwrap());
-        let identity = ((header_crc as u64) << 32) | (data.len() as u32 as u64);
+        let header_crc = u32::from_le_bytes(header_bytes[124..128].try_into().unwrap());
+        let identity = ((header_crc as u64) << 32) | (len as u32 as u64);
         Ok(Self {
-            data,
+            segments,
+            len,
             header,
             groups,
             bloom,
             identity,
         })
+    }
+
+    /// Total length of the file this reader was built from.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Byte ranges that the reader already holds, merged and in ascending
+    /// order. Callers use this to see what they would still need to fetch.
+    pub fn loaded_ranges(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for segment in &self.segments {
+            match out.last_mut() {
+                Some(last) if last.1 == segment.offset => last.1 = segment.end(),
+                _ => out.push((segment.offset, segment.end())),
+            }
+        }
+        out
+    }
+
+    /// Parses the footer that lives in the last [`FOOTER_SIZE`] bytes of a file
+    /// of `file_len` bytes.
+    ///
+    /// This is the entry point for ranged reads: it tells a caller which byte
+    /// ranges hold the header, the file index and the bloom filter, so it can
+    /// fetch those instead of the whole file.
+    pub fn footer_layout(footer: &[u8], file_len: u64) -> Result<FooterLayout, String> {
+        let footer = parse_footer(footer, file_len)?;
+        Ok(FooterLayout {
+            file_index_offset: footer.file_index_offset,
+            file_index_size: footer.file_index_size,
+            bloom_offset: footer.bloom_offset,
+            bloom_size: footer.bloom_size,
+            chunk_group_count: footer.chunk_group_count,
+            row_count: footer.row_count,
+        })
+    }
+
+    /// True when `[offset, offset + size)` is already held.
+    pub fn has_range(&self, offset: u64, size: u64) -> bool {
+        self.subtract_loaded(vec![(offset, offset + size)])
+            .is_empty()
+    }
+
+    /// The next byte ranges a caller must fetch to plan a metric scan, or
+    /// `None` when every page range is known.
+    ///
+    /// Walks the file metadata one level at a time, so a ranged reader can plan
+    /// a scan with a bounded number of small fetches instead of downloading the
+    /// file:
+    ///
+    /// 1. chunk group header (48 B) — gives the series index location;
+    /// 2. series index (40 B per block row) and series index blocks (56 B per
+    ///    series) — give each series' time and sequence bounds;
+    /// 3. series chunk headers (96 B) — give each page index location;
+    /// 4. page indexes (80 B per page) — give each page's time and sequence
+    ///    bounds plus its byte range.
+    ///
+    /// After each call the caller fetches the ranges, rebuilds the reader with
+    /// them, and calls again. Every level only requests ranges that overlap the
+    /// query, so a narrow scan touches few series and, in the last level, few
+    /// pages (see [`TsfReader::page_ranges_for_metrics`]).
+    pub fn next_scan_ranges(&self, metrics: &[(u64, TimeRange)]) -> Option<Vec<(u64, u64)>> {
+        let mut wanted: Vec<(u64, u64)> = Vec::new();
+        let note = |wanted: &mut Vec<(u64, u64)>, offset: u64, size: u64| {
+            let end = offset + size;
+            wanted.extend(self.subtract_loaded(vec![(offset, end)]));
+        };
+        for &(metric_id, range) in metrics {
+            let Ok(Some(group)) = self.group_for(metric_id) else {
+                continue;
+            };
+            if group.min_timestamp > range.end || group.max_timestamp < range.start {
+                continue;
+            }
+            let group_header_size = CHUNK_GROUP_HEADER_SIZE as u64;
+            if !self.has_range(group.group_offset, group_header_size) {
+                note(&mut wanted, group.group_offset, group_header_size);
+                continue;
+            }
+            let Ok(header) = self.chunk_group_header(&group) else {
+                continue;
+            };
+            if !header.overlaps(range) {
+                continue;
+            }
+            if !self.has_range(header.series_index_offset, header.series_index_size as u64) {
+                note(
+                    &mut wanted,
+                    header.series_index_offset,
+                    header.series_index_size as u64,
+                );
+                continue;
+            }
+            let Ok(rows) = self.series_index_rows(&header) else {
+                continue;
+            };
+            for row in &rows {
+                if !self.has_range(row.block_offset, row.block_size as u64) {
+                    note(&mut wanted, row.block_offset, row.block_size as u64);
+                }
+            }
+            if !wanted.is_empty() {
+                continue;
+            }
+            for row in &rows {
+                let Ok(entries) = self.series_block(row) else {
+                    continue;
+                };
+                for entry in entries {
+                    if entry.max_timestamp < range.start || entry.min_timestamp >= range.end {
+                        continue;
+                    }
+                    let chunk_header_size = SERIES_CHUNK_HEADER_SIZE as u64;
+                    if !self.has_range(entry.chunk_offset, chunk_header_size) {
+                        note(&mut wanted, entry.chunk_offset, chunk_header_size);
+                        continue;
+                    }
+                    let Ok(chunk) = self.series_chunk_header(&entry) else {
+                        continue;
+                    };
+                    if !self.has_range(chunk.page_index_offset, chunk.page_index_size as u64) {
+                        note(
+                            &mut wanted,
+                            chunk.page_index_offset,
+                            chunk.page_index_size as u64,
+                        );
+                    }
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return None;
+        }
+        wanted.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(wanted.len());
+        for (start, end) in wanted {
+            if start >= end {
+                continue;
+            }
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        Some(merged)
+    }
+
+    /// Byte ranges of the pages that a metric scan must decode.
+    ///
+    /// Requires the metadata that [`TsfReader::next_scan_ranges`] asks for to
+    /// be loaded. Pages whose time bounds miss `range` are skipped, so this is
+    /// the finest pruning the format allows.
+    pub fn page_ranges_for_metrics(&self, metrics: &[(u64, TimeRange)]) -> Vec<(u64, u64)> {
+        let mut wanted: Vec<(u64, u64)> = Vec::new();
+        for &(metric_id, range) in metrics {
+            let Ok(Some(group)) = self.group_for(metric_id) else {
+                continue;
+            };
+            let Ok(header) = self.chunk_group_header(&group) else {
+                continue;
+            };
+            if !header.overlaps(range) {
+                continue;
+            }
+            let Ok(entries) = self.series_entries(&header) else {
+                continue;
+            };
+            for entry in &entries {
+                if entry.max_timestamp < range.start || entry.min_timestamp >= range.end {
+                    continue;
+                }
+                let Ok(chunk) = self.series_chunk_header(entry) else {
+                    continue;
+                };
+                let Ok(raw) = decompress_at(
+                    &self.segments,
+                    chunk.page_index_offset,
+                    chunk.page_index_size,
+                    chunk.page_index_crc32c,
+                    "page index",
+                ) else {
+                    continue;
+                };
+                for bytes in raw.as_chunks::<PAGE_ENTRY_SIZE>().0 {
+                    let min_timestamp = get_i64(bytes, 0);
+                    let max_timestamp = get_i64(bytes, 8);
+                    if max_timestamp < range.start || min_timestamp >= range.end {
+                        continue;
+                    }
+                    let offset = get_u64(bytes, 64);
+                    let size = get_u32(bytes, 72) as u64;
+                    wanted.push((offset, offset + size));
+                }
+            }
+        }
+        wanted.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(wanted.len());
+        for (start, end) in wanted {
+            if start >= end {
+                continue;
+            }
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
+    /// Subtracts ranges the reader already holds from `wanted`.
+    fn subtract_loaded(&self, wanted: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        let loaded = self.loaded_ranges();
+        let mut out = Vec::new();
+        for (mut start, end) in wanted {
+            for &(loaded_start, loaded_end) in &loaded {
+                if loaded_end <= start {
+                    continue;
+                }
+                if loaded_start >= end {
+                    break;
+                }
+                if loaded_start > start {
+                    out.push((start, loaded_start));
+                }
+                start = start.max(loaded_end);
+                if start >= end {
+                    break;
+                }
+            }
+            if start < end {
+                out.push((start, end));
+            }
+        }
+        out
     }
 
     pub fn file_identity(&self) -> u64 {
@@ -821,7 +1165,12 @@ impl TsfReader {
     }
 
     fn chunk_group_header(&self, group: &ChunkGroupEntry) -> Result<ChunkGroupHeader, String> {
-        let h = slice(&self.data, group.group_offset, CHUNK_GROUP_HEADER_SIZE)?;
+        let h = read_segments(
+            &self.segments,
+            group.group_offset,
+            CHUNK_GROUP_HEADER_SIZE as u64,
+        )?;
+        let h = h.as_ref();
         if crc32c(&h[..44]) != u32::from_le_bytes(h[44..48].try_into().unwrap()) {
             return Err(format!(
                 "chunk group header CRC mismatch for metric {}",
@@ -848,7 +1197,7 @@ impl TsfReader {
 
     fn series_index_rows(&self, group: &ChunkGroupHeader) -> Result<Vec<SeriesIndexRow>, String> {
         let raw = decompress_at(
-            &self.data,
+            &self.segments,
             group.series_index_offset,
             group.series_index_size,
             group.series_index_crc32c,
@@ -873,7 +1222,7 @@ impl TsfReader {
 
     fn series_block(&self, row: &SeriesIndexRow) -> Result<Vec<SeriesEntry>, String> {
         let raw = decompress_at(
-            &self.data,
+            &self.segments,
             row.block_offset,
             row.block_size,
             row.crc32c,
@@ -951,7 +1300,7 @@ impl TsfReader {
             return Ok(pages);
         }
         let raw = decompress_at(
-            &self.data,
+            &self.segments,
             header.page_index_offset,
             header.page_index_size,
             header.page_index_crc32c,
@@ -1024,7 +1373,12 @@ impl TsfReader {
 
     /// Parses and validates one series chunk header.
     fn series_chunk_header(&self, entry: &SeriesEntry) -> Result<SeriesChunkHeader, String> {
-        let h = slice(&self.data, entry.chunk_offset, SERIES_CHUNK_HEADER_SIZE)?;
+        let h = read_segments(
+            &self.segments,
+            entry.chunk_offset,
+            SERIES_CHUNK_HEADER_SIZE as u64,
+        )?;
+        let h = h.as_ref();
         if crc32c(&h[..92]) != u32::from_le_bytes(h[92..96].try_into().unwrap()) {
             return Err(format!(
                 "series chunk header CRC mismatch for series {}",
@@ -1215,8 +1569,8 @@ impl TsfReader {
             if page.max_timestamp < range.start || page.min_timestamp >= range.end {
                 continue;
             }
-            let bytes = slice(&self.data, page.page_offset, page.page_size as usize)?;
-            decode_page_into(bytes, decode_mask, &mut ctx.buffers)?;
+            let bytes = read_segments(&self.segments, page.page_offset, page.page_size as u64)?;
+            decode_page_into(&bytes, decode_mask, &mut ctx.buffers)?;
             if ctx.buffers.row_count != page.row_count as usize {
                 return Err("decoded page row count mismatch".to_string());
             }
@@ -1295,7 +1649,7 @@ impl TsfReader {
         }
         let header = self.series_chunk_header(entry)?;
         let raw = decompress_at(
-            &self.data,
+            &self.segments,
             header.page_index_offset,
             header.page_index_size,
             header.page_index_crc32c,
@@ -1338,8 +1692,8 @@ impl TsfReader {
                     continue;
                 }
             }
-            let bytes = slice(&self.data, page.page_offset, page.page_size as usize)?;
-            let decoded = decode_page(bytes)?;
+            let bytes = read_segments(&self.segments, page.page_offset, page.page_size as u64)?;
+            let decoded = decode_page(&bytes)?;
             if decoded.len() != page.row_count as usize {
                 return Err("decoded page row count mismatch".to_string());
             }
@@ -1605,11 +1959,11 @@ fn decode_chunk_group_entries(raw: &[u8]) -> Result<Vec<ChunkGroupEntry>, String
     Ok(groups)
 }
 
-fn parse_file_header(data: &[u8]) -> Result<FileHeader, String> {
-    if data.len() < FILE_HEADER_SIZE + FOOTER_SIZE {
-        return Err(format!("TSF file is too small: {} bytes", data.len()));
+fn parse_file_header(h: &[u8]) -> Result<FileHeader, String> {
+    if h.len() < FILE_HEADER_SIZE {
+        return Err(format!("TSF header is {} bytes", h.len()));
     }
-    let h = &data[..FILE_HEADER_SIZE];
+    let h = &h[..FILE_HEADER_SIZE];
     if &h[0..4] != MAGIC {
         return Err("unexpected TSF magic".to_string());
     }
@@ -1632,8 +1986,13 @@ fn parse_file_header(data: &[u8]) -> Result<FileHeader, String> {
     })
 }
 
-fn parse_footer(data: &[u8]) -> Result<Footer, String> {
-    let f = &data[data.len() - FOOTER_SIZE..];
+fn parse_footer(f: &[u8], file_len: u64) -> Result<Footer, String> {
+    if f.len() != FOOTER_SIZE {
+        return Err(format!(
+            "TSF footer must be {FOOTER_SIZE} bytes, got {}",
+            f.len()
+        ));
+    }
     if &f[0..4] != MAGIC {
         return Err("unexpected TSF footer magic".to_string());
     }
@@ -1655,7 +2014,7 @@ fn parse_footer(data: &[u8]) -> Result<Footer, String> {
     if footer
         .file_index_offset
         .checked_add(footer.file_index_size as u64)
-        .is_none_or(|end| end > data.len() as u64 - FOOTER_SIZE as u64)
+        .is_none_or(|end| end > file_len - FOOTER_SIZE as u64)
     {
         return Err("file index points outside the file".to_string());
     }
@@ -1663,33 +2022,80 @@ fn parse_footer(data: &[u8]) -> Result<Footer, String> {
 }
 
 fn decompress_at(
-    data: &[u8],
+    segments: &[Segment],
     offset: u64,
     size: u32,
     expected_crc: u32,
     what: &str,
 ) -> Result<Vec<u8>, String> {
-    let bytes = slice(data, offset, size as usize)?;
-    if expected_crc != 0 && crc32c(bytes) != expected_crc {
+    let bytes = read_segments(segments, offset, size as u64)?;
+    if expected_crc != 0 && crc32c(&bytes) != expected_crc {
         return Err(format!("{what} CRC32C mismatch"));
     }
     let mut raw = Vec::new();
-    decompress_zstd(&mut raw, bytes).map_err(|e| format!("cannot decompress {what}: {e}"))?;
+    decompress_zstd(&mut raw, &bytes).map_err(|e| format!("cannot decompress {what}: {e}"))?;
     Ok(raw)
 }
 
-fn slice(data: &[u8], offset: u64, size: usize) -> Result<&[u8], String> {
-    let start = usize::try_from(offset).map_err(|_| "offset overflows usize".to_string())?;
-    let end = start
+/// Returns the bytes at `[offset, offset + size)`.
+///
+/// Serves straight out of a single segment when one covers the range (the
+/// common case: a whole-file reader, or a page read after the chunk group was
+/// fetched) and copies only when the range straddles segment boundaries.
+fn read_segments<'a>(
+    segments: &'a [Segment],
+    offset: u64,
+    size: u64,
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+    let end = offset
         .checked_add(size)
         .ok_or_else(|| "offset + size overflows".to_string())?;
-    if end > data.len() {
-        return Err(format!(
-            "read out of bounds: offset={offset} size={size} file={}",
-            data.len()
-        ));
+    let idx = match segments.binary_search_by(|s| s.offset.cmp(&offset)) {
+        Ok(idx) => idx,
+        Err(0) => {
+            return Err(format!(
+                "byte range {offset}..{end} is not loaded (file starts at {})",
+                segments.first().map(|s| s.offset).unwrap_or(0)
+            ))
+        }
+        Err(idx) => idx - 1,
+    };
+    let first = &segments[idx];
+    if offset < first.offset || end > first.end() {
+        // Either the range starts before what we hold, or it spans a gap or
+        // several segments. Walk forward and stitch; report the gap if a byte
+        // inside the range is missing.
+        let mut out = Vec::with_capacity(size as usize);
+        let mut cursor = offset;
+        for segment in &segments[idx..] {
+            if cursor >= end {
+                break;
+            }
+            if segment.end() <= cursor {
+                continue;
+            }
+            if segment.offset > cursor {
+                return Err(format!(
+                    "byte range {cursor}..{end} is not loaded (gap before {})",
+                    segment.offset
+                ));
+            }
+            let skip = (cursor - segment.offset) as usize;
+            let take = ((end - cursor) as usize).min(segment.data.len() - skip);
+            out.extend_from_slice(&segment.data[skip..skip + take]);
+            cursor += take as u64;
+        }
+        if cursor < end {
+            return Err(format!(
+                "byte range {cursor}..{end} is not loaded (file ends at {cursor})"
+            ));
+        }
+        return Ok(std::borrow::Cow::Owned(out));
     }
-    Ok(&data[start..end])
+    let skip = (offset - first.offset) as usize;
+    Ok(std::borrow::Cow::Borrowed(
+        &first.data[skip..skip + size as usize],
+    ))
 }
 
 fn now_ms() -> i64 {
@@ -2212,5 +2618,239 @@ mod tests {
         assert_eq!(one.len(), 5);
         assert_eq!(one[0].series_id, 500);
         assert_eq!(one.last().unwrap().timestamp, base + 4 * interval);
+    }
+
+    /// Fetches `ranges` out of `data`, the way an object store would, and
+    /// rebuilds a reader from just those bytes.
+    fn ranged_reader(data: &[u8], ranges: &[(u64, u64)]) -> TsfReader {
+        TsfReader::from_segments(
+            ranges
+                .iter()
+                .map(|&(start, end)| (start, data[start as usize..end as usize].to_vec()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_ranged_reader_matches_whole_file() {
+        let rows = mixed_rows();
+        let (bytes, stats) = encode_file(
+            rows.clone(),
+            (0, 2_000_000_000_000),
+            &WriterOptions { page_rows: 64 },
+        )
+        .unwrap();
+        let len = bytes.len() as u64;
+
+        // Round 1: footer only, to learn the index layout.
+        let footer = TsfReader::footer_layout(&bytes[bytes.len() - FOOTER_SIZE..], len).unwrap();
+        assert_eq!(footer.chunk_group_count, 2);
+        assert_eq!(footer.row_count, stats.rows);
+
+        // Round 2: header + bloom + file index + footer.
+        let index_ranges = footer.index_ranges(len);
+        assert!(index_ranges.iter().all(|&(_, end)| end <= len));
+        let loaded = index_ranges.iter().map(|&(a, b)| b - a).sum::<u64>();
+        assert!(loaded < len / 4, "index bytes {loaded} vs file {len}");
+        let index_only = ranged_reader(&bytes, &index_ranges);
+
+        // Reading a chunk group that was never fetched must fail loudly, not
+        // silently return nothing.
+        let mut ctx = ReadContext::new();
+        let err = index_only
+            .read_metric_columns(
+                1,
+                TimeRange::new(i64::MIN, i64::MAX),
+                ColumnMask::ALL,
+                &mut ctx,
+            )
+            .unwrap_err();
+        assert!(err.contains("not loaded"), "unexpected error: {err}");
+
+        // Round 3: the staged planner, until it has everything it needs.
+        let metrics = [(1u64, TimeRange::new(i64::MIN, i64::MAX))];
+        let (ranged, _, _) = plan_ranged_scan(&bytes, &metrics);
+
+        let whole = TsfReader::from_bytes(bytes.clone()).unwrap();
+        let mut ctx = ReadContext::new();
+        let expected = whole
+            .read_metric_columns(
+                1,
+                TimeRange::new(i64::MIN, i64::MAX),
+                ColumnMask::ALL,
+                &mut ctx,
+            )
+            .unwrap();
+        let mut ctx = ReadContext::new();
+        let actual = ranged
+            .read_metric_columns(
+                1,
+                TimeRange::new(i64::MIN, i64::MAX),
+                ColumnMask::ALL,
+                &mut ctx,
+            )
+            .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(&expected) {
+            assert_eq!(a.series_id, b.series_id);
+            assert_eq!(a.timestamps, b.timestamps);
+            assert_eq!(
+                a.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                b.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(a.sequences, b.sequences);
+            assert_eq!(a.reserved, b.reserved);
+        }
+    }
+
+    #[test]
+    fn test_ranged_reader_prunes_by_metric_and_time() {
+        let (bytes, _) = encode_file(
+            mixed_rows(),
+            (0, 2_000_000_000_000),
+            &WriterOptions { page_rows: 64 },
+        )
+        .unwrap();
+        let len = bytes.len() as u64;
+        let footer = TsfReader::footer_layout(&bytes[bytes.len() - FOOTER_SIZE..], len).unwrap();
+        let reader = ranged_reader(&bytes, &footer.index_ranges(len));
+
+        // Metric absent from the file index: the planner asks for nothing.
+        assert!(reader
+            .next_scan_ranges(&[(99, TimeRange::new(i64::MIN, i64::MAX))])
+            .is_none());
+
+        // A range that misses the metric's chunk group asks for nothing too.
+        assert!(reader
+            .next_scan_ranges(&[(1, TimeRange::new(1, 2))])
+            .is_none());
+
+        // A metric that is present needs its chunk group.
+        let wanted = reader
+            .next_scan_ranges(&[(1, TimeRange::new(i64::MIN, i64::MAX))])
+            .unwrap();
+        assert!(!wanted.is_empty());
+        for pair in wanted.windows(2) {
+            assert!(pair[0].1 < pair[1].0, "ranges not merged: {wanted:?}");
+        }
+        for &(start, end) in &wanted {
+            assert!(start < end && end <= len);
+        }
+    }
+
+    /// Fetches whatever `next_scan_ranges` asks for until it stops asking,
+    /// the way the object-store reader does.
+    fn plan_ranged_scan(data: &[u8], metrics: &[(u64, TimeRange)]) -> (TsfReader, u64, usize) {
+        let len = data.len() as u64;
+        let footer = TsfReader::footer_layout(&data[data.len() - FOOTER_SIZE..], len).unwrap();
+        let mut ranges = footer.index_ranges(len);
+        let mut rounds = 0;
+        loop {
+            let reader = ranged_reader(data, &ranges);
+            let Some(more) = reader.next_scan_ranges(metrics) else {
+                break;
+            };
+            rounds += 1;
+            assert!(rounds < 16, "planner did not converge: {more:?}");
+            ranges.extend(more);
+        }
+        ranges.extend(ranged_reader(data, &ranges).page_ranges_for_metrics(metrics));
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        let fetched = merged.iter().map(|(a, b)| b - a).sum::<u64>();
+        (ranged_reader(data, &merged), fetched, rounds)
+    }
+
+    #[test]
+    fn test_staged_scan_planner_reads_only_touched_pages() {
+        // One metric, many series, many pages per series, a full day wide.
+        let base = 1_700_000_000_000;
+        let mut rows = Vec::new();
+        for series in 0..50u64 {
+            for i in 0..400i64 {
+                rows.push(row(
+                    1,
+                    series,
+                    base + i * 1_000,
+                    series as f64 + i as f64,
+                    0,
+                ));
+            }
+        }
+        let (bytes, stats) = encode_file(
+            rows.clone(),
+            (base, base + 86_400_000),
+            &WriterOptions { page_rows: 64 },
+        )
+        .unwrap();
+        let len = bytes.len() as u64;
+
+        // A one-sample window. Fifty series still means fifty pages (one page
+        // per series), so this measures page-level pruning while the file
+        // metadata is a fixed floor: the check is that the bytes fetched track
+        // the window, not the file.
+        let narrow = TimeRange::new(base + 100 * 1_000, base + 100 * 1_000 + 1);
+        let (reader, fetched, rounds) = plan_ranged_scan(&bytes, &[(1, narrow)]);
+        assert!(rounds >= 1, "expected several planning rounds");
+        assert!(
+            fetched * 5 < len * 2,
+            "narrow scan fetched {fetched} of {len} bytes"
+        );
+        // Exactly one page per series is needed.
+        let (planner, _, _) = plan_ranged_scan(&bytes, &[(1, narrow)]);
+        assert_eq!(planner.page_ranges_for_metrics(&[(1, narrow)]).len(), 50);
+
+        let mut ctx = ReadContext::new();
+        let decoded = reader
+            .read_metric_columns(1, narrow, ColumnMask::ALL, &mut ctx)
+            .unwrap();
+        let rows_read: usize = decoded.iter().map(|c| c.len()).sum();
+        assert_eq!(rows_read, 50, "one sample per series");
+        for column in &decoded {
+            assert_eq!(column.len(), 1);
+            assert_eq!(column.timestamps[0], base + 100 * 1_000);
+            assert_eq!(column.values[0], column.series_id as f64 + 100.0);
+        }
+
+        // A whole-file window must still be correct, and it fetches
+        // everything.
+        let wide = TimeRange::new(i64::MIN, i64::MAX);
+        let (reader, fetched, _) = plan_ranged_scan(&bytes, &[(1, wide)]);
+        assert_eq!(fetched, len);
+        let mut ctx = ReadContext::new();
+        let decoded = reader
+            .read_metric_columns(1, wide, ColumnMask::ALL, &mut ctx)
+            .unwrap();
+        let rows_read: usize = decoded.iter().map(|c| c.len()).sum();
+        assert_eq!(rows_read, stats.rows as usize);
+    }
+
+    #[test]
+    fn test_staged_scan_planner_skips_absent_metrics() {
+        let (bytes, _) = encode_file(
+            mixed_rows(),
+            (0, 2_000_000_000_000),
+            &WriterOptions { page_rows: 64 },
+        )
+        .unwrap();
+        let len = bytes.len() as u64;
+        let footer = TsfReader::footer_layout(&bytes[bytes.len() - FOOTER_SIZE..], len).unwrap();
+        let index_only = ranged_reader(&bytes, &footer.index_ranges(len));
+        assert!(index_only
+            .next_scan_ranges(&[(42, TimeRange::new(i64::MIN, i64::MAX))])
+            .is_none());
+        assert!(index_only
+            .next_scan_ranges(&[(1, TimeRange::new(1, 2))])
+            .is_none());
+        assert!(index_only
+            .page_ranges_for_metrics(&[(42, TimeRange::new(i64::MIN, i64::MAX))])
+            .is_empty());
     }
 }
