@@ -19,8 +19,8 @@ use std::{any::Any, pin::Pin, sync::Arc, task::Poll};
 
 use anyhow::Context;
 use arrow::{
-    array::{AsArray, RecordBatch},
-    compute::concat_batches,
+    array::{Array, AsArray, BooleanArray, RecordBatch},
+    compute::{and_kleene, concat_batches, kernels::cmp::eq as eq_kernel},
     datatypes::{
         GenericBinaryType, Int32Type, Int64Type, Int8Type, Schema, SchemaRef, UInt32Type,
         UInt64Type, UInt8Type,
@@ -299,9 +299,86 @@ impl MergeStream {
         true
     }
 
+    /// Whether every row in `batch` has a primary key distinct from its
+    /// neighbours and from the pending row, so the batch can be emitted without
+    /// a merge-operator call per row.
+    ///
+    /// The general path slices one `RecordBatch` per primary-key group and
+    /// calls the merge operator once per group. A time-series scan has a unique
+    /// timestamp per row, so that is one slice, one dynamic-key comparison and
+    /// one operator call per row, which dominates the scan (see the T5
+    /// benchmark). Checking for adjacent duplicates column-wise is two vector
+    /// comparisons per primary key, and in the common case it proves the fast
+    /// path is safe for the whole batch.
+    fn can_emit_in_bulk(&self, batch: &RecordBatch) -> bool {
+        if let Some(pending) = &self.pending_batch {
+            let first = batch.slice(0, 1);
+            if self.primary_key_eq(pending, pending.num_rows() - 1, &first, 0) {
+                return false;
+            }
+        }
+        !self.has_adjacent_duplicate_keys(batch)
+    }
+
+    /// True if two adjacent rows share a primary key, or if the primary-key
+    /// types are not supported by the comparison kernel (in which case the
+    /// caller must take the general path).
+    fn has_adjacent_duplicate_keys(&self, batch: &RecordBatch) -> bool {
+        let rows = batch.num_rows();
+        if rows < 2 {
+            return false;
+        }
+        let mut same: Option<BooleanArray> = None;
+        for idx in 0..self.num_primary_keys {
+            let column = batch.column(idx);
+            let lhs = column.slice(0, rows - 1);
+            let rhs = column.slice(1, rows - 1);
+            let lhs: &dyn Array = &lhs;
+            let rhs: &dyn Array = &rhs;
+            let adjacent = match eq_kernel(&lhs, &rhs) {
+                Ok(adjacent) => adjacent,
+                Err(_) => return true,
+            };
+            same = Some(match same {
+                Some(acc) => match and_kleene(&acc, &adjacent) {
+                    Ok(mask) => mask,
+                    Err(_) => return true,
+                },
+                None => adjacent,
+            });
+        }
+        same.is_some_and(|mask| mask.true_count() > 0)
+    }
+
     fn merge_batch(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>> {
         if batch.num_rows() == 0 {
             return Ok(None);
+        }
+
+        // Fast path: no two rows share a primary key, so every group is a
+        // singleton and the merge operator is the identity. Emit the whole
+        // batch at once and keep only its last row as pending, since the next
+        // batch may continue that key.
+        if self.can_emit_in_bulk(&batch) {
+            let rows = batch.num_rows();
+            let mut output = Vec::with_capacity(2);
+            if let Some(pending) = self.pending_batch.take() {
+                output.push(pending);
+            }
+            self.pending_batch = Some(batch.slice(rows - 1, 1));
+            if rows > 1 {
+                output.push(batch.slice(0, rows - 1));
+            }
+            if output.is_empty() {
+                return Ok(None);
+            }
+            let mut output = if output.len() == 1 {
+                output.pop().unwrap()
+            } else {
+                concat_batches(&batch.schema(), &output).context("concat batch")?
+            };
+            self.maybe_remove_builtin_columns(&mut output);
+            return Ok(Some(output));
         }
 
         // Group rows with the same primary keys
@@ -658,6 +735,88 @@ mod tests {
         ];
 
         test_merge_stream_inner(Arc::new(BytesMergeOperator::new(vec![1])), expected).await;
+    }
+
+    /// A batch whose rows all have distinct primary keys is emitted without a
+    /// merge-operator call per row: the T5 benchmark showed that path
+    /// dominating a full scan.
+    #[test(tokio::test)]
+    async fn test_merge_stream_bulk_path_for_distinct_keys() {
+        let stream = make_sendable_record_batches([
+            record_batch!(
+                ("pk1", UInt8, vec![11, 12]),
+                ("value", Binary, vec![b"1", b"2"]),
+                (SEQ_COLUMN_NAME, UInt8, vec![1, 2]),
+                (RESERVED_COLUMN_NAME, UInt8, vec![None; 2])
+            )
+            .unwrap(),
+            record_batch!(
+                ("pk1", UInt8, vec![13, 14]),
+                ("value", Binary, vec![b"3", b"4"]),
+                (SEQ_COLUMN_NAME, UInt8, vec![3, 4]),
+                (RESERVED_COLUMN_NAME, UInt8, vec![None; 2])
+            )
+            .unwrap(),
+        ]);
+        let expected = record_batch!(
+            ("pk1", UInt8, vec![11, 12, 13, 14]),
+            ("value", Binary, vec![b"1", b"2", b"3", b"4"])
+        )
+        .unwrap();
+
+        let mut stream = Box::pin(MergeStream::new(
+            stream,
+            1,
+            Arc::new(LastValueOperator),
+            false, // keep_builtin
+        ));
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.unwrap());
+        }
+        let actual = concat_batches(&expected.schema(), &batches).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    /// The bulk path must still merge a key that continues from the pending row
+    /// of the previous batch.
+    #[test(tokio::test)]
+    async fn test_merge_stream_bulk_path_merges_across_batches() {
+        let stream = make_sendable_record_batches([
+            record_batch!(
+                ("pk1", UInt8, vec![11, 12]),
+                ("value", Binary, vec![b"1", b"2"]),
+                (SEQ_COLUMN_NAME, UInt8, vec![1, 2]),
+                (RESERVED_COLUMN_NAME, UInt8, vec![None; 2])
+            )
+            .unwrap(),
+            record_batch!(
+                ("pk1", UInt8, vec![12, 13]),
+                ("value", Binary, vec![b"3", b"4"]),
+                (SEQ_COLUMN_NAME, UInt8, vec![3, 4]),
+                (RESERVED_COLUMN_NAME, UInt8, vec![None; 2])
+            )
+            .unwrap(),
+        ]);
+        // Last value wins for the shared key: 12 -> "3".
+        let expected = record_batch!(
+            ("pk1", UInt8, vec![11, 12, 13]),
+            ("value", Binary, vec![b"1", b"3", b"4"])
+        )
+        .unwrap();
+
+        let mut stream = Box::pin(MergeStream::new(
+            stream,
+            1,
+            Arc::new(LastValueOperator),
+            false, // keep_builtin
+        ));
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.unwrap());
+        }
+        let actual = concat_batches(&expected.schema(), &batches).unwrap();
+        assert_eq!(actual, expected);
     }
 
     async fn test_merge_stream_inner<I>(merge_op: MergeOperatorRef, expected: I)
