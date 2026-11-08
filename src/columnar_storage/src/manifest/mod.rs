@@ -151,14 +151,19 @@ impl Manifest {
             .context("failed to encode manifest update")?;
 
         // 1. Persist the delta manifest
+        let metrics = self.metrics.read().unwrap().clone();
+        let payload_len = buf.len() as u64;
+        let commit_started = std::time::Instant::now();
         self.store
             .put(&path, PutPayload::from_bytes(Bytes::from(buf)))
             .await
             .with_context(|| format!("Failed to write delta manifest, path:{}", path))?;
+        let commit_elapsed = commit_started.elapsed();
 
         // 2. Update cached payload
         {
-            if let Some(metrics) = self.metrics.read().unwrap().as_ref() {
+            if let Some(metrics) = metrics.as_ref() {
+                metrics.record_manifest_commit(payload_len, commit_elapsed);
                 for file in &update.to_adds {
                     let meta = file.meta();
                     metrics.for_format(meta.format).record_write(

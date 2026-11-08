@@ -910,6 +910,15 @@ mod tests {
                 // them left codec counters behind.
                 assert_eq!(stats.flush.flushes, 1);
                 assert_eq!(stats.flush.rows, 4);
+                assert!(
+                    stats.flush.sort_millis + stats.flush.write_millis + stats.flush.wal_millis
+                        <= stats.flush.total_millis,
+                    "stage timings are subsets of the flush"
+                );
+                // The flush committed one delta; the commit is timed
+                // separately.
+                assert_eq!(stats.manifest.commits, 1);
+                assert!(stats.manifest.bytes_written > 0);
                 assert!(stats.tsf_kernel.pages > 0);
                 assert_eq!(stats.compaction, Default::default());
 

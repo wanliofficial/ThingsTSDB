@@ -43,10 +43,13 @@
 //! Two more groups answer the operational questions the per-format counters
 //! cannot:
 //!
-//! - [`FlushStats`] reports how long a flush takes and how many rows it moves,
-//!   which is where write latency comes from;
-//! - [`CompactionStats`] reports compaction input and output volume, so write
-//!   amplification (output bytes / input bytes) is visible.
+//! - [`FlushStats`] reports how long a flush takes, its sort/write/WAL stage
+//!   split and how many rows it moves, which is where write latency comes from;
+//! - [`CompactionStats`] reports compaction input and output volume and rows,
+//!   so write amplification (output bytes / input bytes) and deduplicated rows
+//!   are visible;
+//! - [`ManifestStats`] reports delta-commit bytes and latency, the shared cost
+//!   of every flush, compaction and rewrite.
 //!
 //! The codec, bloom and index-cache counters are process-wide and live in the
 //! kernel ([`storage_kernel::tsf::codec_stats`]); [`StorageMetrics::snapshot`]
@@ -142,16 +145,37 @@ pub struct FlushCounters {
     rows: AtomicU64,
     total_millis: AtomicU64,
     max_millis: AtomicU64,
+    sort_millis: AtomicU64,
+    write_millis: AtomicU64,
+    wal_millis: AtomicU64,
+}
+
+/// Where the time inside one flush went. The three stages are disjoint and
+/// `write` includes the manifest commit of the produced files.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FlushStages {
+    /// Merging and sorting the buffered batches of every segment.
+    pub sort: Duration,
+    /// Encoding, uploading and committing the segment files.
+    pub write: Duration,
+    /// Removing the WAL files that the flush made durable.
+    pub wal: Duration,
 }
 
 impl FlushCounters {
     /// Records one successful flush of `rows` buffered rows.
-    pub fn record(&self, rows: u64, elapsed: Duration) {
+    pub fn record(&self, rows: u64, elapsed: Duration, stages: FlushStages) {
         let millis = elapsed.as_millis() as u64;
         self.flushes.fetch_add(1, Ordering::Relaxed);
         self.rows.fetch_add(rows, Ordering::Relaxed);
         self.total_millis.fetch_add(millis, Ordering::Relaxed);
         self.max_millis.fetch_max(millis, Ordering::Relaxed);
+        self.sort_millis
+            .fetch_add(stages.sort.as_millis() as u64, Ordering::Relaxed);
+        self.write_millis
+            .fetch_add(stages.write.as_millis() as u64, Ordering::Relaxed);
+        self.wal_millis
+            .fetch_add(stages.wal.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> FlushStats {
@@ -160,6 +184,9 @@ impl FlushCounters {
             rows: self.rows.load(Ordering::Relaxed),
             total_millis: self.total_millis.load(Ordering::Relaxed),
             max_millis: self.max_millis.load(Ordering::Relaxed),
+            sort_millis: self.sort_millis.load(Ordering::Relaxed),
+            write_millis: self.write_millis.load(Ordering::Relaxed),
+            wal_millis: self.wal_millis.load(Ordering::Relaxed),
         }
     }
 }
@@ -175,6 +202,12 @@ pub struct FlushStats {
     pub total_millis: u64,
     /// Slowest single flush, in milliseconds.
     pub max_millis: u64,
+    /// Time spent sorting buffered batches, summed over all flushes.
+    pub sort_millis: u64,
+    /// Time spent encoding, uploading and committing files.
+    pub write_millis: u64,
+    /// Time spent removing the flushed WAL files.
+    pub wal_millis: u64,
 }
 
 impl FlushStats {
@@ -185,6 +218,34 @@ impl FlushStats {
             self.total_millis as f64 / self.flushes as f64
         }
     }
+
+    /// Fraction of flush wall time spent in each of the three stages. The
+    /// stages sum to approximately `total_millis`; the difference is the time
+    /// between them (lock acquisition, draining the buffer).
+    pub fn stage_ratio(&self) -> Option<(f64, f64, f64)> {
+        let total = self.sort_millis + self.write_millis + self.wal_millis;
+        if total == 0 {
+            None
+        } else {
+            let total = total as f64;
+            Some((
+                self.sort_millis as f64 / total,
+                self.write_millis as f64 / total,
+                self.wal_millis as f64 / total,
+            ))
+        }
+    }
+}
+
+/// One completed compaction, as reported to the counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionVolume {
+    pub input_files: u64,
+    pub input_bytes: u64,
+    pub input_rows: u64,
+    pub output_files: u64,
+    pub output_bytes: u64,
+    pub output_rows: u64,
 }
 
 /// Compaction volume counters.
@@ -193,21 +254,31 @@ pub struct CompactionCounters {
     tasks: AtomicU64,
     input_files: AtomicU64,
     input_bytes: AtomicU64,
+    input_rows: AtomicU64,
     output_files: AtomicU64,
     output_bytes: AtomicU64,
+    output_rows: AtomicU64,
     expired_files: AtomicU64,
     expired_bytes: AtomicU64,
 }
 
 impl CompactionCounters {
-    /// Records one completed compaction: the files and bytes it merged and the
-    /// files and bytes it wrote in their place.
-    pub fn record(&self, inputs: u64, input_bytes: u64, outputs: u64, output_bytes: u64) {
+    /// Records one completed compaction: the files, bytes and rows it merged
+    /// and the files, bytes and rows it wrote in their place.
+    pub fn record(&self, volume: CompactionVolume) {
         self.tasks.fetch_add(1, Ordering::Relaxed);
-        self.input_files.fetch_add(inputs, Ordering::Relaxed);
-        self.input_bytes.fetch_add(input_bytes, Ordering::Relaxed);
-        self.output_files.fetch_add(outputs, Ordering::Relaxed);
-        self.output_bytes.fetch_add(output_bytes, Ordering::Relaxed);
+        self.input_files
+            .fetch_add(volume.input_files, Ordering::Relaxed);
+        self.input_bytes
+            .fetch_add(volume.input_bytes, Ordering::Relaxed);
+        self.input_rows
+            .fetch_add(volume.input_rows, Ordering::Relaxed);
+        self.output_files
+            .fetch_add(volume.output_files, Ordering::Relaxed);
+        self.output_bytes
+            .fetch_add(volume.output_bytes, Ordering::Relaxed);
+        self.output_rows
+            .fetch_add(volume.output_rows, Ordering::Relaxed);
     }
 
     /// Records files removed for TTL rather than merged.
@@ -221,8 +292,10 @@ impl CompactionCounters {
             tasks: self.tasks.load(Ordering::Relaxed),
             input_files: self.input_files.load(Ordering::Relaxed),
             input_bytes: self.input_bytes.load(Ordering::Relaxed),
+            input_rows: self.input_rows.load(Ordering::Relaxed),
             output_files: self.output_files.load(Ordering::Relaxed),
             output_bytes: self.output_bytes.load(Ordering::Relaxed),
+            output_rows: self.output_rows.load(Ordering::Relaxed),
             expired_files: self.expired_files.load(Ordering::Relaxed),
             expired_bytes: self.expired_bytes.load(Ordering::Relaxed),
         }
@@ -236,8 +309,12 @@ pub struct CompactionStats {
     pub tasks: u64,
     pub input_files: u64,
     pub input_bytes: u64,
+    /// Rows read from the merged input files.
+    pub input_rows: u64,
     pub output_files: u64,
     pub output_bytes: u64,
+    /// Rows written after deduplication.
+    pub output_rows: u64,
     /// Files dropped by TTL instead of being merged.
     pub expired_files: u64,
     pub expired_bytes: u64,
@@ -253,6 +330,64 @@ impl CompactionStats {
             self.output_bytes as f64 / self.input_bytes as f64
         }
     }
+
+    /// Rows removed because a merge found newer versions of the same series
+    /// and timestamp.
+    pub fn deduplicated_rows(&self) -> u64 {
+        self.input_rows.saturating_sub(self.output_rows)
+    }
+}
+
+/// Manifest commit counters.
+#[derive(Debug, Default)]
+pub struct ManifestCounters {
+    commits: AtomicU64,
+    bytes_written: AtomicU64,
+    total_millis: AtomicU64,
+    max_millis: AtomicU64,
+}
+
+impl ManifestCounters {
+    /// Records one durable delta commit of `bytes`.
+    pub fn record(&self, bytes: u64, elapsed: Duration) {
+        let millis = elapsed.as_millis() as u64;
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written.fetch_add(bytes, Ordering::Relaxed);
+        self.total_millis.fetch_add(millis, Ordering::Relaxed);
+        self.max_millis.fetch_max(millis, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ManifestStats {
+        ManifestStats {
+            commits: self.commits.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            total_millis: self.total_millis.load(Ordering::Relaxed),
+            max_millis: self.max_millis.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time copy of the manifest commit counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestStats {
+    /// Delta objects committed successfully.
+    pub commits: u64,
+    /// Encoded delta bytes uploaded.
+    pub bytes_written: u64,
+    /// Wall time of those uploads, in milliseconds.
+    pub total_millis: u64,
+    /// Slowest single commit, in milliseconds.
+    pub max_millis: u64,
+}
+
+impl ManifestStats {
+    pub fn average_millis(&self) -> f64 {
+        if self.commits == 0 {
+            0.0
+        } else {
+            self.total_millis as f64 / self.commits as f64
+        }
+    }
 }
 
 /// Both formats' counters, as reported to the operator.
@@ -262,6 +397,8 @@ pub struct StorageStats {
     pub tsf: FormatStats,
     pub flush: FlushStats,
     pub compaction: CompactionStats,
+    /// Manifest delta commits, shared by flush, compaction, rewrite and TTL.
+    pub manifest: ManifestStats,
     /// Process-wide codec, bloom and index-cache counters from the kernel.
     /// They cover every TSF file this process has read or written, not just
     /// this storage instance.
@@ -291,24 +428,23 @@ pub struct StorageMetrics {
     tsf: FormatCounters,
     flush: FlushCounters,
     compaction: CompactionCounters,
+    manifest: ManifestCounters,
 }
 
 impl StorageMetrics {
     /// Records one successful flush.
-    pub fn record_flush(&self, rows: u64, elapsed: Duration) {
-        self.flush.record(rows, elapsed);
+    pub fn record_flush(&self, rows: u64, elapsed: Duration, stages: FlushStages) {
+        self.flush.record(rows, elapsed, stages);
     }
 
     /// Records one committed compaction task.
-    pub fn record_compaction(
-        &self,
-        inputs: u64,
-        input_bytes: u64,
-        outputs: u64,
-        output_bytes: u64,
-    ) {
-        self.compaction
-            .record(inputs, input_bytes, outputs, output_bytes);
+    pub fn record_compaction(&self, volume: CompactionVolume) {
+        self.compaction.record(volume);
+    }
+
+    /// Records one manifest delta upload.
+    pub fn record_manifest_commit(&self, bytes: u64, elapsed: Duration) {
+        self.manifest.record(bytes, elapsed);
     }
 
     /// Records files removed by TTL.
@@ -330,6 +466,7 @@ impl StorageMetrics {
             tsf: self.tsf.snapshot(),
             flush: self.flush.snapshot(),
             compaction: self.compaction.snapshot(),
+            manifest: self.manifest.snapshot(),
             tsf_kernel: storage_kernel::tsf::codec_stats(),
         }
     }
@@ -518,12 +655,28 @@ mod tests {
     }
 
     /// Flush and compaction counters are independent of the per-format ones:
-    /// a flush moves rows, a compaction rewrites bytes.
+    /// a flush moves rows, a compaction rewrites bytes and drops duplicates.
     #[test]
     fn test_flush_and_compaction_counters() {
         let stats = metrics();
-        stats.record_flush(1_000, Duration::from_millis(30));
-        stats.record_flush(2_000, Duration::from_millis(90));
+        stats.record_flush(
+            1_000,
+            Duration::from_millis(30),
+            FlushStages {
+                sort: Duration::from_millis(5),
+                write: Duration::from_millis(20),
+                wal: Duration::from_millis(2),
+            },
+        );
+        stats.record_flush(
+            2_000,
+            Duration::from_millis(90),
+            FlushStages {
+                sort: Duration::from_millis(10),
+                write: Duration::from_millis(70),
+                wal: Duration::from_millis(4),
+            },
+        );
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.flush.flushes, 2);
@@ -531,24 +684,65 @@ mod tests {
         assert_eq!(snapshot.flush.total_millis, 120);
         assert_eq!(snapshot.flush.max_millis, 90);
         assert_eq!(snapshot.flush.average_millis(), 60.0);
+        assert_eq!(snapshot.flush.sort_millis, 15);
+        assert_eq!(snapshot.flush.write_millis, 90);
+        assert_eq!(snapshot.flush.wal_millis, 6);
+        let (sort, write, wal) = snapshot.flush.stage_ratio().unwrap();
+        assert!((sort - 15.0 / 111.0).abs() < 1e-9);
+        assert!((write - 90.0 / 111.0).abs() < 1e-9);
+        assert!((wal - 6.0 / 111.0).abs() < 1e-9);
         // Flushes say nothing about file I/O; that is still the manifest's job.
         assert_eq!(snapshot.total().files_written, 0);
 
-        stats.record_compaction(4, 1_000, 1, 600);
-        stats.record_compaction(2, 400, 1, 500);
+        stats.record_compaction(CompactionVolume {
+            input_files: 4,
+            input_bytes: 1_000,
+            input_rows: 800,
+            output_files: 1,
+            output_bytes: 600,
+            output_rows: 750,
+        });
+        stats.record_compaction(CompactionVolume {
+            input_files: 2,
+            input_bytes: 400,
+            input_rows: 300,
+            output_files: 1,
+            output_bytes: 500,
+            output_rows: 300,
+        });
         stats.record_expired(3, 300);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.compaction.tasks, 2);
         assert_eq!(snapshot.compaction.input_files, 6);
         assert_eq!(snapshot.compaction.input_bytes, 1_400);
+        assert_eq!(snapshot.compaction.input_rows, 1_100);
         assert_eq!(snapshot.compaction.output_files, 2);
         assert_eq!(snapshot.compaction.output_bytes, 1_100);
+        assert_eq!(snapshot.compaction.output_rows, 1_050);
+        assert_eq!(snapshot.compaction.deduplicated_rows(), 50);
         assert_eq!(snapshot.compaction.expired_files, 3);
         assert_eq!(snapshot.compaction.expired_bytes, 300);
         assert!((snapshot.compaction.write_amplification() - 1_100.0 / 1_400.0).abs() < 1e-9);
         assert_eq!(CompactionStats::default().write_amplification(), 0.0);
+        assert_eq!(CompactionStats::default().deduplicated_rows(), 0);
         assert_eq!(FlushStats::default().average_millis(), 0.0);
+        assert_eq!(FlushStats::default().stage_ratio(), None);
+    }
+
+    #[test]
+    fn test_manifest_commit_counters() {
+        let stats = metrics();
+        stats.record_manifest_commit(120, Duration::from_millis(8));
+        stats.record_manifest_commit(30, Duration::from_millis(2));
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.manifest.commits, 2);
+        assert_eq!(snapshot.manifest.bytes_written, 150);
+        assert_eq!(snapshot.manifest.total_millis, 10);
+        assert_eq!(snapshot.manifest.max_millis, 8);
+        assert_eq!(snapshot.manifest.average_millis(), 5.0);
+        assert_eq!(ManifestStats::default().average_millis(), 0.0);
     }
 
     /// The snapshot also carries the kernel's process-wide counters, so an

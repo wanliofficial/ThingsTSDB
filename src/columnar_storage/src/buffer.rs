@@ -55,7 +55,7 @@ use tracing::{debug, error};
 use crate::{
     config::BufferConfig,
     manifest::{ManifestRef, ManifestUpdate},
-    metrics::StorageMetrics,
+    metrics::{FlushStages, StorageMetrics},
     sst::{FileFormat, FileId, FileMeta, SstFile, SstPathGenerator},
     storage::WriteRequest,
     types::{ObjectStoreRef, RuntimeRef, StorageSchema, TimeRange, SEQ_COLUMN_NAME},
@@ -275,13 +275,15 @@ impl FlushState {
         let rows = frames.iter().map(|f| f.batch.num_rows() as u64).sum();
         let started = Instant::now();
         match self.persist_frames(&frames).await {
-            Ok(()) => {
+            Ok(mut stages) => {
+                let wal_started = Instant::now();
                 if let Some(wal) = &self.wal {
                     for path in &wal_paths {
                         wal.remove(path).await;
                     }
                 }
-                self.metrics.record_flush(rows, started.elapsed());
+                stages.wal = wal_started.elapsed();
+                self.metrics.record_flush(rows, started.elapsed(), stages);
                 Ok(())
             }
             Err(e) => {
@@ -296,21 +298,28 @@ impl FlushState {
     /// Persist all frames, split into one sorted SST file per segment. Keeping
     /// segments apart is required by the file-granularity TTL, which can only
     /// evict a whole SST.
-    async fn persist_frames(&self, frames: &[BufferedFrame]) -> Result<()> {
+    async fn persist_frames(&self, frames: &[BufferedFrame]) -> Result<FlushStages> {
         let segment_duration = self.segment_duration.as_millis() as i64;
         let mut frames_by_segment: BTreeMap<i64, Vec<&BufferedFrame>> = BTreeMap::new();
         for frame in frames {
             let segment = frame.time_range.start.0 / segment_duration;
             frames_by_segment.entry(segment).or_default().push(frame);
         }
+        let mut stages = FlushStages::default();
         for (segment, frames) in frames_by_segment {
-            self.persist_segment(segment, &frames).await?;
+            let timing = self.persist_segment(segment, &frames).await?;
+            stages.sort += timing.sort;
+            stages.write += timing.write;
         }
-        Ok(())
+        Ok(stages)
     }
 
     /// Merge the frames of one segment into one sorted SST file.
-    async fn persist_segment(&self, segment: i64, frames: &[&BufferedFrame]) -> Result<()> {
+    async fn persist_segment(
+        &self,
+        segment: i64,
+        frames: &[&BufferedFrame],
+    ) -> Result<FlushStages> {
         let mut time_range = frames[0].time_range.clone();
         let mut max_seq = frames[0].seq;
         let mut batches = Vec::with_capacity(frames.len());
@@ -325,8 +334,11 @@ impl FlushState {
         let combined = concat_batches(&self.schema.arrow_schema, &batches)
             .context("concat buffered batches")?;
         let num_rows = combined.num_rows();
+        let sort_started = Instant::now();
         let mut sorted = sort_batch(&self.schema, combined, true).await?;
+        let sort = sort_started.elapsed();
 
+        let write_started = Instant::now();
         match self.format {
             FileFormat::Parquet => {
                 let file_id = SstFile::allocate_id();
@@ -372,7 +384,11 @@ impl FlushState {
             num_rows,
             "Flushed write buffer"
         );
-        Ok(())
+        Ok(FlushStages {
+            sort,
+            write: write_started.elapsed(),
+            wal: Duration::ZERO,
+        })
     }
 
     /// Streams the sorted batches into a Parquet object. Returns

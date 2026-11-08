@@ -39,7 +39,7 @@ use crate::{
     compaction::Task,
     ensure,
     manifest::{ManifestRef, ManifestUpdate},
-    metrics::StorageMetrics,
+    metrics::{CompactionVolume, StorageMetrics},
     read::ParquetReader,
     sst::{FileFormat, FileId, FileMeta, SstFile, SstPathGenerator},
     types::{ObjectStoreRef, RuntimeRef, StorageSchema},
@@ -200,6 +200,7 @@ impl Executor {
         // First add new sst to manifest, then delete expired/old sst
         let output_bytes = to_adds.iter().map(|f| f.size() as u64).sum();
         let output_files = to_adds.len() as u64;
+        let output_rows = to_adds.iter().map(|f| f.meta().num_rows as u64).sum();
         self.inner
             .manifest
             .update(ManifestUpdate::new(to_adds, to_deletes.clone()))
@@ -210,12 +211,14 @@ impl Executor {
         // expiration task merges nothing and is reported through the expired
         // counters only.
         if !task.inputs.is_empty() {
-            self.inner.metrics.record_compaction(
-                task.inputs.len() as u64,
-                task.input_size(),
+            self.inner.metrics.record_compaction(CompactionVolume {
+                input_files: task.inputs.len() as u64,
+                input_bytes: task.input_size(),
+                input_rows: task.inputs.iter().map(|f| f.meta().num_rows as u64).sum(),
                 output_files,
                 output_bytes,
-            );
+                output_rows,
+            });
         }
         if !task.expireds.is_empty() {
             let expired_bytes = task.expireds.iter().map(|f| f.size() as u64).sum();

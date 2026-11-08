@@ -267,7 +267,12 @@ pub fn encode_page(rows: &[Row]) -> Result<(Vec<u8>, PageMeta), String> {
         )
     });
     crate::tsf::stats::record_page(
-        &[ts_mt, value_mt, seq_mt, reserved_mt],
+        &[
+            (ts_mt, ts_payload.len() as u64),
+            (value_mt, value_payload.len() as u64),
+            (seq_mt, seq_payload.len() as u64),
+            (reserved_mt, reserved_payload.len() as u64),
+        ],
         page_is_uncompressed,
     );
 

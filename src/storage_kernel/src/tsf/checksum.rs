@@ -61,10 +61,12 @@ pub fn crc32c(data: &[u8]) -> u32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if has_sse42() {
+            super::stats::record_crc_hardware();
             // SAFETY: the runtime check above guarantees SSE4.2 support.
             return unsafe { !crc32c_update_hw(!0, data) };
         }
     }
+    super::stats::record_crc_software();
     !crc32c_update_sw(!0, data)
 }
 
@@ -75,6 +77,7 @@ pub fn crc32c_multi(parts: &[&[u8]]) -> u32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if has_sse42() {
+            super::stats::record_crc_hardware();
             let mut crc = !0u32;
             for part in parts {
                 // SAFETY: the runtime check above guarantees SSE4.2 support.
@@ -83,6 +86,7 @@ pub fn crc32c_multi(parts: &[&[u8]]) -> u32 {
             return !crc;
         }
     }
+    super::stats::record_crc_software();
     let mut crc = !0u32;
     for part in parts {
         crc = crc32c_update_sw(crc, part);
@@ -186,5 +190,22 @@ mod tests {
         joined.extend_from_slice(&c);
         assert_eq!(crc32c_multi(&[a, b, &c]), crc32c(&joined));
         assert_eq!(crc32c_multi(&[]), 0);
+    }
+
+    /// Every public checksum entry point reports which implementation ran.
+    /// Other tests checksum concurrently, so only the lower bound is asserted.
+    #[test]
+    fn test_crc_dispatch_is_counted() {
+        let before = super::super::stats::codec_stats();
+        let _ = crc32c(b"dispatch");
+        let _ = crc32c_multi(&[b"dispatch", b"-again"]);
+        let after = super::super::stats::codec_stats();
+
+        let dispatched =
+            (after.crc_hardware - before.crc_hardware) + (after.crc_software - before.crc_software);
+        assert!(
+            dispatched >= 2,
+            "two public calls must be counted, got {dispatched}"
+        );
     }
 }
