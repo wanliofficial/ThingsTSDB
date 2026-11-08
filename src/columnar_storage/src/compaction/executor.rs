@@ -39,6 +39,7 @@ use crate::{
     compaction::Task,
     ensure,
     manifest::{ManifestRef, ManifestUpdate},
+    metrics::StorageMetrics,
     read::ParquetReader,
     sst::{FileFormat, FileId, FileMeta, SstFile, SstPathGenerator},
     types::{ObjectStoreRef, RuntimeRef, StorageSchema},
@@ -72,6 +73,7 @@ struct Inner {
     mem_limit: u64,
     trigger_tx: Sender<()>,
     format: FileFormat,
+    metrics: Arc<StorageMetrics>,
 }
 
 impl Executor {
@@ -87,6 +89,7 @@ impl Executor {
         mem_limit: u64,
         trigger_tx: Sender<()>,
         format: FileFormat,
+        metrics: Arc<StorageMetrics>,
     ) -> Self {
         let inner = Inner {
             runtime,
@@ -100,6 +103,7 @@ impl Executor {
             inused_memory: AtomicU64::new(0),
             trigger_tx,
             format,
+            metrics,
         };
         Self {
             inner: Arc::new(inner),
@@ -194,10 +198,31 @@ impl Executor {
             .collect::<Vec<_>>();
         let to_deletes = removed_files.iter().map(|f| f.id()).collect::<Vec<_>>();
         // First add new sst to manifest, then delete expired/old sst
+        let output_bytes = to_adds.iter().map(|f| f.size() as u64).sum();
+        let output_files = to_adds.len() as u64;
         self.inner
             .manifest
             .update(ManifestUpdate::new(to_adds, to_deletes.clone()))
             .await?;
+
+        // The commit is the point of no return: count the task once it is
+        // durable, so a retry after a failure is not double counted. A pure
+        // expiration task merges nothing and is reported through the expired
+        // counters only.
+        if !task.inputs.is_empty() {
+            self.inner.metrics.record_compaction(
+                task.inputs.len() as u64,
+                task.input_size(),
+                output_files,
+                output_bytes,
+            );
+        }
+        if !task.expireds.is_empty() {
+            let expired_bytes = task.expireds.iter().map(|f| f.size() as u64).sum();
+            self.inner
+                .metrics
+                .record_expired(task.expireds.len() as u64, expired_bytes);
+        }
 
         // From now on, no error should be returned!
         // Because we have already updated manifest.
@@ -488,6 +513,7 @@ mod tests {
                 1 << 30,
                 trigger_tx,
                 FileFormat::Tsf,
+                Arc::new(StorageMetrics::default()),
             );
 
             let task = Task {

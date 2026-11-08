@@ -25,8 +25,10 @@ pub mod compaction;
 pub mod file;
 pub mod page;
 pub mod partition;
+pub mod stats;
 
 pub use page::{ColumnMask, PageBuffers};
+pub use stats::{codec_stats, CodecStats};
 
 /// One row of the prototype schema `(i64 ts, f64 value, u64 seq, u64 reserved)`
 /// keyed by metric and series.

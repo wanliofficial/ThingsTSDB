@@ -39,10 +39,25 @@
 //! formats. Both readers open each selected file at most once, so this is the
 //! file count of a scan without hiding the pruning decisions behind an
 //! object-store request count.
+//!
+//! Two more groups answer the operational questions the per-format counters
+//! cannot:
+//!
+//! - [`FlushStats`] reports how long a flush takes and how many rows it moves,
+//!   which is where write latency comes from;
+//! - [`CompactionStats`] reports compaction input and output volume, so write
+//!   amplification (output bytes / input bytes) is visible.
+//!
+//! The codec, bloom and index-cache counters are process-wide and live in the
+//! kernel ([`storage_kernel::tsf::codec_stats`]); [`StorageMetrics::snapshot`]
+//! folds them into the same report.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -120,11 +135,137 @@ impl FormatStats {
     }
 }
 
+/// Flush latency and volume counters.
+#[derive(Debug, Default)]
+pub struct FlushCounters {
+    flushes: AtomicU64,
+    rows: AtomicU64,
+    total_millis: AtomicU64,
+    max_millis: AtomicU64,
+}
+
+impl FlushCounters {
+    /// Records one successful flush of `rows` buffered rows.
+    pub fn record(&self, rows: u64, elapsed: Duration) {
+        let millis = elapsed.as_millis() as u64;
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        self.rows.fetch_add(rows, Ordering::Relaxed);
+        self.total_millis.fetch_add(millis, Ordering::Relaxed);
+        self.max_millis.fetch_max(millis, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> FlushStats {
+        FlushStats {
+            flushes: self.flushes.load(Ordering::Relaxed),
+            rows: self.rows.load(Ordering::Relaxed),
+            total_millis: self.total_millis.load(Ordering::Relaxed),
+            max_millis: self.max_millis.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time copy of the flush counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FlushStats {
+    /// Successful flushes (a flush with no buffered rows is not counted).
+    pub flushes: u64,
+    /// Rows those flushes persisted.
+    pub rows: u64,
+    /// Wall time spent inside flushes, in milliseconds.
+    pub total_millis: u64,
+    /// Slowest single flush, in milliseconds.
+    pub max_millis: u64,
+}
+
+impl FlushStats {
+    pub fn average_millis(&self) -> f64 {
+        if self.flushes == 0 {
+            0.0
+        } else {
+            self.total_millis as f64 / self.flushes as f64
+        }
+    }
+}
+
+/// Compaction volume counters.
+#[derive(Debug, Default)]
+pub struct CompactionCounters {
+    tasks: AtomicU64,
+    input_files: AtomicU64,
+    input_bytes: AtomicU64,
+    output_files: AtomicU64,
+    output_bytes: AtomicU64,
+    expired_files: AtomicU64,
+    expired_bytes: AtomicU64,
+}
+
+impl CompactionCounters {
+    /// Records one completed compaction: the files and bytes it merged and the
+    /// files and bytes it wrote in their place.
+    pub fn record(&self, inputs: u64, input_bytes: u64, outputs: u64, output_bytes: u64) {
+        self.tasks.fetch_add(1, Ordering::Relaxed);
+        self.input_files.fetch_add(inputs, Ordering::Relaxed);
+        self.input_bytes.fetch_add(input_bytes, Ordering::Relaxed);
+        self.output_files.fetch_add(outputs, Ordering::Relaxed);
+        self.output_bytes.fetch_add(output_bytes, Ordering::Relaxed);
+    }
+
+    /// Records files removed for TTL rather than merged.
+    pub fn record_expired(&self, files: u64, bytes: u64) {
+        self.expired_files.fetch_add(files, Ordering::Relaxed);
+        self.expired_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> CompactionStats {
+        CompactionStats {
+            tasks: self.tasks.load(Ordering::Relaxed),
+            input_files: self.input_files.load(Ordering::Relaxed),
+            input_bytes: self.input_bytes.load(Ordering::Relaxed),
+            output_files: self.output_files.load(Ordering::Relaxed),
+            output_bytes: self.output_bytes.load(Ordering::Relaxed),
+            expired_files: self.expired_files.load(Ordering::Relaxed),
+            expired_bytes: self.expired_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time copy of the compaction counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionStats {
+    /// Compaction tasks that committed their output.
+    pub tasks: u64,
+    pub input_files: u64,
+    pub input_bytes: u64,
+    pub output_files: u64,
+    pub output_bytes: u64,
+    /// Files dropped by TTL instead of being merged.
+    pub expired_files: u64,
+    pub expired_bytes: u64,
+}
+
+impl CompactionStats {
+    /// Output bytes per input byte. Above 1.0 means compaction is writing more
+    /// than it read, which is the write-amplification cost of the policy.
+    pub fn write_amplification(&self) -> f64 {
+        if self.input_bytes == 0 {
+            0.0
+        } else {
+            self.output_bytes as f64 / self.input_bytes as f64
+        }
+    }
+}
+
 /// Both formats' counters, as reported to the operator.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StorageStats {
     pub parquet: FormatStats,
     pub tsf: FormatStats,
+    pub flush: FlushStats,
+    pub compaction: CompactionStats,
+    /// Process-wide codec, bloom and index-cache counters from the kernel.
+    /// They cover every TSF file this process has read or written, not just
+    /// this storage instance.
+    pub tsf_kernel: storage_kernel::tsf::CodecStats,
 }
 
 impl StorageStats {
@@ -148,9 +289,33 @@ impl StorageStats {
 pub struct StorageMetrics {
     parquet: FormatCounters,
     tsf: FormatCounters,
+    flush: FlushCounters,
+    compaction: CompactionCounters,
 }
 
 impl StorageMetrics {
+    /// Records one successful flush.
+    pub fn record_flush(&self, rows: u64, elapsed: Duration) {
+        self.flush.record(rows, elapsed);
+    }
+
+    /// Records one committed compaction task.
+    pub fn record_compaction(
+        &self,
+        inputs: u64,
+        input_bytes: u64,
+        outputs: u64,
+        output_bytes: u64,
+    ) {
+        self.compaction
+            .record(inputs, input_bytes, outputs, output_bytes);
+    }
+
+    /// Records files removed by TTL.
+    pub fn record_expired(&self, files: u64, bytes: u64) {
+        self.compaction.record_expired(files, bytes);
+    }
+
     /// Counters for `format`; use it to record a write or a file read.
     pub fn for_format(&self, format: FileFormat) -> &FormatCounters {
         match format {
@@ -163,6 +328,9 @@ impl StorageMetrics {
         StorageStats {
             parquet: self.parquet.snapshot(),
             tsf: self.tsf.snapshot(),
+            flush: self.flush.snapshot(),
+            compaction: self.compaction.snapshot(),
+            tsf_kernel: storage_kernel::tsf::codec_stats(),
         }
     }
 }
@@ -347,5 +515,63 @@ mod tests {
                 .unwrap();
             assert_eq!(listed.len(), 1);
         });
+    }
+
+    /// Flush and compaction counters are independent of the per-format ones:
+    /// a flush moves rows, a compaction rewrites bytes.
+    #[test]
+    fn test_flush_and_compaction_counters() {
+        let stats = metrics();
+        stats.record_flush(1_000, Duration::from_millis(30));
+        stats.record_flush(2_000, Duration::from_millis(90));
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.flush.flushes, 2);
+        assert_eq!(snapshot.flush.rows, 3_000);
+        assert_eq!(snapshot.flush.total_millis, 120);
+        assert_eq!(snapshot.flush.max_millis, 90);
+        assert_eq!(snapshot.flush.average_millis(), 60.0);
+        // Flushes say nothing about file I/O; that is still the manifest's job.
+        assert_eq!(snapshot.total().files_written, 0);
+
+        stats.record_compaction(4, 1_000, 1, 600);
+        stats.record_compaction(2, 400, 1, 500);
+        stats.record_expired(3, 300);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.compaction.tasks, 2);
+        assert_eq!(snapshot.compaction.input_files, 6);
+        assert_eq!(snapshot.compaction.input_bytes, 1_400);
+        assert_eq!(snapshot.compaction.output_files, 2);
+        assert_eq!(snapshot.compaction.output_bytes, 1_100);
+        assert_eq!(snapshot.compaction.expired_files, 3);
+        assert_eq!(snapshot.compaction.expired_bytes, 300);
+        assert!((snapshot.compaction.write_amplification() - 1_100.0 / 1_400.0).abs() < 1e-9);
+        assert_eq!(CompactionStats::default().write_amplification(), 0.0);
+        assert_eq!(FlushStats::default().average_millis(), 0.0);
+    }
+
+    /// The snapshot also carries the kernel's process-wide counters, so an
+    /// operator sees codec choices next to the storage's own numbers.
+    #[test]
+    fn test_snapshot_includes_kernel_counters() {
+        let before = storage_kernel::tsf::codec_stats();
+        let page = storage_kernel::tsf::page::encode_page(&[storage_kernel::tsf::Row {
+            metric_id: 1,
+            series_id: 1,
+            timestamp: 1,
+            value: 1.5,
+            sequence: 1,
+            reserved: 0,
+        }])
+        .unwrap();
+        assert!(!page.0.is_empty());
+        let snapshot = metrics().snapshot();
+        assert!(snapshot.tsf_kernel.pages > before.pages);
+        assert_eq!(
+            snapshot.tsf_kernel.pages - before.pages,
+            1,
+            "one page encoded"
+        );
     }
 }

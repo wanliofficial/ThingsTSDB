@@ -266,6 +266,10 @@ pub fn encode_page(rows: &[Row]) -> Result<(Vec<u8>, PageMeta), String> {
             MarshalType::ZstdNearestDelta | MarshalType::ZstdNearestDelta2
         )
     });
+    crate::tsf::stats::record_page(
+        &[ts_mt, value_mt, seq_mt, reserved_mt],
+        page_is_uncompressed,
+    );
 
     let mut meta = PageMeta {
         row_count: rows.len() as u32,

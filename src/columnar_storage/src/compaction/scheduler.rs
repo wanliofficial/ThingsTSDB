@@ -31,6 +31,7 @@ use crate::{
     compaction::Task,
     config::SchedulerConfig,
     manifest::ManifestRef,
+    metrics::StorageMetrics,
     read::ParquetReader,
     sst::{FileFormat, SstPathGenerator},
     types::{ObjectStoreRef, RuntimeRef, StorageSchema},
@@ -59,6 +60,7 @@ impl Scheduler {
         config: SchedulerConfig,
         write_props: WriterProperties,
         format: FileFormat,
+        metrics: Arc<StorageMetrics>,
     ) -> Self {
         let (task_tx, task_rx) = mpsc::channel(config.max_pending_compaction_tasks);
         let (trigger_tx, trigger_rx) = mpsc::channel::<()>(1);
@@ -76,6 +78,7 @@ impl Scheduler {
                 config.memory_limit.0,
                 trigger_tx.clone(),
                 format,
+                metrics,
             );
 
             runtime.spawn(async move {

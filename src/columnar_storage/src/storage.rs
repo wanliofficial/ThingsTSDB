@@ -104,6 +104,8 @@ pub trait ColumnarStorage {
     ///
     /// Write counters come from the manifest commit, read counters from the
     /// query plans, so both reflect real file content and real fetched bytes.
+    /// Flush latency, compaction write amplification and the kernel's codec,
+    /// bloom and cache counters ride along in the same snapshot.
     fn stats(&self) -> crate::metrics::StorageStats {
         crate::metrics::StorageStats::default()
     }
@@ -204,6 +206,7 @@ impl ObjectBasedStorage {
             storage_opts.scheduler,
             write_props.clone(),
             format,
+            metrics.clone(),
         );
 
         let partition_manager = crate::partition::PartitionManager::new(
@@ -227,6 +230,7 @@ impl ObjectBasedStorage {
             format,
             &storage_opts.buffer,
             wal,
+            metrics.clone(),
         ));
         flush_state.recover_from_wal().await?;
         let (flush_tx, flush_rx) = mpsc::channel(1);
@@ -835,7 +839,7 @@ mod tests {
     /// that served them (ADR-0002 §13).
     #[test(test)]
     fn test_storage_stats_are_split_by_format() {
-        use crate::{config::DataFileFormat, metrics::StorageStats, types::Timestamp};
+        use crate::{config::DataFileFormat, types::Timestamp};
 
         let schema = arrow_schema!(
             ("metric_id", UInt64),
@@ -881,7 +885,13 @@ mod tests {
                 .await
                 .unwrap();
 
-                assert_eq!(storage.stats(), StorageStats::default());
+                // The kernel counters are process-wide, so only compare the
+                // storage's own groups here.
+                let stats = storage.stats();
+                assert_eq!(stats.parquet, Default::default());
+                assert_eq!(stats.tsf, Default::default());
+                assert_eq!(stats.flush, Default::default());
+                assert_eq!(stats.compaction, Default::default());
 
                 let t0 = 1_700_000_000_000i64;
                 write_rows(&storage, t0, 1.0).await;
@@ -896,6 +906,12 @@ mod tests {
                 assert_eq!(stats.tsf.rows_written, 4);
                 assert_eq!(stats.parquet, Default::default());
                 assert_eq!(stats.tsf.files_read, 0);
+                // The flush that committed those rows is counted, and encoding
+                // them left codec counters behind.
+                assert_eq!(stats.flush.flushes, 1);
+                assert_eq!(stats.flush.rows, 4);
+                assert!(stats.tsf_kernel.pages > 0);
+                assert_eq!(stats.compaction, Default::default());
 
                 let stream = storage
                     .scan(ScanRequest {
@@ -1212,6 +1228,16 @@ mod tests {
                 4,
                 "a partition that closed outside the window must not be recompacted"
             );
+
+            // Only the first merge ran, and its volume is reported: two
+            // inputs became one output, so the amplification is measurable.
+            let stats = storage.stats();
+            assert_eq!(stats.compaction.tasks, 1);
+            assert_eq!(stats.compaction.input_files, 2);
+            assert!(stats.compaction.input_bytes > 0);
+            assert_eq!(stats.compaction.output_files, 1);
+            assert!(stats.compaction.output_bytes > 0);
+            assert!(stats.compaction.write_amplification() > 0.0);
         });
     }
 

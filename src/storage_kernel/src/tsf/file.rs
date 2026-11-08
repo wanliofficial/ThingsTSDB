@@ -389,6 +389,15 @@ impl ReadContext {
     }
 }
 
+impl Drop for ReadContext {
+    /// Folds this context's cache counters into the process totals
+    /// (`crate::tsf::codec_stats`) so operators can see whether the caches earn
+    /// their memory without every call site having to report them.
+    fn drop(&mut self) {
+        crate::tsf::stats::record_cache(&self.cache_stats());
+    }
+}
+
 /// Options for a parallel metric scan.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanOptions {
@@ -1527,6 +1536,7 @@ impl TsfReader {
     ) -> Result<Vec<Row>, String> {
         if let Some(filter) = &self.bloom {
             if !bloom::might_contain(filter, series_id) {
+                crate::tsf::stats::record_bloom_reject();
                 return Ok(Vec::new());
             }
         }
@@ -1561,6 +1571,7 @@ impl TsfReader {
         let mut out = DecodedColumns::new(metric_id, series_id, columns);
         if let Some(filter) = &self.bloom {
             if !bloom::might_contain(filter, series_id) {
+                crate::tsf::stats::record_bloom_reject();
                 return Ok(out);
             }
         }
@@ -2530,6 +2541,7 @@ mod tests {
         let (bytes, _) = encode_file(rows, (0, 10_000), &WriterOptions::default()).unwrap();
         let reader = TsfReader::from_bytes(bytes).unwrap();
         let range = TimeRange::new(i64::MIN, i64::MAX);
+        let before = crate::tsf::codec_stats();
         let mut ctx = ReadContext::with_cache_bytes(1 << 20);
         reader
             .read_series_columns(3, 73, range, ColumnMask::SAMPLE, &mut ctx)
@@ -2552,6 +2564,26 @@ mod tests {
         assert!(!out.is_empty());
         assert!(tiny.cache_stats().rejects > 0);
         assert_eq!(tiny.cache_bytes(), 0);
+
+        // A series the bloom filter can rule out must not reach the index.
+        let bloom_before = crate::tsf::codec_stats().bloom_rejects;
+        let missed = reader
+            .read_series_columns(3, 10_000, range, ColumnMask::SAMPLE, &mut ctx)
+            .unwrap();
+        assert!(missed.timestamps.is_empty());
+        assert!(
+            crate::tsf::codec_stats().bloom_rejects > bloom_before,
+            "expected the bloom filter to reject an absent series"
+        );
+
+        // Dropping a read context folds its counters into the process totals.
+        drop(ctx);
+        drop(tiny);
+        let after = crate::tsf::codec_stats();
+        assert!(after.cache.hits > before.cache.hits);
+        assert!(after.cache.misses > before.cache.misses);
+        assert!(after.cache.rejects > before.cache.rejects);
+        assert_eq!(after.cache.entries, 0, "gauges are not aggregated");
     }
 
     #[test]

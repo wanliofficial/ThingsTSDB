@@ -1044,10 +1044,10 @@ Done:
 
 Follow-up (not yet implemented):
 
-- **Remaining observability:** codec selection and fallback counts, page/index-cache
-  hit ratios and bloom rejections (the kernel already exposes `CacheStats`, but
-  nothing aggregates it), plus flush/commit latency and compaction write
-  amplification.
+- **Remaining observability:** per-payload compressed bytes, CRC hardware/software
+  dispatch counts, rows dropped by compaction dedup (the kernel's
+  `duplicate_key_count` is still unused), manifest commit latency and WAL truncation
+  lag, and per-flush sub-timings (sort, encode, upload, commit).
 
 Acceptance targets (from the roadmap, made measurable):
 
@@ -1114,9 +1114,22 @@ Implementation notes:
   traffic is write amplification, not query traffic.
 - **Counters are relaxed atomics.** They are advisory (dashboards, migration
   tracking) and must not become a synchronization point on the read path.
-- Not yet aggregated: kernel `CacheStats` (page/index cache hits, evictions, bloom
-  rejects) and per-codec counters. They exist at the file level; surfacing them needs
-  a storage-wide registry.
+- **Flush and compaction have their own groups.** `StorageMetrics::record_flush`
+  times the persist half of a flush (after the buffer is drained, on success only) and
+  reports rows, total and max milliseconds. `record_compaction` runs once per committed
+  task and reports input/output files and bytes, so
+  `CompactionStats::write_amplification` is the real ratio; TTL removals are counted
+  separately as expired files/bytes. Counting after the manifest commit keeps a retried
+  task from being counted twice.
+- **Kernel counters are process-wide.** `storage_kernel::tsf::codec_stats` aggregates
+  what the kernel sees without a metrics dependency: pages encoded, pages stored
+  uncompressed, codec choices per payload (indexed by `MarshalType`), bloom rejections,
+  and index-cache hits/misses/evictions/rejects folded in when a `ReadContext` is
+  dropped. `StorageStats::tsf_kernel` carries them next to the storage's own groups.
+  They describe the process, not one storage instance, and the gauge fields
+  (`entries`, `bytes`) stay per-context, so they read zero in the snapshot.
+  Still missing: per-payload compressed byte counts, CRC hardware/software dispatch
+  counts, and flush WAL/manifest sub-timings.
 
 # Drawbacks
 

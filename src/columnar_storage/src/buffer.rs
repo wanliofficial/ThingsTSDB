@@ -26,7 +26,7 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -55,6 +55,7 @@ use tracing::{debug, error};
 use crate::{
     config::BufferConfig,
     manifest::{ManifestRef, ManifestUpdate},
+    metrics::StorageMetrics,
     sst::{FileFormat, FileId, FileMeta, SstFile, SstPathGenerator},
     storage::WriteRequest,
     types::{ObjectStoreRef, RuntimeRef, StorageSchema, TimeRange, SEQ_COLUMN_NAME},
@@ -145,6 +146,7 @@ pub(crate) struct FlushState {
     wal: Option<Wal>,
     write_lock: Mutex<()>,
     flush_lock: Mutex<()>,
+    metrics: Arc<StorageMetrics>,
 }
 
 impl FlushState {
@@ -159,6 +161,7 @@ impl FlushState {
         format: FileFormat,
         buffer_config: &BufferConfig,
         wal: Option<Wal>,
+        metrics: Arc<StorageMetrics>,
     ) -> Self {
         Self {
             schema,
@@ -172,6 +175,7 @@ impl FlushState {
             wal,
             write_lock: Mutex::new(()),
             flush_lock: Mutex::new(()),
+            metrics,
         }
     }
 
@@ -268,6 +272,8 @@ impl FlushState {
             (frames, wal_paths)
         };
 
+        let rows = frames.iter().map(|f| f.batch.num_rows() as u64).sum();
+        let started = Instant::now();
         match self.persist_frames(&frames).await {
             Ok(()) => {
                 if let Some(wal) = &self.wal {
@@ -275,6 +281,7 @@ impl FlushState {
                         wal.remove(path).await;
                     }
                 }
+                self.metrics.record_flush(rows, started.elapsed());
                 Ok(())
             }
             Err(e) => {
