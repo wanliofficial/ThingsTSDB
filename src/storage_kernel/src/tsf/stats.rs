@@ -20,9 +20,9 @@
 //! These are advisory counters for operators, not a synchronisation mechanism:
 //! every increment is relaxed. They are process-wide rather than per-reader
 //! because the questions they answer ("which codec wins on this workload?",
-//! "is the CRC hardware path in use?", "how often does the bloom filter save a
-//! lookup?", "do the index caches earn their memory?") are about the
-//! deployment, not one file.
+//! "is the CRC hardware path in use?", "how many rows does dedup drop?", "how
+//! often does the bloom filter save a lookup?", "do the index caches earn their
+//! memory?") are about the deployment, not one file.
 //!
 //! `storage_kernel` has no logging or metrics dependency, so the counters live
 //! here and the storage layer reads them: [`super::codec_stats`] is a snapshot.
@@ -47,10 +47,17 @@ pub struct CodecStats {
     /// [`Self::codec_counts`]. The sum over this array is the total payload
     /// bytes written, which is what the codec ratio is computed from.
     pub codec_bytes: [u64; 7],
+    /// Uncompressed payload bytes per codec choice: eight bytes per row for
+    /// every payload. Together with [`Self::codec_bytes`] this makes the
+    /// compression ratio of each codec available.
+    pub codec_raw_bytes: [u64; 7],
     /// CRC32C computations that used the SSE4.2 instruction.
     pub crc_hardware: u64,
     /// CRC32C computations that fell back to the slicing-by-8 table.
     pub crc_software: u64,
+    /// Rows dropped by LWW deduplication when encoding a file (flush,
+    /// compaction and rewrite all funnel through `encode_file`).
+    pub dedup_dropped: u64,
     /// Series lookups the bloom filter rejected as definitely absent.
     pub bloom_rejects: u64,
     /// Index-cache totals merged across every read context. `entries` and
@@ -67,6 +74,22 @@ impl CodecStats {
     /// Compressed bytes produced by `codec`.
     pub fn codec_bytes(&self, codec: MarshalType) -> u64 {
         self.codec_bytes[codec.as_u8() as usize]
+    }
+
+    /// Uncompressed bytes that `codec` was chosen for.
+    pub fn codec_raw_bytes(&self, codec: MarshalType) -> u64 {
+        self.codec_raw_bytes[codec.as_u8() as usize]
+    }
+
+    /// Uncompressed / compressed ratio for `codec`, or `None` before it was
+    /// used. A ratio of 2.0 means the payload is half its raw size.
+    pub fn codec_compression_ratio(&self, codec: MarshalType) -> Option<f64> {
+        let compressed = self.codec_bytes(codec);
+        if compressed == 0 {
+            None
+        } else {
+            Some(self.codec_raw_bytes(codec) as f64 / compressed as f64)
+        }
     }
 
     /// Total payload bytes written (all four payloads, all pages).
@@ -122,23 +145,36 @@ static CODEC_BYTES: [AtomicU64; 7] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
+static CODEC_RAW_BYTES: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 static CRC_HARDWARE: AtomicU64 = AtomicU64::new(0);
 static CRC_SOFTWARE: AtomicU64 = AtomicU64::new(0);
+static DEDUP_DROPPED: AtomicU64 = AtomicU64::new(0);
 static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static CACHE_REJECTS: AtomicU64 = AtomicU64::new(0);
 
 /// Records the codecs chosen for one encoded page and their payload sizes.
-pub(super) fn record_page(payloads: &[(MarshalType, u64); 4], uncompressed: bool) {
+/// Every payload holds one `i64` per row, so the raw size is `rows * 8`.
+pub(super) fn record_page(payloads: &[(MarshalType, u64); 4], rows: u32, uncompressed: bool) {
     PAGES.fetch_add(1, Ordering::Relaxed);
     if uncompressed {
         UNCOMPRESSED_PAGES.fetch_add(1, Ordering::Relaxed);
     }
+    let raw = rows as u64 * 8;
     for (codec, bytes) in payloads {
         let index = codec.as_u8() as usize;
         CODEC_COUNTS[index].fetch_add(1, Ordering::Relaxed);
         CODEC_BYTES[index].fetch_add(*bytes, Ordering::Relaxed);
+        CODEC_RAW_BYTES[index].fetch_add(raw, Ordering::Relaxed);
     }
 }
 
@@ -150,6 +186,13 @@ pub(super) fn record_crc_hardware() {
 /// Records one CRC32C computation on the portable path.
 pub(super) fn record_crc_software() {
     CRC_SOFTWARE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records rows removed by LWW deduplication before encoding.
+pub(super) fn record_dedup(dropped: u64) {
+    if dropped > 0 {
+        DEDUP_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+    }
 }
 
 /// Records one series lookup that the bloom filter ruled out.
@@ -179,13 +222,19 @@ pub fn codec_stats() -> CodecStats {
     for (out, counter) in codec_bytes.iter_mut().zip(CODEC_BYTES.iter()) {
         *out = load(counter);
     }
+    let mut codec_raw_bytes = [0u64; 7];
+    for (out, counter) in codec_raw_bytes.iter_mut().zip(CODEC_RAW_BYTES.iter()) {
+        *out = load(counter);
+    }
     CodecStats {
         pages: load(&PAGES),
         uncompressed_pages: load(&UNCOMPRESSED_PAGES),
         codec_counts,
         codec_bytes,
+        codec_raw_bytes,
         crc_hardware: load(&CRC_HARDWARE),
         crc_software: load(&CRC_SOFTWARE),
+        dedup_dropped: load(&DEDUP_DROPPED),
         bloom_rejects: load(&BLOOM_REJECTS),
         cache: CacheStats {
             hits: load(&CACHE_HITS),
@@ -215,6 +264,7 @@ mod tests {
                 (MarshalType::Const, 3),
                 (MarshalType::NearestDelta, 40),
             ],
+            100,
             false,
         );
         record_page(
@@ -224,6 +274,7 @@ mod tests {
                 (MarshalType::NearestDelta, 70),
                 (MarshalType::Const, 3),
             ],
+            50,
             true,
         );
         let after = codec_stats();
@@ -247,6 +298,21 @@ mod tests {
             after.codec_bytes(MarshalType::Const) - before.codec_bytes(MarshalType::Const) >= 6
         );
         assert_eq!(after.payload_bytes() - before.payload_bytes(), compressed);
+
+        // Raw payload bytes are eight per row, for every codec.
+        let raw: u64 = (0..7)
+            .map(|codec| after.codec_raw_bytes[codec] - before.codec_raw_bytes[codec])
+            .sum();
+        assert!(raw >= 4 * 100 * 8 + 4 * 50 * 8);
+        assert!(
+            after.codec_raw_bytes(MarshalType::Const) - before.codec_raw_bytes(MarshalType::Const)
+                >= (100 + 50) * 8
+        );
+        assert!(after.codec_compression_ratio(MarshalType::Const).is_some());
+        assert_eq!(
+            CodecStats::default().codec_compression_ratio(MarshalType::Const),
+            None
+        );
     }
 
     #[test]
@@ -268,6 +334,16 @@ mod tests {
             None,
             "no checksum yet"
         );
+    }
+
+    #[test]
+    fn test_dedup_counter() {
+        let before = codec_stats();
+        record_dedup(0);
+        record_dedup(5);
+        let after = codec_stats();
+
+        assert!(after.dedup_dropped - before.dedup_dropped >= 5);
     }
 
     #[test]

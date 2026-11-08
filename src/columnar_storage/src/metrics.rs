@@ -43,8 +43,9 @@
 //! Two more groups answer the operational questions the per-format counters
 //! cannot:
 //!
-//! - [`FlushStats`] reports how long a flush takes, its sort/write/WAL stage
-//!   split and how many rows it moves, which is where write latency comes from;
+//! - [`FlushStats`] reports how long a flush takes, its sort/write/commit/WAL
+//!   stage split, how long acknowledged writes waited in the WAL, and how many
+//!   rows it moves, which is where write latency comes from;
 //! - [`CompactionStats`] reports compaction input and output volume and rows,
 //!   so write amplification (output bytes / input bytes) and deduplicated rows
 //!   are visible;
@@ -147,25 +148,39 @@ pub struct FlushCounters {
     max_millis: AtomicU64,
     sort_millis: AtomicU64,
     write_millis: AtomicU64,
+    commit_millis: AtomicU64,
     wal_millis: AtomicU64,
+    wal_lag_total_millis: AtomicU64,
+    wal_lag_max_millis: AtomicU64,
 }
 
-/// Where the time inside one flush went. The three stages are disjoint and
-/// `write` includes the manifest commit of the produced files.
+/// Where the time inside one flush went. The stages are disjoint and `write`
+/// no longer includes the manifest commit of the produced files.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FlushStages {
     /// Merging and sorting the buffered batches of every segment.
     pub sort: Duration,
-    /// Encoding, uploading and committing the segment files.
+    /// Encoding and uploading the segment files.
     pub write: Duration,
+    /// Committing the produced files to the manifest.
+    pub commit: Duration,
     /// Removing the WAL files that the flush made durable.
     pub wal: Duration,
 }
 
+impl FlushStages {
+    /// Total time covered by the stages.
+    pub fn total(&self) -> Duration {
+        self.sort + self.write + self.commit + self.wal
+    }
+}
+
 impl FlushCounters {
-    /// Records one successful flush of `rows` buffered rows.
-    pub fn record(&self, rows: u64, elapsed: Duration, stages: FlushStages) {
+    /// Records one successful flush of `rows` buffered rows. `wal_lag` is the
+    /// age of the oldest buffered frame when its WAL file is removed.
+    pub fn record(&self, rows: u64, elapsed: Duration, stages: FlushStages, wal_lag: Duration) {
         let millis = elapsed.as_millis() as u64;
+        let lag_millis = wal_lag.as_millis() as u64;
         self.flushes.fetch_add(1, Ordering::Relaxed);
         self.rows.fetch_add(rows, Ordering::Relaxed);
         self.total_millis.fetch_add(millis, Ordering::Relaxed);
@@ -174,8 +189,14 @@ impl FlushCounters {
             .fetch_add(stages.sort.as_millis() as u64, Ordering::Relaxed);
         self.write_millis
             .fetch_add(stages.write.as_millis() as u64, Ordering::Relaxed);
+        self.commit_millis
+            .fetch_add(stages.commit.as_millis() as u64, Ordering::Relaxed);
         self.wal_millis
             .fetch_add(stages.wal.as_millis() as u64, Ordering::Relaxed);
+        self.wal_lag_total_millis
+            .fetch_add(lag_millis, Ordering::Relaxed);
+        self.wal_lag_max_millis
+            .fetch_max(lag_millis, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> FlushStats {
@@ -186,7 +207,10 @@ impl FlushCounters {
             max_millis: self.max_millis.load(Ordering::Relaxed),
             sort_millis: self.sort_millis.load(Ordering::Relaxed),
             write_millis: self.write_millis.load(Ordering::Relaxed),
+            commit_millis: self.commit_millis.load(Ordering::Relaxed),
             wal_millis: self.wal_millis.load(Ordering::Relaxed),
+            wal_lag_total_millis: self.wal_lag_total_millis.load(Ordering::Relaxed),
+            wal_lag_max_millis: self.wal_lag_max_millis.load(Ordering::Relaxed),
         }
     }
 }
@@ -204,10 +228,17 @@ pub struct FlushStats {
     pub max_millis: u64,
     /// Time spent sorting buffered batches, summed over all flushes.
     pub sort_millis: u64,
-    /// Time spent encoding, uploading and committing files.
+    /// Time spent encoding and uploading files.
     pub write_millis: u64,
+    /// Time spent committing files to the manifest.
+    pub commit_millis: u64,
     /// Time spent removing the flushed WAL files.
     pub wal_millis: u64,
+    /// Age of the oldest buffered frame when its WAL file was removed, summed
+    /// over all flushes.
+    pub wal_lag_total_millis: u64,
+    /// Oldest single-frame WAL lag seen, in milliseconds.
+    pub wal_lag_max_millis: u64,
 }
 
 impl FlushStats {
@@ -219,11 +250,22 @@ impl FlushStats {
         }
     }
 
-    /// Fraction of flush wall time spent in each of the three stages. The
-    /// stages sum to approximately `total_millis`; the difference is the time
-    /// between them (lock acquisition, draining the buffer).
-    pub fn stage_ratio(&self) -> Option<(f64, f64, f64)> {
-        let total = self.sort_millis + self.write_millis + self.wal_millis;
+    /// Mean age of the oldest buffered frame at WAL truncation: how long a
+    /// write waited between being acknowledged and leaving the WAL.
+    pub fn average_wal_lag_millis(&self) -> f64 {
+        if self.flushes == 0 {
+            0.0
+        } else {
+            self.wal_lag_total_millis as f64 / self.flushes as f64
+        }
+    }
+
+    /// Fraction of the stage time spent in each stage (`sort`, `write`,
+    /// `commit`, `wal`). The stages sum to approximately `total_millis`; the
+    /// difference is the time between them (lock acquisition, draining the
+    /// buffer).
+    pub fn stage_ratio(&self) -> Option<(f64, f64, f64, f64)> {
+        let total = self.sort_millis + self.write_millis + self.commit_millis + self.wal_millis;
         if total == 0 {
             None
         } else {
@@ -231,6 +273,7 @@ impl FlushStats {
             Some((
                 self.sort_millis as f64 / total,
                 self.write_millis as f64 / total,
+                self.commit_millis as f64 / total,
                 self.wal_millis as f64 / total,
             ))
         }
@@ -433,8 +476,14 @@ pub struct StorageMetrics {
 
 impl StorageMetrics {
     /// Records one successful flush.
-    pub fn record_flush(&self, rows: u64, elapsed: Duration, stages: FlushStages) {
-        self.flush.record(rows, elapsed, stages);
+    pub fn record_flush(
+        &self,
+        rows: u64,
+        elapsed: Duration,
+        stages: FlushStages,
+        wal_lag: Duration,
+    ) {
+        self.flush.record(rows, elapsed, stages, wal_lag);
     }
 
     /// Records one committed compaction task.
@@ -665,8 +714,10 @@ mod tests {
             FlushStages {
                 sort: Duration::from_millis(5),
                 write: Duration::from_millis(20),
-                wal: Duration::from_millis(2),
+                commit: Duration::from_millis(2),
+                wal: Duration::from_millis(1),
             },
+            Duration::from_millis(900),
         );
         stats.record_flush(
             2_000,
@@ -674,8 +725,10 @@ mod tests {
             FlushStages {
                 sort: Duration::from_millis(10),
                 write: Duration::from_millis(70),
+                commit: Duration::from_millis(3),
                 wal: Duration::from_millis(4),
             },
+            Duration::from_millis(1_500),
         );
 
         let snapshot = stats.snapshot();
@@ -686,11 +739,16 @@ mod tests {
         assert_eq!(snapshot.flush.average_millis(), 60.0);
         assert_eq!(snapshot.flush.sort_millis, 15);
         assert_eq!(snapshot.flush.write_millis, 90);
-        assert_eq!(snapshot.flush.wal_millis, 6);
-        let (sort, write, wal) = snapshot.flush.stage_ratio().unwrap();
-        assert!((sort - 15.0 / 111.0).abs() < 1e-9);
-        assert!((write - 90.0 / 111.0).abs() < 1e-9);
-        assert!((wal - 6.0 / 111.0).abs() < 1e-9);
+        assert_eq!(snapshot.flush.commit_millis, 5);
+        assert_eq!(snapshot.flush.wal_millis, 5);
+        assert_eq!(snapshot.flush.wal_lag_total_millis, 2_400);
+        assert_eq!(snapshot.flush.wal_lag_max_millis, 1_500);
+        assert_eq!(snapshot.flush.average_wal_lag_millis(), 1_200.0);
+        let (sort, write, commit, wal) = snapshot.flush.stage_ratio().unwrap();
+        assert!((sort - 15.0 / 115.0).abs() < 1e-9);
+        assert!((write - 90.0 / 115.0).abs() < 1e-9);
+        assert!((commit - 5.0 / 115.0).abs() < 1e-9);
+        assert!((wal - 5.0 / 115.0).abs() < 1e-9);
         // Flushes say nothing about file I/O; that is still the manifest's job.
         assert_eq!(snapshot.total().files_written, 0);
 

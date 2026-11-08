@@ -660,7 +660,9 @@ pub fn encode_file(
             opts.page_rows
         ));
     }
+    let input_rows = rows.len();
     super::compaction::dedup_lww(&mut rows);
+    super::stats::record_dedup((input_rows - rows.len()) as u64);
     let deduped = rows;
 
     let min_sequence = deduped.iter().map(|r| r.sequence).min().unwrap();

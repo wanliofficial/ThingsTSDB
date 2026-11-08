@@ -1044,10 +1044,8 @@ Done:
 
 Follow-up (not yet implemented):
 
-- **Remaining observability:** WAL truncation lag (time from an acknowledged write
-  to the removal of its WAL file), a split of the flush write stage into page
-  encoding, object upload and manifest commit, and rows dropped by compaction dedup
-  counted by the kernel itself (the kernel's `duplicate_key_count` is still unused).
+- **Remaining observability:** a split of the flush write stage into page encoding
+  and object upload (the streaming Parquet writer interleaves them).
 
 Acceptance targets (from the roadmap, made measurable):
 
@@ -1116,11 +1114,15 @@ Implementation notes:
   tracking) and must not become a synchronization point on the read path.
 - **Flush and compaction have their own groups.** `StorageMetrics::record_flush`
   times the persist half of a flush (after the buffer is drained, on success only) and
-  reports rows, total and max milliseconds, plus three disjoint stage totals: `sort`
-  (concat and sort of the buffered batches), `write` (encode, upload and manifest
-  commit of the produced files) and `wal` (removal of the flushed WAL files);
-  `FlushStats::stage_ratio` turns them into a profile. `record_compaction` runs once
-  per committed task and reports input/output files, bytes and rows, so
+  reports rows, total and max milliseconds, plus disjoint stage totals: `sort`
+  (concat and sort of the buffered batches), `write` (encode and upload), `commit`
+  (manifest delta) and `wal` (removal of the flushed WAL files);
+  `FlushStats::stage_ratio` turns them into a profile. Each buffered frame carries
+  its enqueue instant, so the same record reports `wal_lag` — the age of the oldest
+  frame when its WAL file was removed — which is the real
+  acknowledged-to-truncated delay; replayed frames start at recovery time, since
+  their original age is lost. `record_compaction` runs once per committed task and
+  reports input/output files, bytes and rows, so
   `CompactionStats::write_amplification` is the real ratio and
   `deduplicated_rows` is the row volume a merge dropped; TTL removals are counted
   separately as expired files/bytes. Counting after the manifest commit keeps a
@@ -1131,13 +1133,15 @@ Implementation notes:
   retried commit is not counted.
 - **Kernel counters are process-wide.** `storage_kernel::tsf::codec_stats` aggregates
   what the kernel sees without a metrics dependency: pages encoded, pages stored
-  uncompressed, codec choices and compressed payload bytes per payload (both indexed
-  by `MarshalType`), CRC32C calls split by the SSE4.2 and software paths, bloom
-  rejections, and index-cache hits/misses/evictions/rejects folded in when a
-  `ReadContext` is dropped. `StorageStats::tsf_kernel` carries them next to the
-  storage's own groups. They describe the process, not one storage instance, and the
-  gauge fields (`entries`, `bytes`) stay per-context, so they read zero in the
-  snapshot.
+  uncompressed, codec choices plus compressed and raw payload bytes per payload (both
+  indexed by `MarshalType`, so `codec_compression_ratio` is per codec), CRC32C calls
+  split by the SSE4.2 and software paths, rows
+  dropped by LWW deduplication at encode (flush, compaction and rewrite all funnel
+  through `encode_file`), bloom rejections, and index-cache
+  hits/misses/evictions/rejects folded in when a `ReadContext` is dropped.
+  `StorageStats::tsf_kernel` carries them next to the storage's own groups. They
+  describe the process, not one storage instance, and the gauge fields (`entries`,
+  `bytes`) stay per-context, so they read zero in the snapshot.
 
 # Drawbacks
 

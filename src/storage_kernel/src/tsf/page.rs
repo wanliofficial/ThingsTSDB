@@ -273,6 +273,7 @@ pub fn encode_page(rows: &[Row]) -> Result<(Vec<u8>, PageMeta), String> {
             (seq_mt, seq_payload.len() as u64),
             (reserved_mt, reserved_payload.len() as u64),
         ],
+        rows.len() as u32,
         page_is_uncompressed,
     );
 

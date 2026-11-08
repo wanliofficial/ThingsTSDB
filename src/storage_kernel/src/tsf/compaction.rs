@@ -21,8 +21,6 @@
 //! point-wise LWW resolution, sequence-span union (compaction never narrows
 //! sequence coverage) and the small/big-part merge trigger.
 
-use std::collections::HashMap;
-
 use super::Row;
 
 /// Merge when a partition has more than this many small parts.
@@ -113,18 +111,6 @@ where
     small_part_bytes_exceed_ratio(total - largest, total)
 }
 
-/// Counts duplicate `(metric_id, series_id, timestamp)` keys without mutating
-/// the input. Used by compaction observability ("deduplicated rows").
-pub fn duplicate_key_count(rows: &[Row]) -> usize {
-    let mut seen: HashMap<(u64, u64, i64), ()> = HashMap::with_capacity(rows.len());
-    rows.iter()
-        .filter(|r| {
-            seen.insert((r.metric_id, r.series_id, r.timestamp), ())
-                .is_some()
-        })
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,11 +180,5 @@ mod tests {
         assert!(!small_parts_exceed_ratio([100, 10, 10]));
         // 40 B of flushes is over a quarter of 140 B.
         assert!(small_parts_exceed_ratio([100, 20, 20]));
-    }
-
-    #[test]
-    fn test_duplicate_key_count() {
-        let rows = vec![row(1, 1, 1), row(1, 1, 2), row(1, 2, 3), row(2, 1, 4)];
-        assert_eq!(duplicate_key_count(&rows), 1);
     }
 }

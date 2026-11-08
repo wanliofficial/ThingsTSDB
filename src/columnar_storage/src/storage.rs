@@ -911,9 +911,16 @@ mod tests {
                 assert_eq!(stats.flush.flushes, 1);
                 assert_eq!(stats.flush.rows, 4);
                 assert!(
-                    stats.flush.sort_millis + stats.flush.write_millis + stats.flush.wal_millis
+                    stats.flush.sort_millis
+                        + stats.flush.write_millis
+                        + stats.flush.commit_millis
+                        + stats.flush.wal_millis
                         <= stats.flush.total_millis,
                     "stage timings are subsets of the flush"
+                );
+                assert_eq!(
+                    stats.flush.wal_lag_total_millis,
+                    stats.flush.wal_lag_max_millis
                 );
                 // The flush committed one delta; the commit is timed
                 // separately.
@@ -1246,6 +1253,13 @@ mod tests {
             assert!(stats.compaction.input_bytes > 0);
             assert_eq!(stats.compaction.output_files, 1);
             assert!(stats.compaction.output_bytes > 0);
+            assert_eq!(stats.compaction.input_rows, 2 * SAMPLES as u64);
+            assert_eq!(stats.compaction.output_rows, 2 * SAMPLES as u64);
+            assert_eq!(
+                stats.compaction.deduplicated_rows(),
+                0,
+                "the two chunks hold distinct timestamps"
+            );
             assert!(stats.compaction.write_amplification() > 0.0);
         });
     }

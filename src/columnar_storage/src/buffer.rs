@@ -69,6 +69,10 @@ pub(crate) struct BufferedFrame {
     seq: u64,
     time_range: TimeRange,
     batch: RecordBatch,
+    /// When this frame was accepted into the buffer. Used to report how long a
+    /// write waited for its WAL file to be truncated; frames replayed from a
+    /// previous run start at recovery time because their original age is lost.
+    enqueued: Instant,
 }
 
 impl BufferedFrame {
@@ -199,6 +203,7 @@ impl FlushState {
             seq: SstFile::allocate_ids(num_rows as u64),
             time_range: req.time_range,
             batch: req.batch,
+            enqueued: Instant::now(),
         };
 
         // Appending to the WAL and pushing to the buffer must be atomic with
@@ -245,6 +250,7 @@ impl FlushState {
                 seq: frame.seq,
                 time_range: frame.time_range,
                 batch: frame.batch,
+                enqueued: Instant::now(),
             });
         }
         buffer.add_pending_wals(wal_files);
@@ -283,7 +289,14 @@ impl FlushState {
                     }
                 }
                 stages.wal = wal_started.elapsed();
-                self.metrics.record_flush(rows, started.elapsed(), stages);
+                // How long the oldest acknowledged write stayed in the WAL.
+                let wal_lag = frames
+                    .iter()
+                    .map(|f| f.enqueued.elapsed())
+                    .max()
+                    .unwrap_or_default();
+                self.metrics
+                    .record_flush(rows, started.elapsed(), stages, wal_lag);
                 Ok(())
             }
             Err(e) => {
@@ -310,6 +323,7 @@ impl FlushState {
             let timing = self.persist_segment(segment, &frames).await?;
             stages.sort += timing.sort;
             stages.write += timing.write;
+            stages.commit += timing.commit;
         }
         Ok(stages)
     }
@@ -339,11 +353,12 @@ impl FlushState {
         let sort = sort_started.elapsed();
 
         let write_started = Instant::now();
-        match self.format {
+        let (write, commit) = match self.format {
             FileFormat::Parquet => {
                 let file_id = SstFile::allocate_id();
                 let (object_size, written_rows, min_seq) =
                     self.write_parquet(file_id, &mut sorted).await?;
+                let write = write_started.elapsed();
                 let file_meta = FileMeta {
                     max_sequence: max_seq,
                     min_sequence: min_seq,
@@ -352,7 +367,9 @@ impl FlushState {
                     time_range,
                     format: FileFormat::Parquet,
                 };
+                let commit_started = Instant::now();
                 self.manifest.add_file(file_id, file_meta).await?;
+                (write, commit_started.elapsed())
             }
             FileFormat::Tsf => {
                 // A segment can straddle UTC midnight, so this may yield more
@@ -367,17 +384,20 @@ impl FlushState {
                     &time_range,
                 )
                 .await?;
+                let write = write_started.elapsed();
                 let to_adds = files
                     .into_iter()
                     .inspect(|f| {
                         debug!(file_meta = ?f.meta(), segment, "Flushed TSF segment");
                     })
                     .collect::<Vec<_>>();
+                let commit_started = Instant::now();
                 self.manifest
                     .update(ManifestUpdate::new(to_adds, Vec::new()))
                     .await?;
+                (write, commit_started.elapsed())
             }
-        }
+        };
         debug!(
             segment,
             frames = frames.len(),
@@ -386,7 +406,8 @@ impl FlushState {
         );
         Ok(FlushStages {
             sort,
-            write: write_started.elapsed(),
+            write,
+            commit,
             wal: Duration::ZERO,
         })
     }
