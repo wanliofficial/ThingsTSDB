@@ -56,7 +56,7 @@ use common::{ReadableDuration, ReadableSize};
 use datafusion::logical_expr::{col, lit, Expr};
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;
-use storage_kernel::tsf::partition::DAY_MS;
+use storage_kernel::tsf::{codec::MarshalType, partition::DAY_MS};
 use tokio::runtime::Runtime;
 
 const STEP_MS: i64 = 15_000;
@@ -268,6 +268,39 @@ async fn run_format(
         stats.bytes_written,
         stats.bytes_written as f64 / ds.rows() as f64,
     );
+    if file_format == FileFormat::Tsf {
+        // The size target is dominated by the value payload, so report what
+        // each codec actually produced (ADR-0002 §4.4, §13).
+        let kernel = storage.stats().tsf_kernel;
+        let raw: u64 = kernel.codec_raw_bytes.iter().sum();
+        if raw > 0 {
+            println!(
+                "Kernel codec profile: {} pages ({:.1}% without ZSTD), payload {:.2} B/sample",
+                kernel.pages,
+                kernel.uncompressed_ratio() * 100.0,
+                kernel.payload_bytes() as f64 * 8.0 / raw as f64,
+            );
+            for id in 1..=MarshalType::MAX_ID {
+                let Some(codec) = MarshalType::from_u8(id) else {
+                    continue;
+                };
+                let count = kernel.codec_count(codec);
+                if count == 0 {
+                    continue;
+                }
+                let raw_codec = kernel.codec_raw_bytes(codec);
+                let per_sample = if raw_codec == 0 {
+                    0.0
+                } else {
+                    kernel.codec_bytes(codec) as f64 * 8.0 / raw_codec as f64
+                };
+                println!(
+                    "  {codec:?}: {count} payloads, {per_sample:.2} B/sample, {:.2}x",
+                    kernel.codec_compression_ratio(codec).unwrap_or(0.0)
+                );
+            }
+        }
+    }
     println!();
 
     // ---- Full scan ----
