@@ -40,16 +40,28 @@ pub enum MarshalType {
     /// Used instead of `ZstdNearestDelta` if compression doesn't help.
     /// Go: MarshalTypeNearestDelta.
     NearestDelta = 6,
+    /// Order-k polynomial prediction of the f64 value, with the residual bit
+    /// pattern zig-zag varint encoded (ADR-0002 §4.4). Only the value payload
+    /// of a page uses it; see [`super::predict`].
+    PredictedF64 = 7,
 }
 
 impl MarshalType {
+    /// Largest on-disk codec id.
+    pub const MAX_ID: u8 = 7;
+    /// Number of codec slots, indexed by id.
+    pub const SLOTS: usize = Self::MAX_ID as usize + 1;
+
     /// Returns true if the type may need additional validation for silent data
     /// corruption. Go: MarshalType.NeedsValidation.
     pub fn needs_validation(self) -> bool {
         // Other types do not need additional validation, since they either
         // already contain checksums (e.g. compressed data) or they are trivial
         // and cannot be validated (e.g. const or delta const).
-        matches!(self, MarshalType::NearestDelta2 | MarshalType::NearestDelta)
+        matches!(
+            self,
+            MarshalType::NearestDelta2 | MarshalType::NearestDelta | MarshalType::PredictedF64
+        )
     }
 
     /// Converts a raw byte into a `MarshalType`.
@@ -61,6 +73,7 @@ impl MarshalType {
             4 => Some(MarshalType::ZstdNearestDelta),
             5 => Some(MarshalType::NearestDelta2),
             6 => Some(MarshalType::NearestDelta),
+            7 => Some(MarshalType::PredictedF64),
             _ => None,
         }
     }
@@ -72,10 +85,14 @@ impl MarshalType {
 }
 
 /// Verifies whether the raw `mt` byte is valid. Go: CheckMarshalType
-/// (Go accepts the whole [0..6] range even though 0 is unused).
+/// (Go accepts the whole [0..6] range even though 0 is unused; this build adds
+/// the PredictedF64 codec as id 7).
 pub fn check_marshal_type(mt: u8) -> Result<(), String> {
-    if mt > 6 {
-        return Err(format!("MarshalType should be in range [0..6]; got {mt}"));
+    if mt > MarshalType::MAX_ID {
+        return Err(format!(
+            "MarshalType should be in range [0..{}]; got {mt}",
+            MarshalType::MAX_ID
+        ));
     }
     Ok(())
 }
@@ -137,6 +154,36 @@ pub fn unmarshal_timestamps(
 /// Go: MarshalValues.
 pub fn marshal_values(dst: &mut Vec<u8>, values: &[i64], precision_bits: u8) -> (MarshalType, i64) {
     marshal_int64_array(dst, values, precision_bits)
+}
+
+/// Marshals an f64 bit-pattern array, also considering the predictive codec.
+///
+/// The nearest-delta family is still the base result; the predictive codec is
+/// only used when its payload is strictly shorter, so this never inflates a
+/// page. Callers must use this for the value column only: codec 7 predicts in
+/// the `f64` domain and is meaningless for timestamps or sequences.
+pub fn marshal_values_f64(
+    dst: &mut Vec<u8>,
+    values: &[i64],
+    precision_bits: u8,
+) -> (MarshalType, i64) {
+    let start = dst.len();
+    let (mt, first_value) = marshal_int64_array(dst, values, precision_bits);
+    if matches!(mt, MarshalType::Const | MarshalType::DeltaConst) {
+        return (mt, first_value);
+    }
+
+    let mut candidate = Vec::new();
+    if !super::predict::marshal(&mut candidate, values) {
+        return (mt, first_value);
+    }
+    if candidate.len() < dst.len() - start {
+        dst.truncate(start);
+        dst.extend_from_slice(&candidate);
+        (MarshalType::PredictedF64, first_value)
+    } else {
+        (mt, first_value)
+    }
 }
 
 /// Unmarshals values from `src`, appending them to `dst`.
@@ -294,6 +341,8 @@ pub(crate) fn unmarshal_int64_array(
             super::simd::fill_delta_i64(&mut dst[start..], first_value, d);
             Ok(())
         }
+        MarshalType::PredictedF64 => super::predict::unmarshal(dst, src, first_value, items_count)
+            .map_err(|err| format!("cannot unmarshal predicted data: {err}")),
     }
 }
 
@@ -760,20 +809,78 @@ mod tests {
 
     #[test]
     fn test_marshal_type_roundtrip() {
-        for v in 1..=6u8 {
+        for v in 1..=MarshalType::MAX_ID {
             let mt = MarshalType::from_u8(v).unwrap();
             assert_eq!(mt.as_u8(), v);
         }
         assert!(MarshalType::from_u8(0).is_none());
-        assert!(MarshalType::from_u8(7).is_none());
+        assert!(MarshalType::from_u8(8).is_none());
+        assert_eq!(MarshalType::SLOTS, 8);
         assert!(check_marshal_type(6).is_ok());
         assert!(check_marshal_type(0).is_ok());
-        assert!(check_marshal_type(7).is_err());
+        assert!(check_marshal_type(MarshalType::MAX_ID).is_ok());
+        assert!(check_marshal_type(8).is_err());
         assert!(MarshalType::NearestDelta.needs_validation());
         assert!(MarshalType::NearestDelta2.needs_validation());
+        assert!(MarshalType::PredictedF64.needs_validation());
         assert!(!MarshalType::ZstdNearestDelta.needs_validation());
         assert!(!MarshalType::ZstdNearestDelta2.needs_validation());
         assert!(!MarshalType::Const.needs_validation());
         assert!(!MarshalType::DeltaConst.needs_validation());
+    }
+
+    /// `marshal_values_f64` picks the predictive codec for a smooth gauge and
+    /// keeps the nearest-delta family otherwise, never growing the payload.
+    #[test]
+    fn test_predictive_value_codec_selection() {
+        let sine: Vec<i64> = (0..5_760)
+            .map(|i| (i as f64 * 0.01).sin().to_bits() as i64)
+            .collect();
+        let mut payload = Vec::new();
+        let (mt, first) = marshal_values_f64(&mut payload, &sine, 64);
+        assert_eq!(mt, MarshalType::PredictedF64);
+        assert_eq!(first, sine[0]);
+        let mut decoded = Vec::new();
+        unmarshal_values(&mut decoded, &payload, mt, first, sine.len()).unwrap();
+        assert_eq!(decoded, sine);
+
+        let mut fallback = Vec::new();
+        let (fallback_mt, fallback_first) = marshal_values(&mut fallback, &sine, 64);
+        assert!(
+            payload.len() < fallback.len(),
+            "predictive payload {} must beat {}",
+            payload.len(),
+            fallback.len()
+        );
+        assert_ne!(fallback_mt, MarshalType::PredictedF64);
+        assert_eq!(fallback_first, first);
+
+        // An alternating ramp is unpredictable: the payload must not grow.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let noisy: Vec<i64> = (0..1_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state | 0x3ff0_0000_0000_0000) as i64
+            })
+            .collect();
+        let mut plain = Vec::new();
+        let (plain_mt, _) = marshal_values(&mut plain, &noisy, 64);
+        let mut chosen = Vec::new();
+        let (chosen_mt, chosen_first) = marshal_values_f64(&mut chosen, &noisy, 64);
+        assert!(chosen.len() <= plain.len());
+        assert_eq!(chosen.len(), plain.len());
+        assert_eq!(chosen_mt, plain_mt);
+        let mut decoded = Vec::new();
+        unmarshal_values(&mut decoded, &chosen, chosen_mt, chosen_first, noisy.len()).unwrap();
+        assert_eq!(decoded, noisy);
+
+        // A page containing a NaN keeps the nearest-delta path.
+        let mut with_nan = sine.clone();
+        with_nan[3] = f64::NAN.to_bits() as i64;
+        let mut out = Vec::new();
+        let (nan_mt, _) = marshal_values_f64(&mut out, &with_nan, 64);
+        assert_ne!(nan_mt, MarshalType::PredictedF64);
     }
 }

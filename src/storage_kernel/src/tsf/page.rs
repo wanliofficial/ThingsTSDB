@@ -23,8 +23,8 @@ use super::Row;
 use crate::tsf::{
     checksum::crc32c_multi,
     codec::{
-        marshal_timestamps, marshal_values, marshal_var_int64, unmarshal_timestamps,
-        unmarshal_values, MarshalType,
+        marshal_timestamps, marshal_values, marshal_values_f64, marshal_var_int64,
+        unmarshal_timestamps, unmarshal_values, MarshalType,
     },
 };
 
@@ -249,7 +249,7 @@ pub fn encode_page(rows: &[Row]) -> Result<(Vec<u8>, PageMeta), String> {
     let mut ts_payload = Vec::new();
     let (ts_mt, first_timestamp) = marshal_timestamps(&mut ts_payload, &timestamps, PRECISION_BITS);
     let mut value_payload = Vec::new();
-    let (value_mt, first_value) = marshal_values(&mut value_payload, &values, PRECISION_BITS);
+    let (value_mt, first_value) = marshal_values_f64(&mut value_payload, &values, PRECISION_BITS);
     let mut seq_payload = Vec::new();
     let (seq_mt, first_sequence) = marshal_values(&mut seq_payload, &sequences, PRECISION_BITS);
     let mut reserved_payload = Vec::new();
@@ -615,7 +615,8 @@ mod tests {
         let mut ts_payload = Vec::new();
         let (ts_mt, first_ts) = marshal_timestamps(&mut ts_payload, &timestamps, PRECISION_BITS);
         let mut value_payload = Vec::new();
-        let (value_mt, first_value) = marshal_values(&mut value_payload, &values, PRECISION_BITS);
+        let (value_mt, first_value) =
+            marshal_values_f64(&mut value_payload, &values, PRECISION_BITS);
         let mut seq_payload = Vec::new();
         let (seq_mt, first_seq) = marshal_values(&mut seq_payload, &sequences, PRECISION_BITS);
         let mut reserved_payload = Vec::new();

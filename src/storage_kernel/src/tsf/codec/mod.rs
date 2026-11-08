@@ -27,6 +27,7 @@ mod float;
 mod int;
 mod nearest_delta;
 mod nearest_delta2;
+mod predict;
 pub mod simd;
 
 #[cfg(test)]

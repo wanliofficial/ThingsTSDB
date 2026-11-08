@@ -42,15 +42,15 @@ pub struct CodecStats {
     /// Payload codec choices, indexed by `MarshalType::as_u8` (`1..=6`).
     /// Every page records one choice for each of its four payloads, so the
     /// sum over this array is `4 * pages`.
-    pub codec_counts: [u64; 7],
+    pub codec_counts: [u64; MarshalType::SLOTS],
     /// Compressed payload bytes per codec choice, same indexing as
     /// [`Self::codec_counts`]. The sum over this array is the total payload
     /// bytes written, which is what the codec ratio is computed from.
-    pub codec_bytes: [u64; 7],
+    pub codec_bytes: [u64; MarshalType::SLOTS],
     /// Uncompressed payload bytes per codec choice: eight bytes per row for
     /// every payload. Together with [`Self::codec_bytes`] this makes the
     /// compression ratio of each codec available.
-    pub codec_raw_bytes: [u64; 7],
+    pub codec_raw_bytes: [u64; MarshalType::SLOTS],
     /// CRC32C computations that used the SSE4.2 instruction.
     pub crc_hardware: u64,
     /// CRC32C computations that fell back to the slicing-by-8 table.
@@ -126,34 +126,13 @@ impl CodecStats {
 
 static PAGES: AtomicU64 = AtomicU64::new(0);
 static UNCOMPRESSED_PAGES: AtomicU64 = AtomicU64::new(0);
-static CODEC_COUNTS: [AtomicU64; 7] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static CODEC_COUNTS: [AtomicU64; MarshalType::SLOTS] =
+    [const { AtomicU64::new(0) }; MarshalType::SLOTS];
 static BLOOM_REJECTS: AtomicU64 = AtomicU64::new(0);
-static CODEC_BYTES: [AtomicU64; 7] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static CODEC_RAW_BYTES: [AtomicU64; 7] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static CODEC_BYTES: [AtomicU64; MarshalType::SLOTS] =
+    [const { AtomicU64::new(0) }; MarshalType::SLOTS];
+static CODEC_RAW_BYTES: [AtomicU64; MarshalType::SLOTS] =
+    [const { AtomicU64::new(0) }; MarshalType::SLOTS];
 static CRC_HARDWARE: AtomicU64 = AtomicU64::new(0);
 static CRC_SOFTWARE: AtomicU64 = AtomicU64::new(0);
 static DEDUP_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -214,15 +193,15 @@ fn load(counter: &AtomicU64) -> u64 {
 
 /// Snapshots the process-wide counters.
 pub fn codec_stats() -> CodecStats {
-    let mut codec_counts = [0u64; 7];
+    let mut codec_counts = [0u64; MarshalType::SLOTS];
     for (out, counter) in codec_counts.iter_mut().zip(CODEC_COUNTS.iter()) {
         *out = load(counter);
     }
-    let mut codec_bytes = [0u64; 7];
+    let mut codec_bytes = [0u64; MarshalType::SLOTS];
     for (out, counter) in codec_bytes.iter_mut().zip(CODEC_BYTES.iter()) {
         *out = load(counter);
     }
-    let mut codec_raw_bytes = [0u64; 7];
+    let mut codec_raw_bytes = [0u64; MarshalType::SLOTS];
     for (out, counter) in codec_raw_bytes.iter_mut().zip(CODEC_RAW_BYTES.iter()) {
         *out = load(counter);
     }
@@ -282,7 +261,7 @@ mod tests {
         assert!(after.pages - before.pages >= 2);
         assert!(after.uncompressed_pages - before.uncompressed_pages >= 1);
         assert!(after.zstd_pages() > before.zstd_pages());
-        let encoded: u64 = (0..7)
+        let encoded: u64 = (0..MarshalType::SLOTS)
             .map(|codec| after.codec_counts[codec] - before.codec_counts[codec])
             .sum();
         assert!(encoded >= 8, "four payloads per page");
@@ -290,7 +269,7 @@ mod tests {
             after.codec_count(MarshalType::Const) - before.codec_count(MarshalType::Const) >= 2
         );
 
-        let compressed: u64 = (0..7)
+        let compressed: u64 = (0..MarshalType::SLOTS)
             .map(|codec| after.codec_bytes[codec] - before.codec_bytes[codec])
             .sum();
         assert!(compressed >= 100 + 200 + 3 + 40 + 5 + 60 + 70 + 3);
@@ -300,7 +279,7 @@ mod tests {
         assert_eq!(after.payload_bytes() - before.payload_bytes(), compressed);
 
         // Raw payload bytes are eight per row, for every codec.
-        let raw: u64 = (0..7)
+        let raw: u64 = (0..MarshalType::SLOTS)
             .map(|codec| after.codec_raw_bytes[codec] - before.codec_raw_bytes[codec])
             .sum();
         assert!(raw >= 4 * 100 * 8 + 4 * 50 * 8);

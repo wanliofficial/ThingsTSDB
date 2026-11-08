@@ -451,10 +451,16 @@ Codec ids are stored per payload in the page header:
 | 4 | `ZstdNearestDelta` | gauge-like integer arrays |
 | 5 | `NearestDelta2` | uncompressed counter fallback |
 | 6 | `NearestDelta` | uncompressed gauge fallback |
+| 7 | `PredictedF64` | smooth gauge values (order-k polynomial prediction) |
 
 Ids 1-6 match the `esm-encoding` discriminants so the codec modules can be ported
 without translation. `f64` values are converted to their bit patterns and encoded as
 `i64` arrays; `precision_bits` applies only to the nearest-delta codecs.
+
+Id 7 is local to this implementation. It is only considered for the value payload, and
+only when its payload is strictly shorter than the nearest-delta result, so enabling it
+never inflates a file. Readers from before it existed reject id 7; a file that contains
+it needs a reader that knows the codec.
 
 ### 4.1 Timestamps
 
@@ -477,15 +483,28 @@ that decrease. Duplicate timestamps are legal and set the duplicate flag.
 1. `Const` if all values are bit-identical;
 2. `DeltaConst` if all bit-pattern deltas are equal (rare, but cheap to detect);
 3. nearest-delta / delta-of-delta with 64 precision bits for gauges and counters;
-4. plain varint or raw bits + ZSTD fallback.
+4. `PredictedF64`: an order-1..5 polynomial extrapolation of the value itself, encoded
+   as the zig-zag varint of the residual bit pattern, chosen when it beats step 3;
+5. plain varint or raw bits + ZSTD fallback.
 
 `precision_bits = 64` is the default and is lossless. Lower precision is an opt-in
 compression mode for future versions; it must be recorded in the page header so readers
 can report lossy data. NaN and infinities round-trip exactly.
 
-IoTDB's Gorilla/CHIMP XOR encoding is a valid alternative for gauges; it is listed as a
-benchmark alternative rather than the v1 default because the nearest-delta codec is
-already implemented and tested in the reference implementation.
+`PredictedF64` exists because the nearest-delta codec compares adjacent bit patterns, and
+adjacent samples of a smooth gauge differ in their low mantissa bits: the delta is small
+in value space but noise in bit space, so every sample costs 7-8 bytes. Extrapolating the
+value with the binomial coefficients of `(1 - x)^k` puts the residual near zero instead.
+Both ends evaluate the same `f64` expression in the same order, so the predicted bit
+pattern is identical; the residual is the wrapping integer difference of the bit
+patterns, which makes the codec lossless even when the prediction is poor. Non-finite
+values disable it for that page, because NaN payload bits are not reproducible. On the
+§12 T5 gauge this moved the value payload from 7.14 to 2.40 B/sample (3.3x) and the file
+from 7.20 to 2.46 B/sample.
+
+IoTDB's Gorilla/CHIMP XOR encoding was evaluated and rejected: on the same gauge it needs
+~65 B/sample, because consecutive values share almost no leading/trailing mantissa bits
+and the XOR blocks stay wide. Prediction exploits the smoothness that XOR cannot.
 
 ### 4.3 `__seq__` and `__reserved__`
 
@@ -1040,10 +1059,10 @@ Done:
   write throughput, full-scan throughput, 1-day/30-day single-series p50/p99,
   page pruning and restart). Results and analysis are in
   `docs/rfcs/20261028-phase2-benchmark.md`. Full scan was 0.7 M rows/s before the
-  merge fast path and is 20-42 M rows/s after. Every latency target now passes:
-  the 30-day single-series p99 is 20.3 ms (gauge) and 12.7 ms (counter) against a
-  50 ms target, after series pushdown replaced a whole-metric decode with a
-  one-series read.
+  merge fast path and is 36-50 M rows/s after. Every target passes: size is
+  2.46 B/sample on gauge and 0.06 on counter; the 30-day single-series p99 is
+  17.3 ms (gauge) and 9.5 ms (counter) against a 50 ms target, after series
+  pushdown replaced a whole-metric decode with a one-series read.
 
 Follow-up (not yet implemented):
 
@@ -1078,10 +1097,11 @@ shape; buffer reuse and cheaper codec selection are the first optimizations. The
 decode follow-up is specified in `docs/rfcs/20261029-vectorized-decode-plan.md`.
 
 End-to-end results for the finished storage path (WAL, manifest, both formats, 30 day
-partitions) are in `docs/rfcs/20261028-phase2-benchmark.md`: full scan 20-42 M rows/s,
-durable ingest 1.3-1.8 M rows/s (above Parquet), 1-day query p99 2-5 ms, 30-day
-single-series p99 13-20 ms. Size is 2.3x smaller than Parquet on gauge and 200x on
-counter; the remaining size miss is the incompressible f64 mantissa, not the format.
+partitions) are in `docs/rfcs/20261028-phase2-benchmark.md`: every acceptance target
+passes. Full scan is 36-50 M rows/s, durable ingest 1.2-1.8 M rows/s (at or above
+Parquet), 1-day query p99 1.4-2.1 ms, 30-day single-series p99 9.5-17.3 ms. Size is
+2.46 B/sample on gauge (6.8x smaller than Parquet, inside the 2.5 target thanks to the
+`PredictedF64` codec of §4.2) and 0.06 B/sample on counter.
 
 ## 13. Observability
 
