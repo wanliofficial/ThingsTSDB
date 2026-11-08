@@ -759,6 +759,23 @@ the monthly indexDB partition, not here (ADR-0001).
 A `partition_duration` other than one day is allowed by the format, but the index and
 the TTL tests are defined for daily partitions in Phase 2.
 
+Implementation notes (`columnar_storage::partition::PartitionManager`):
+
+- Partition discovery lists `data/` once with `list_with_delimiter` and accepts only
+  `YYYYMMDD` segments; Parquet objects sitting directly in `data/` are not partitions.
+  The manifest remains the only source of truth for queries, so listing happens on the
+  maintenance path only.
+- A directory with zero objects is not reported as a partition: deleting objects does
+  not remove the directory on a local filesystem, and treating the leftover as a live
+  partition would make a completed drop look pending.
+- Both sides of every path comparison go through `object_store::path::Path`, which
+  strips the leading `/` that a local-filesystem root adds to the configured prefix.
+- Orphan GC deletes objects under `data/` that no manifest entry names. It cannot tell
+  an orphan from a flushed/compacted file that has not been committed yet, so it must
+  run while writes are quiet; the storage-trait doc comment says so.
+- `drop_expired` flushes buffered writes first, so a segment that is still partly in
+  the buffer cannot be dropped (or kept) arbitrarily.
+
 ## 9. Object Storage
 
 TSF is designed to be one object per part:
@@ -886,7 +903,7 @@ emission, hardware CRC, SIMD kernels, parallel page decoding) is in
 parity against the scalar decoder on all codecs; T2 requires at least 2x the prototype
 scan throughput with selective-query latency unchanged or better.
 
-### 12.1 Implementation status (2026-11-07)
+### 12.1 Implementation status (2026-11-08)
 
 Done:
 
@@ -924,28 +941,36 @@ Done:
   Parquet SSTs left behind by a format switch, exposed as
   `ColumnarStorage::rewrite_legacy_files`, and converges when repeated
   (`test_rewrite_parquet_files_to_tsf`, `test_storage_rewrite_legacy_files`).
+- **T2 range reads:** `TsfReader` is built from byte segments (`from_segments`), so a
+  reader can hold any subset of a file. `FooterLayout` parses the footer alone and
+  names the header/bloom/index ranges; `next_scan_ranges` then walks chunk-group
+  header -> series index -> series index blocks -> series chunk header -> page index
+  one level per round, and `page_ranges_for_metrics` returns the exact pages a window
+  needs. `TsfExec` drives those rounds against the object store, coalescing only
+  across small gaps (the store's own `get_ranges` merges up to 1 MiB, which would
+  defeat the plan), and decodes only the intersection of the scan range and the file
+  range (`test_ranged_read_fetches_only_touched_pages`,
+  `test_staged_scan_planner_reads_only_touched_pages`). Files at or below 512 KiB are
+  still read whole, where the round trips cost more than the bytes they save.
+- **T3 partition manager / GC:** `columnar_storage::partition::PartitionManager`
+  discovers day partitions under `data/` with `list_with_delimiter` +
+  `parse_partition_label`, drives TTL drops through `Manifest::drop_expired_partitions`
+  and then deletes the objects, and sweeps objects that no manifest entry references.
+  Exposed on the storage trait as `partitions`, `drop_expired` and `gc_orphans`
+  (`test_list_partitions_groups_by_day`,
+  `test_drop_expired_removes_manifest_first_then_objects`,
+  `test_gc_orphans_keeps_live_files_and_bytes`,
+  `test_storage_drop_expired_and_gc_orphans`).
 
 Follow-up (not yet implemented):
 
-- **T2 range reads (landed):** `TsfReader` is built from byte segments
-  (`from_segments`), so a reader can hold any subset of a file. `FooterLayout`
-  parses the footer alone and names the header/bloom/index ranges; then
-  `next_scan_ranges` walks chunk-group header -> series index -> series chunk
-  header -> page index one level per round, and `page_ranges_for_metrics` returns
-  the exact pages a window needs. `TsfExec` drives those rounds against the object
-  store and decodes only the intersection of the scan range and the file range
-  (`test_ranged_read_fetches_only_touched_pages`). Files at or below 512 KiB are
-  still read whole, where round trips cost more than the bytes saved.
-- **T3 partition manager:** automatic partition discovery, small/big compaction job
-  policies, crash recovery and orphan GC beyond the pure helpers and the TTL drop.
+- **T3 compaction policies:** small/big compaction-job selection beyond the current
+  time-window strategy, and kill -9 crash-recovery tests (WAL replay and orphan
+  cleanup are implemented, the fault-injection suite is not).
 - **T4 per-format metrics:** write/read counters are not split by format yet. The
   rewrite job currently skips files that span more than one UTC day, since splitting
   them needs page-level work.
 - **T5:** the full size/write-throughput/query-p99/recovery benchmark matrix.
-
-The remaining work is mostly operational plumbing (partition manager, GC, rewrite
-job) rather than format or decode work, so it is tracked here rather than implied by
-the Phase 2 completion.
 
 Acceptance targets (from the roadmap, made measurable):
 

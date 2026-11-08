@@ -23,6 +23,7 @@ pub mod config;
 mod macros;
 pub mod manifest;
 pub mod operator;
+pub mod partition;
 mod read;
 pub mod sst;
 pub mod storage;

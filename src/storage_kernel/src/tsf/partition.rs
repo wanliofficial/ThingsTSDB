@@ -53,6 +53,30 @@ pub fn partition_label(timestamp_ms: i64) -> String {
     format!("{year:04}{month:02}{day:02}")
 }
 
+/// Parses a `YYYYMMDD` partition label back to its UTC-day index.
+///
+/// Inverse of [`partition_label`]. Used by the partition manager, which
+/// discovers partitions by listing `data/` and must map a directory name back
+/// to a day without trusting the file metadata inside it.
+pub fn parse_partition_label(label: &str) -> Option<i64> {
+    if label.len() != 8 || !label.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = label[0..4].parse().ok()?;
+    let month: u32 = label[4..6].parse().ok()?;
+    let day: u32 = label[6..8].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    // Reject impossible dates such as 20230230 instead of silently mapping
+    // them to a neighbouring day.
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    Some(days)
+}
+
 /// Returns the partition indexes whose exclusive end is at or before
 /// `now_ms - ttl_ms`, in ascending order.
 ///
@@ -72,6 +96,20 @@ where
     expired.sort_unstable();
     expired.dedup();
     expired
+}
+
+/// Proleptic Gregorian `(year, month, day)` to days since 1970-01-01.
+///
+/// Howard Hinnant's `days_from_civil` algorithm, the inverse of
+/// [`civil_from_days`].
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
 }
 
 /// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`.
@@ -137,6 +175,37 @@ mod tests {
             let ts = idx * DAY_MS;
             assert_eq!(partition_index(ts), idx);
             assert!(!partition_label(ts).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_partition_label_parses_back_to_index() {
+        for idx in [-20_000, -10, -1, 0, 1, 19_000, 21_000] {
+            let label = partition_label(idx * DAY_MS);
+            assert_eq!(parse_partition_label(&label), Some(idx), "label {label}");
+        }
+        assert_eq!(
+            parse_partition_label("20231114"),
+            Some(partition_index(1_700_000_000_000))
+        );
+        assert_eq!(parse_partition_label("19700101"), Some(0));
+        assert_eq!(parse_partition_label("19691231"), Some(-1));
+    }
+
+    #[test]
+    fn test_parse_partition_label_rejects_garbage() {
+        for bad in [
+            "",
+            "2023111",
+            "202311140",
+            "2023-1-1",
+            "20231301",
+            "20230132",
+            "20230230",
+            "abcdefgh",
+            "2023111a",
+        ] {
+            assert_eq!(parse_partition_label(bad), None, "accepted {bad:?}");
         }
     }
 }

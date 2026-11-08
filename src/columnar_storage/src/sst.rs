@@ -292,6 +292,11 @@ impl SstPathGenerator {
         Self { prefix }
     }
 
+    /// Storage root that relative paths are resolved against.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Legacy Parquet path: `{root}/data/{file_id}.sst`.
     pub fn generate(&self, id: FileId) -> String {
         format!("{}/{}/{}.sst", self.prefix, PREFIX_PATH, id)

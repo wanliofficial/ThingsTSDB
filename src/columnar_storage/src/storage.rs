@@ -83,6 +83,21 @@ pub trait ColumnarStorage {
     async fn rewrite_legacy_files(&self) -> Result<crate::tsf::RewriteReport> {
         Err(anyhow::anyhow!("rewrite_legacy_files is not supported by this storage").into())
     }
+
+    /// Day partitions on storage. See [`crate::partition::PartitionManager`].
+    async fn partitions(&self) -> Result<Vec<crate::partition::Partition>> {
+        Err(anyhow::anyhow!("partitions is not supported by this storage").into())
+    }
+
+    /// TTL drop. See [`crate::partition::PartitionManager::drop_expired`].
+    async fn drop_expired(&self, _ttl: Duration) -> Result<Vec<crate::sst::FileId>> {
+        Err(anyhow::anyhow!("drop_expired is not supported by this storage").into())
+    }
+
+    /// Orphan GC. See [`crate::partition::PartitionManager::gc_orphans`].
+    async fn gc_orphans(&self) -> Result<crate::partition::GcReport> {
+        Err(anyhow::anyhow!("gc_orphans is not supported by this storage").into())
+    }
 }
 
 pub type ColumnarStorageRef = Arc<dyn ColumnarStorage + Send + Sync>;
@@ -120,6 +135,7 @@ pub struct ObjectBasedStorage {
     write_props: WriterProperties,
     sst_path_gen: Arc<SstPathGenerator>,
     compact_scheduler: CompactionScheduler,
+    partition_manager: crate::partition::PartitionManager,
     flush_state: Arc<FlushState>,
     flush_tx: mpsc::Sender<()>,
 }
@@ -176,6 +192,12 @@ impl ObjectBasedStorage {
             format,
         );
 
+        let partition_manager = crate::partition::PartitionManager::new(
+            store.clone(),
+            manifest.clone(),
+            sst_path_gen.clone(),
+        );
+
         let wal = if storage_opts.wal.enabled {
             Some(Wal::new(&path, &storage_opts.wal)?)
         } else {
@@ -215,6 +237,7 @@ impl ObjectBasedStorage {
             write_props,
             sst_path_gen,
             compact_scheduler,
+            partition_manager,
             flush_state,
             flush_tx,
         })
@@ -337,6 +360,24 @@ impl ColumnarStorage for ObjectBasedStorage {
             ssts,
         )
         .await
+    }
+
+    async fn partitions(&self) -> Result<Vec<crate::partition::Partition>> {
+        self.partition_manager.list_partitions().await
+    }
+
+    async fn drop_expired(&self, ttl: Duration) -> Result<Vec<crate::sst::FileId>> {
+        // Flush first: buffered rows still belong to a live segment, and a
+        // half-written segment would be dropped or kept arbitrarily.
+        self.flush_state.flush().await?;
+        let now = common::now();
+        self.partition_manager
+            .drop_expired(now, ttl.as_millis() as i64)
+            .await
+    }
+
+    async fn gc_orphans(&self) -> Result<crate::partition::GcReport> {
+        self.partition_manager.gc_orphans().await
     }
 }
 
@@ -621,6 +662,144 @@ mod tests {
                 .get(&Path::from(path))
                 .await
                 .expect("TSF object must exist");
+        });
+    }
+
+    /// TTL drop and orphan GC through the storage trait (ADR-0002 §8.3).
+    ///
+    /// Two days are written; dropping with a two-day TTL must remove the older
+    /// one end to end: manifest entries first, then objects, and a scan must no
+    /// longer see those rows. GC must then delete an object that no manifest
+    /// entry references.
+    #[test(test)]
+    fn test_storage_drop_expired_and_gc_orphans() {
+        use object_store::path::Path;
+        use storage_kernel::tsf::partition::{partition_label, DAY_MS};
+
+        use crate::{config::DataFileFormat, partition::GcReport};
+
+        let schema = arrow_schema!(
+            ("metric_id", UInt64),
+            ("tsid", UInt64),
+            ("timestamp", Int64),
+            ("value", Float64)
+        );
+        let root_dir = temp_dir::TempDir::new().unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let runtimes = build_runtimes();
+        runtimes.sst_compact_runtime.clone().block_on(async move {
+            let mut config = config_without_periodic_flush();
+            config.format = DataFileFormat::Tsf;
+            let storage = ObjectBasedStorage::try_new(
+                root_dir.path().to_string_lossy().to_string(),
+                Duration::from_hours(2),
+                store,
+                schema.clone(),
+                3,
+                config,
+                runtimes,
+            )
+            .await
+            .unwrap();
+
+            // Whole days, so the partition boundaries are unambiguous.
+            let now = common::now();
+            let today = now.div_euclid(DAY_MS);
+            let old_day = today - 3;
+            let old_ts = old_day * DAY_MS + 1_000;
+            let new_ts = now;
+            assert_ne!(old_day, today);
+
+            for (ts, value) in [(old_ts, 1.0), (new_ts, 2.0)] {
+                let batch = record_batch!(
+                    ("metric_id", UInt64, vec![1]),
+                    ("tsid", UInt64, vec![10]),
+                    ("timestamp", Int64, vec![ts]),
+                    ("value", Float64, vec![value])
+                )
+                .unwrap();
+                storage
+                    .write(WriteRequest {
+                        batch,
+                        time_range: (ts..ts + 1).into(),
+                        enable_check: true,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let before = storage
+                .scan(ScanRequest {
+                    range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                    predicate: vec![],
+                    projections: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(collect_batch(before).await.num_rows(), 2);
+
+            let partitions = storage.partitions().await.unwrap();
+            assert_eq!(partitions.len(), 2);
+            assert_eq!(partitions[0].index, old_day);
+            assert_eq!(partitions[0].label, partition_label(old_ts));
+            assert_eq!(partitions[1].index, today);
+
+            // Keep the last two days: the old partition is past its TTL.
+            let removed = storage
+                .drop_expired(Duration::from_hours(48))
+                .await
+                .unwrap();
+            assert_eq!(removed.len(), 1);
+
+            let after = storage
+                .scan(ScanRequest {
+                    range: TimeRange::new(Timestamp(0), Timestamp::MAX),
+                    predicate: vec![],
+                    projections: None,
+                })
+                .await
+                .unwrap();
+            let after = collect_batch(after).await;
+            assert_eq!(after.num_rows(), 1);
+            let expected = record_batch!(
+                ("metric_id", UInt64, vec![1]),
+                ("tsid", UInt64, vec![10]),
+                ("timestamp", Int64, vec![new_ts]),
+                ("value", Float64, vec![2.0])
+            )
+            .unwrap();
+            assert_eq!(after, expected);
+
+            let partitions = storage.partitions().await.unwrap();
+            assert_eq!(partitions.len(), 1);
+            assert_eq!(partitions[0].index, today);
+
+            // An object no manifest entry references: written by a compaction
+            // that crashed before committing.
+            let orphan = format!(
+                "{}/data/{}/999999.tsf",
+                storage.sst_path_gen.prefix(),
+                partition_label(new_ts)
+            );
+            storage
+                .store
+                .put(&Path::from(orphan.clone()), vec![0u8; 11].into())
+                .await
+                .unwrap();
+            let report = storage.gc_orphans().await.unwrap();
+            assert_eq!(
+                report,
+                GcReport {
+                    orphan_files: 1,
+                    orphan_bytes: 11,
+                    retained_files: 1,
+                    failed_deletes: 0,
+                }
+            );
+            assert!(storage.store.get(&Path::from(orphan)).await.is_err());
+
+            // A second pass has nothing left to do.
+            assert!(!storage.gc_orphans().await.unwrap().made_progress());
         });
     }
 

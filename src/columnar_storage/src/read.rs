@@ -39,7 +39,7 @@ use datafusion::{
     },
     logical_expr::utils::conjunction,
     parquet::arrow::async_reader::AsyncFileReader,
-    physical_expr::{create_physical_expr, LexOrdering},
+    physical_expr::{create_physical_expr, EquivalenceProperties, LexOrdering},
     physical_plan::{
         filter::FilterExec, metrics::ExecutionPlanMetricsSet,
         sorts::sort_preserving_merge::SortPreservingMergeExec, DisplayAs, Distribution,
@@ -106,6 +106,13 @@ pub(crate) struct MergeExec {
     value_operator: Arc<dyn MergeOperator>,
     /// Whether to keep the builtin columns in the output
     keep_builtin: bool,
+    /// Output schema and partitioning, computed once.
+    ///
+    /// The output schema is *not* the input schema when `keep_builtin` is
+    /// false: the merge drops the trailing builtin columns. Reporting the input
+    /// schema here makes a plan built on top of this one (a `UnionExec` for a
+    /// multi-segment scan) advertise columns its batches do not have.
+    cache: PlanProperties,
 }
 
 impl MergeExec {
@@ -115,13 +122,34 @@ impl MergeExec {
         value_operator: Arc<dyn MergeOperator>,
         keep_builtin: bool,
     ) -> Self {
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(merge_output_schema(input.schema(), keep_builtin)),
+            input.properties().output_partitioning().clone(),
+            input.properties().execution_mode,
+        );
         Self {
             input,
             num_primary_keys,
             value_operator,
             keep_builtin,
+            cache,
         }
     }
+}
+
+/// Schema a merged stream emits: the input schema without the builtin columns
+/// when the caller does not keep them. Builtin columns are always at the end.
+fn merge_output_schema(input: SchemaRef, keep_builtin: bool) -> SchemaRef {
+    if keep_builtin {
+        return input;
+    }
+    let fields = input
+        .fields()
+        .into_iter()
+        .take(input.fields().len() - BUILTIN_COLUMN_NUM)
+        .cloned()
+        .collect_vec();
+    Arc::new(Schema::new_with_metadata(fields, input.metadata().clone()))
 }
 impl DisplayAs for MergeExec {
     fn fmt_as(
@@ -148,7 +176,7 @@ impl ExecutionPlan for MergeExec {
     }
 
     fn properties(&self) -> &PlanProperties {
-        self.input.properties()
+        &self.cache
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -221,22 +249,7 @@ impl MergeStream {
             assert!(found_reserved, "Reserved column not found");
             schema
         } else {
-            let fields = stream
-                .schema()
-                .fields()
-                .into_iter()
-                .filter_map(|f| {
-                    if StorageSchema::is_builtin_field(f) {
-                        None
-                    } else {
-                        Some(f.clone())
-                    }
-                })
-                .collect_vec();
-            Arc::new(Schema::new_with_metadata(
-                fields,
-                stream.schema().metadata.clone(),
-            ))
+            merge_output_schema(stream.schema(), false)
         };
         Self {
             stream,
