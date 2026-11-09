@@ -61,6 +61,10 @@ pub struct MetricEngineConfig {
     pub segment_duration: ReadableDuration,
     pub threads: ThreadConfig,
     pub storage: StorageConfig,
+    /// Which index answers queries (ADR-0001 §12.5). Writes always dual-write
+    /// the legacy tables and the mergeset index, so this can be changed
+    /// without a backfill.
+    pub index_mode: IndexModeConfig,
 }
 
 impl Default for MetricEngineConfig {
@@ -69,6 +73,30 @@ impl Default for MetricEngineConfig {
             segment_duration: ReadableDuration::hours(12),
             threads: ThreadConfig::default(),
             storage: StorageConfig::default(),
+            index_mode: IndexModeConfig::default(),
+        }
+    }
+}
+
+/// Query-path index selection, mirroring `metric_engine::IndexMode`.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndexModeConfig {
+    /// Only the legacy inverted-index tables.
+    Legacy,
+    /// Only the month-partitioned mergeset index.
+    New,
+    /// Both, unioned; the default while a deployment migrates.
+    #[default]
+    DualRead,
+}
+
+impl From<IndexModeConfig> for metric_engine::IndexMode {
+    fn from(value: IndexModeConfig) -> Self {
+        match value {
+            IndexModeConfig::Legacy => metric_engine::IndexMode::Legacy,
+            IndexModeConfig::New => metric_engine::IndexMode::New,
+            IndexModeConfig::DualRead => metric_engine::IndexMode::DualRead,
         }
     }
 }

@@ -56,25 +56,31 @@ pub struct Sample {
 }
 
 impl Sample {
-    /// Canonical encoding of the series this sample belongs to:
-    /// `name + sorted label pairs`, with length prefixes to avoid ambiguity.
+    /// Canonical encoding of the series this sample belongs to.
     pub fn series_key(&self) -> Vec<u8> {
-        let mut labels = self.labels.iter().collect::<Vec<_>>();
-        labels.sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
-
-        let mut buf = Vec::new();
-        put_bytes(&mut buf, &self.name);
-        for label in labels {
-            put_bytes(&mut buf, &label.name);
-            put_bytes(&mut buf, &label.value);
-        }
-        buf
+        build_series_key(&self.name, &self.labels)
     }
 
     /// Series id is the hash of the canonical series key.
     pub fn series_id(&self) -> SeriesId {
         SeriesId(hash(&self.series_key()))
     }
+}
+
+/// Builds the canonical series key of a metric name and its labels.
+///
+/// Labels are sorted by `(name, value)` so the encoding is order-insensitive.
+pub fn build_series_key(name: &[u8], labels: &[Label]) -> Vec<u8> {
+    let mut labels = labels.iter().collect::<Vec<_>>();
+    labels.sort_by(|a, b| (&a.name, &a.value).cmp(&(&b.name, &b.value)));
+
+    let mut buf = Vec::new();
+    put_bytes(&mut buf, name);
+    for label in labels {
+        put_bytes(&mut buf, &label.name);
+        put_bytes(&mut buf, &label.value);
+    }
+    buf
 }
 
 pub fn hash(buf: &[u8]) -> u64 {

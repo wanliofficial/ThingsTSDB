@@ -34,7 +34,12 @@ use columnar_storage::{
 };
 
 use crate::{
-    data::SampleManager, index::IndexManager, metric::MetricManager, types::Sample, Result,
+    data::SampleManager,
+    index::IndexManager,
+    indexdb::{IndexDbManager, IndexMode, IndexQueryStats},
+    metric::MetricManager,
+    types::Sample,
+    Result,
 };
 
 pub type MetricEngineRef = Arc<MetricEngine>;
@@ -64,6 +69,10 @@ pub struct MetricEngine {
     pub(crate) metric: Arc<MetricManager>,
     pub(crate) index: Arc<IndexManager>,
     pub(crate) data: Arc<SampleManager>,
+    /// Month-partitioned mergeset index (ADR-0001 M5). Always written, so a
+    /// deployment can switch [`IndexMode`] without a backfill.
+    pub(crate) indexdb: Option<Arc<IndexDbManager>>,
+    pub(crate) index_mode: IndexMode,
 }
 
 impl MetricEngine {
@@ -73,6 +82,26 @@ impl MetricEngine {
         store: ObjectStoreRef,
         storage_opts: StorageConfig,
         runtimes: StorageRuntimes,
+    ) -> Result<Self> {
+        Self::try_open_with_index_mode(
+            root_path,
+            segment_duration,
+            store,
+            storage_opts,
+            runtimes,
+            IndexMode::default(),
+        )
+        .await
+    }
+
+    /// Opens the engine with an explicit index mode (ADR-0001 §12.5).
+    pub async fn try_open_with_index_mode(
+        root_path: &str,
+        segment_duration: Duration,
+        store: ObjectStoreRef,
+        storage_opts: StorageConfig,
+        runtimes: StorageRuntimes,
+        index_mode: IndexMode,
     ) -> Result<Self> {
         // Metadata tables are not TTL-evicted: their rows use write-time
         // timestamps and must survive data expiry.
@@ -135,10 +164,16 @@ impl MetricEngine {
         let metric = Arc::new(MetricManager::new(metric_storage));
         let index = Arc::new(IndexManager::new(series_storage, index_storage));
         let data = Arc::new(SampleManager::new(data_storage));
+        let indexdb = Arc::new(
+            IndexDbManager::open(root_path, Default::default())
+                .map_err(|e| anyhow::anyhow!("open indexdb: {e}"))?,
+        );
         let engine = Self {
             metric,
             index,
             data,
+            indexdb: Some(indexdb),
+            index_mode,
         };
         // Warm up caches so known metrics and series won't be re-persisted.
         engine.metric.load().await?;
@@ -149,14 +184,39 @@ impl MetricEngine {
     /// Write samples, the full pipeline is:
     /// 1. allocate metric ids for metric names;
     /// 2. allocate series ids for series keys and build the inverted index;
-    /// 3. persist all samples.
+    /// 3. register the series days in the month-partitioned indexDB;
+    /// 4. persist all samples.
     pub async fn write(&self, mut samples: Vec<Sample>) -> Result<()> {
         if samples.is_empty() {
             return Ok(());
         }
         self.metric.populate_metric_ids(&mut samples).await?;
         self.index.populate_series_ids(&mut samples).await?;
+        // Dual-write the mergeset index: it stays in sync while the legacy path
+        // is still authoritative, so switching modes never needs a backfill.
+        if let Some(indexdb) = &self.indexdb {
+            let indexdb = Arc::clone(indexdb);
+            let batch = samples.clone();
+            tokio::task::spawn_blocking(move || indexdb.register_samples(&batch))
+                .await
+                .map_err(|e| anyhow::anyhow!("indexdb write task: {e}"))??;
+        }
         self.data.persist(samples).await
+    }
+
+    /// The index mode this engine was opened with.
+    pub fn index_mode(&self) -> IndexMode {
+        self.index_mode
+    }
+
+    /// The month-partitioned indexDB, when enabled.
+    pub fn indexdb(&self) -> Option<&Arc<IndexDbManager>> {
+        self.indexdb.as_ref()
+    }
+
+    /// Query counters of the new index path (ADR-0001 §12.5).
+    pub fn index_stats(&self) -> Option<&IndexQueryStats> {
+        self.indexdb.as_ref().map(|db| db.stats())
     }
 
     /// Trigger compaction of all tables.

@@ -32,7 +32,9 @@ columnar_storage = { workspace = true }
 common = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
+regex = "1.13.1"
 seahash = { workspace = true }
+storage_kernel = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

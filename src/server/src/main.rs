@@ -176,10 +176,8 @@ async fn run_read_query(
         let matcher_type = match matcher.r#type() {
             PbMatcherType::Eq => MatcherType::Eq,
             PbMatcherType::Neq => MatcherType::Neq,
-            other => {
-                let msg = format!("matcher type {other:?} is not supported, only EQ/NEQ");
-                return Err(anyhow::anyhow!(msg).into());
-            }
+            PbMatcherType::Re => MatcherType::Re,
+            PbMatcherType::Nre => MatcherType::Nre,
         };
         if matcher.name == "__name__" {
             if matcher_type != MatcherType::Eq {
@@ -378,6 +376,7 @@ pub fn main() {
     };
     let storage_opts = config.metric_engine.storage.time_merge_storage;
     let segment_duration = config.metric_engine.segment_duration.0;
+    let index_mode = config.metric_engine.index_mode.into();
 
     let write_worker_num = config.test.write_worker_num;
     let write_interval = config.test.write_interval.0;
@@ -387,12 +386,13 @@ pub fn main() {
     let _ = rt.block_on(async move {
         let store = Arc::new(LocalFileSystem::new());
         let engine = Arc::new(
-            MetricEngine::try_open(
+            MetricEngine::try_open_with_index_mode(
                 &object_store_config.data_dir,
                 segment_duration,
                 store,
                 storage_opts,
                 runtimes,
+                index_mode,
             )
             .await
             .unwrap(),

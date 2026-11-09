@@ -17,9 +17,10 @@
 
 //! Query path, the counterpart of the write path:
 //!
-//! 1. resolve label matchers to a series id set via the inverted `index` table
-//!    (EQ) and subtraction (NEQ);
-//! 2. fetch series keys of the matched series from the `series` table;
+//! 1. resolve label matchers to a series id set via the month-partitioned
+//!    mergeset index (ADR-0001 §7), optionally unioned with the legacy inverted
+//!    `index` table while a deployment migrates;
+//! 2. fetch the labels of the matched series;
 //! 3. scan the `data` table by (metric_id, tsid, timestamp range);
 //! 4. group samples back into series.
 //!
@@ -36,19 +37,27 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::StreamExt;
+use storage_kernel::mergeset::tag_filter::TagMatcher;
 
 use crate::{
     data, index,
+    indexdb::IndexMode,
     metric::full_range,
-    types::{decode_series_key, Label},
+    types::{build_series_key, decode_series_key, Label},
     MetricEngine, Result,
 };
 
-/// Regex matchers (RE/NRE in Prometheus) are not supported yet.
+/// The label matcher types Prometheus remote read and PromQL use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatcherType {
+    /// `=`
     Eq,
+    /// `!=`
     Neq,
+    /// `=~`
+    Re,
+    /// `!~`
+    Nre,
 }
 
 #[derive(Debug, Clone)]
@@ -90,28 +99,120 @@ impl MetricEngine {
     pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SeriesSamples>> {
         let metric_id = crate::hash(&req.metric_name);
 
-        // Step 1: resolve matchers to a candidate series id set.
-        // `None` means "all series of this metric" so far.
-        let mut candidates: Option<HashSet<u64>> = None;
-        let mut eq_matchers = Vec::new();
-        let mut neq_matchers = Vec::new();
-        for matcher in &req.matchers {
-            match matcher.matcher_type {
-                MatcherType::Eq => eq_matchers.push(matcher),
-                MatcherType::Neq => neq_matchers.push(matcher),
+        // Step 1: resolve matchers to series id -> labels. The new index is
+        // authoritative once fully migrated; the legacy tables are still read
+        // in `DualRead` so data written before the switch stays visible.
+        let mut series: HashMap<u64, (Vec<u8>, Vec<Label>)> = HashMap::new();
+        let use_new = self.indexdb.is_some() && self.index_mode != IndexMode::Legacy;
+        let use_legacy = self.index_mode != IndexMode::New;
+
+        if use_new {
+            let indexdb = self.indexdb.as_ref().expect("checked above");
+            let found = indexdb.search(
+                &req.metric_name,
+                &tag_matchers(&req.matchers),
+                req.start_ms,
+                req.end_ms,
+            )?;
+            for (tsid, (name, tags)) in found {
+                let labels = tags
+                    .into_iter()
+                    .map(|(name, value)| Label { name, value })
+                    .collect();
+                series.insert(tsid, (name, labels));
             }
         }
-        for matcher in &eq_matchers {
-            let matched = self.lookup_index(metric_id, matcher).await?;
-            candidates = Some(match candidates {
-                None => matched,
-                Some(current) => current.intersection(&matched).copied().collect(),
-            });
+
+        if use_legacy {
+            let series_keys = self.fetch_series_keys(metric_id).await?;
+            let candidates = self
+                .resolve_legacy(metric_id, &req.matchers, &series_keys)
+                .await?;
+            for tsid in candidates {
+                if series.contains_key(&tsid) {
+                    continue;
+                }
+                let Some(key) = series_keys.get(&tsid) else {
+                    continue;
+                };
+                let (name, labels) = decode_series_key(key).context("decode series key")?;
+                series.insert(tsid, (name, labels));
+            }
+        }
+
+        // Step 2: scan data.
+        let candidates: HashSet<u64> = series.keys().copied().collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let samples_by_tsid = self
+            .scan_samples(metric_id, &candidates, req.start_ms, req.end_ms)
+            .await?;
+
+        // Step 3: assemble results, ordered by canonical series key for
+        // determinism.
+        let mut matched: Vec<(Vec<u8>, SeriesSamples)> = samples_by_tsid
+            .into_iter()
+            .filter_map(|(tsid, mut samples)| {
+                let (name, labels) = series.get(&tsid)?;
+                samples.sort_by_key(|s| s.timestamp);
+                let key = build_series_key(name, labels);
+                Some((
+                    key,
+                    SeriesSamples {
+                        metric_name: name.clone(),
+                        labels: labels.clone(),
+                        samples,
+                    },
+                ))
+            })
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(matched.into_iter().map(|(_, series)| series).collect())
+    }
+
+    /// Resolves matchers through the legacy inverted index. Regex matchers are
+    /// evaluated against the series labels, because the legacy index only
+    /// stores exact tag pairs.
+    async fn resolve_legacy(
+        &self,
+        metric_id: u64,
+        matchers: &[LabelMatcher],
+        series_keys: &HashMap<u64, Vec<u8>>,
+    ) -> Result<HashSet<u64>> {
+        let needs_scan = matchers
+            .iter()
+            .any(|m| matches!(m.matcher_type, MatcherType::Re | MatcherType::Nre));
+        if needs_scan {
+            let compiled = compile_matchers(matchers)?;
+            let mut out = HashSet::new();
+            for (tsid, key) in series_keys {
+                let (_, labels) = decode_series_key(key).context("decode series key")?;
+                if compiled.iter().all(|m| m.matches(&labels)) {
+                    out.insert(*tsid);
+                }
+            }
+            return Ok(out);
+        }
+
+        let mut candidates: Option<HashSet<u64>> = None;
+        let mut neq_matchers = Vec::new();
+        for matcher in matchers {
+            match matcher.matcher_type {
+                MatcherType::Eq => {
+                    let matched = self.lookup_index(metric_id, matcher).await?;
+                    candidates = Some(match candidates {
+                        None => matched,
+                        Some(current) => current.intersection(&matched).copied().collect(),
+                    });
+                }
+                MatcherType::Neq => neq_matchers.push(matcher),
+                MatcherType::Re | MatcherType::Nre => unreachable!("handled above"),
+            }
         }
         // NEQ matchers need the full series set to subtract from.
         if !neq_matchers.is_empty() && candidates.is_none() {
-            let all = self.fetch_all_tsids(metric_id).await?;
-            candidates = Some(all);
+            candidates = Some(series_keys.keys().copied().collect());
         }
         for matcher in &neq_matchers {
             let matched = self.lookup_index(metric_id, matcher).await?;
@@ -121,40 +222,7 @@ impl MetricEngine {
                 }
             }
         }
-
-        // Step 2: fetch series keys for label reconstruction.
-        let series_keys = self.fetch_series_keys(metric_id).await?;
-        let candidates = match candidates {
-            Some(set) => set,
-            None => series_keys.keys().copied().collect(),
-        };
-
-        // Step 3: scan data.
-        let samples_by_tsid = self
-            .scan_samples(metric_id, &candidates, req.start_ms, req.end_ms)
-            .await?;
-
-        // Step 4: assemble results, ordered by series key for determinism.
-        let mut matched: Vec<(Vec<u8>, u64, Vec<SamplePoint>)> = samples_by_tsid
-            .into_iter()
-            .filter_map(|(tsid, mut samples)| {
-                let series_key = series_keys.get(&tsid)?;
-                samples.sort_by_key(|s| s.timestamp);
-                Some((series_key.clone(), tsid, samples))
-            })
-            .collect();
-        matched.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut results = Vec::with_capacity(matched.len());
-        for (series_key, _, samples) in matched {
-            let (name, labels) = decode_series_key(&series_key).context("decode series key")?;
-            results.push(SeriesSamples {
-                metric_name: name,
-                labels,
-                samples,
-            });
-        }
-        Ok(results)
+        Ok(candidates.unwrap_or_else(|| series_keys.keys().copied().collect()))
     }
 
     /// Look up series ids matching one label pair from the inverted index.
@@ -174,22 +242,6 @@ impl MetricEngine {
             })
             .await?;
         collect_tsids(stream, index::TSID_COLUMN, self.index.index_storage()).await
-    }
-
-    /// All series ids of one metric, from the series table.
-    async fn fetch_all_tsids(&self, metric_id: u64) -> Result<HashSet<u64>> {
-        let stream = self
-            .index
-            .series_storage()
-            .scan(ScanRequest {
-                range: full_range(),
-                predicate: vec![
-                    col(index::METRIC_ID_COLUMN).eq(lit(ScalarValue::UInt64(Some(metric_id))))
-                ],
-                projections: None,
-            })
-            .await?;
-        collect_tsids(stream, index::TSID_COLUMN, self.index.series_storage()).await
     }
 
     /// Series id -> series key of one metric.
@@ -304,6 +356,84 @@ impl MetricEngine {
     }
 }
 
+/// Maps the engine matchers to the planner's canonical matchers.
+fn tag_matchers(matchers: &[LabelMatcher]) -> Vec<TagMatcher> {
+    matchers
+        .iter()
+        .map(|m| match m.matcher_type {
+            MatcherType::Eq => TagMatcher::Equal {
+                key: m.name.clone(),
+                value: m.value.clone(),
+            },
+            MatcherType::Neq => TagMatcher::NotEqual {
+                key: m.name.clone(),
+                value: m.value.clone(),
+            },
+            MatcherType::Re => TagMatcher::Re {
+                key: m.name.clone(),
+                regex: m.value.clone(),
+            },
+            MatcherType::Nre => TagMatcher::Nre {
+                key: m.name.clone(),
+                regex: m.value.clone(),
+            },
+        })
+        .collect()
+}
+
+/// A matcher compiled for the legacy path's in-memory series filter.
+enum LegacyMatcher {
+    Eq(Vec<u8>, Vec<u8>),
+    Neq(Vec<u8>, Vec<u8>),
+    Re(Vec<u8>, regex::bytes::Regex),
+    Nre(Vec<u8>, regex::bytes::Regex),
+}
+
+impl LegacyMatcher {
+    /// Evaluates the matcher against a series' labels.
+    ///
+    /// Prometheus semantics: a negative matcher also matches series that do
+    /// not carry the label at all.
+    fn matches(&self, labels: &[Label]) -> bool {
+        let name = match self {
+            LegacyMatcher::Eq(name, _)
+            | LegacyMatcher::Neq(name, _)
+            | LegacyMatcher::Re(name, _)
+            | LegacyMatcher::Nre(name, _) => name,
+        };
+        let value = labels.iter().find(|l| &l.name == name).map(|l| &l.value);
+        match self {
+            LegacyMatcher::Eq(_, want) => value.is_some_and(|v| v == want),
+            LegacyMatcher::Neq(_, want) => !value.is_some_and(|v| v == want),
+            LegacyMatcher::Re(_, re) => value.is_some_and(|v| re.is_match(v)),
+            LegacyMatcher::Nre(_, re) => !value.is_some_and(|v| re.is_match(v)),
+        }
+    }
+}
+
+fn compile_matchers(matchers: &[LabelMatcher]) -> Result<Vec<LegacyMatcher>> {
+    let mut out = Vec::with_capacity(matchers.len());
+    for m in matchers {
+        out.push(match m.matcher_type {
+            MatcherType::Eq => LegacyMatcher::Eq(m.name.clone(), m.value.clone()),
+            MatcherType::Neq => LegacyMatcher::Neq(m.name.clone(), m.value.clone()),
+            MatcherType::Re | MatcherType::Nre => {
+                let pattern = std::str::from_utf8(&m.value)
+                    .with_context(|| format!("matcher on {:?} is not UTF-8", m.name))?;
+                // Prometheus regexes are fully anchored.
+                let re = regex::bytes::Regex::new(&format!("^(?:{pattern})$"))
+                    .with_context(|| format!("invalid regex {pattern:?}"))?;
+                if m.matcher_type == MatcherType::Re {
+                    LegacyMatcher::Re(m.name.clone(), re)
+                } else {
+                    LegacyMatcher::Nre(m.name.clone(), re)
+                }
+            }
+        });
+    }
+    Ok(out)
+}
+
 async fn collect_tsids(
     mut stream: datafusion::execution::SendableRecordBatchStream,
     tsid_column: &str,
@@ -355,6 +485,27 @@ mod tests {
 
     async fn open_engine(root: &temp_dir::TempDir) -> MetricEngine {
         open_engine_with_opts(root, StorageConfig::default()).await
+    }
+
+    /// Opens an engine with an explicit index mode, so tests can compare the
+    /// legacy and mergeset paths on identical data.
+    async fn open_engine_with_mode(
+        root: &temp_dir::TempDir,
+        index_mode: IndexMode,
+    ) -> MetricEngine {
+        let store: ObjectStoreRef = Arc::new(LocalFileSystem::new());
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let runtimes = StorageRuntimes::new(rt.clone(), rt);
+        MetricEngine::try_open_with_index_mode(
+            &root.path().to_string_lossy(),
+            Duration::from_hours(2),
+            store,
+            StorageConfig::default(),
+            runtimes,
+            index_mode,
+        )
+        .await
+        .unwrap()
     }
 
     fn make_sample(name: &str, code: &str, job: &str, ts: i64, value: f64) -> crate::Sample {
@@ -506,6 +657,91 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].samples.len(), 1);
         assert_eq!(results[0].samples[0].timestamp, 20);
+    }
+
+    /// The mergeset index and the legacy inverted index must resolve the same
+    /// series for every matcher type, across the time range and label
+    /// reconstruction. This is the migration gate in ADR-0001 §12.5.
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_index_modes_agree_on_search_results() {
+        let legacy_root = temp_dir::TempDir::new().unwrap();
+        let new_root = temp_dir::TempDir::new().unwrap();
+        let legacy = open_engine_with_mode(&legacy_root, IndexMode::Legacy).await;
+        let new = open_engine_with_mode(&new_root, IndexMode::New).await;
+        prepare_data(&legacy).await;
+        prepare_data(&new).await;
+
+        // Flush both indexDBs so the comparison covers parts as well as the
+        // in-memory pending buffer. The legacy engine writes the mergeset too.
+        legacy.indexdb().unwrap().flush().unwrap();
+        new.indexdb().unwrap().flush().unwrap();
+
+        let cases: Vec<(&str, Vec<LabelMatcher>, i64, i64)> = vec![
+            ("m1", vec![], 0, 100),
+            ("m1", vec![matcher("code", "200", MatcherType::Eq)], 0, 100),
+            ("m1", vec![matcher("code", "200", MatcherType::Neq)], 0, 100),
+            ("m1", vec![matcher("job", "a.*", MatcherType::Re)], 0, 100),
+            ("m1", vec![matcher("job", "a.*", MatcherType::Nre)], 0, 100),
+            ("m1", vec![matcher("code", "2..", MatcherType::Re)], 20, 30),
+            (
+                "m1",
+                vec![
+                    matcher("code", "200", MatcherType::Eq),
+                    matcher("job", "api", MatcherType::Eq),
+                ],
+                0,
+                100,
+            ),
+            ("m2", vec![matcher("job", "db", MatcherType::Eq)], 0, 100),
+            ("m404", vec![], 0, 100),
+        ];
+
+        for (name, matchers, start, end) in cases {
+            let left = legacy
+                .search(&search_req(name, matchers.clone(), start, end))
+                .await
+                .unwrap();
+            let right = new
+                .search(&search_req(name, matchers.clone(), start, end))
+                .await
+                .unwrap();
+            assert_eq!(
+                render(&left),
+                render(&right),
+                "index modes disagree for {name} {matchers:?} [{start}, {end})"
+            );
+        }
+    }
+
+    /// A stable textual form of search results, for equality assertions.
+    fn render(results: &[SeriesSamples]) -> Vec<String> {
+        results
+            .iter()
+            .map(|series| {
+                let labels: Vec<String> = series
+                    .labels
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{}={}",
+                            String::from_utf8_lossy(&l.name),
+                            String::from_utf8_lossy(&l.value)
+                        )
+                    })
+                    .collect();
+                let samples: Vec<String> = series
+                    .samples
+                    .iter()
+                    .map(|s| format!("{}@{}", s.timestamp, s.value))
+                    .collect();
+                format!(
+                    "{}{{{}}} {}",
+                    String::from_utf8_lossy(&series.metric_name),
+                    labels.join(","),
+                    samples.join(",")
+                )
+            })
+            .collect()
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
