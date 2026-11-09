@@ -21,6 +21,14 @@
 //! The planner simplifies regexes, orders filters by cost, intersects the
 //! posting sets and applies the time range through the per-day rows.
 
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
+
 use crate::mergeset::{
     indexdb::{self, append_tag, composite_key, escape},
     series_id_set::SeriesIdSet,
@@ -286,6 +294,44 @@ impl PositiveFilter {
     }
 }
 
+/// Encodes the cache key of a positive filter.
+///
+/// The kind byte keeps equal/prefix/any-of/regex entries of the same key apart,
+/// and every variable-length field is length-prefixed so that `key="a",
+/// value="bc"` and `key="ab", value="c"` cannot collide.
+fn filter_cache_key(filter: &PositiveFilter) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + filter.key.len());
+    key.push(b'p');
+    key.extend_from_slice(&(filter.key.len() as u32).to_be_bytes());
+    key.extend_from_slice(&filter.key);
+    match &filter.kind {
+        PositiveKind::Equal(value) => {
+            key.push(b'=');
+            key.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            key.extend_from_slice(value);
+        }
+        PositiveKind::Prefix(prefix) => {
+            key.push(b'>');
+            key.extend_from_slice(&(prefix.len() as u32).to_be_bytes());
+            key.extend_from_slice(prefix);
+        }
+        PositiveKind::Regex(regex) => {
+            key.push(b'r');
+            key.extend_from_slice(&(regex.len() as u32).to_be_bytes());
+            key.extend_from_slice(regex);
+        }
+        PositiveKind::AnyOf(values) => {
+            key.push(b'a');
+            key.extend_from_slice(&(values.len() as u32).to_be_bytes());
+            for value in values {
+                key.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                key.extend_from_slice(value);
+            }
+        }
+    }
+    key
+}
+
 /// The namespace row lookups the resolver needs (ADR-0001 §4).
 ///
 /// Implemented over a live mergeset [`Table`](crate::mergeset::table::Table) in
@@ -297,19 +343,146 @@ pub trait RowSource {
     fn search_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, String>;
 }
 
+/// A budgeted, versioned cache of resolved posting sets (ADR-0001 §4.2).
+///
+/// A query materializes the metric-group row, the per-day series set and one
+/// posting set per filter. Those sets only grow when new rows are written, so
+/// they can be reused across queries as long as nothing changed: writes bump
+/// the version, and an entry is only returned while its version matches.
+///
+/// The budget counts retained IDs, not bytes (`8 * ids` bytes), and the cache
+/// is flushed when a new entry would exceed it.
+pub struct FilterCache {
+    version: AtomicU64,
+    inner: Mutex<CacheInner>,
+    budget_ids: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+#[derive(Default)]
+struct CacheInner {
+    retained: usize,
+    entries: HashMap<Vec<u8>, (u64, Arc<SeriesIdSet>)>,
+}
+
+/// Retained IDs kept by an indexDB cache by default (8 bytes each, so 64 MiB).
+pub const DEFAULT_CACHE_IDS: usize = 8 * 1024 * 1024;
+
+impl FilterCache {
+    pub fn new(budget_ids: usize) -> Self {
+        Self {
+            version: AtomicU64::new(0),
+            inner: Mutex::new(CacheInner::default()),
+            budget_ids,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// The current cache generation. A resolver snapshots it once and stamps
+    /// every entry it inserts, so a concurrent write makes the whole
+    /// generation stale in one atomic bump.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
+    /// Invalidates every entry. Called whenever new rows are written.
+    pub fn invalidate(&self) {
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Number of retained IDs, exposed for observability and tests.
+    pub fn retained_ids(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retained
+    }
+
+    fn get(&self, key: &[u8], version: u64) -> Option<Arc<SeriesIdSet>> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((entry_version, set)) = inner.entries.get(key) {
+            if *entry_version == version {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(Arc::clone(set));
+            }
+        }
+        // Drop the stale entry so a version bump never leaks memory.
+        if let Some((_, stale)) = inner.entries.remove(key) {
+            inner.retained = inner.retained.saturating_sub(stale.len());
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn put(&self, key: Vec<u8>, version: u64, set: Arc<SeriesIdSet>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.retained + set.len() > self.budget_ids {
+            inner.entries.clear();
+            inner.retained = 0;
+        }
+        if let Some((_, previous)) = inner.entries.insert(key, (version, set.clone())) {
+            inner.retained = inner.retained.saturating_sub(previous.len());
+        }
+        inner.retained += set.len();
+    }
+}
+
+impl Default for FilterCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_CACHE_IDS)
+    }
+}
+
 /// Resolves a plan against the rows of one indexDB (ADR-0001 §5).
 ///
 /// Every namespace is seeked by prefix: the metric-group row gives the cross-
 /// metric narrowing, the positive filters intersect their posting lists, the
 /// per-day set applies the time range and the negatives are subtracted last.
+/// An optional [`FilterCache`] reuses resolved sets across queries.
 pub struct IndexResolver<'a, S: ?Sized> {
     db: &'a S,
+    cache: Option<(&'a FilterCache, u64)>,
 }
 
 #[allow(clippy::needless_lifetimes)]
 impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
     pub fn new(db: &'a S) -> Self {
-        Self { db }
+        Self { db, cache: None }
+    }
+
+    /// Reuses posting-set resolutions through `cache`. The current cache
+    /// generation is snapshotted here, so one query sees one consistent view.
+    pub fn with_cache(mut self, cache: &'a FilterCache) -> Self {
+        self.cache = Some((cache, cache.version()));
+        self
+    }
+
+    /// Returns the cached set for `key`, or computes it and stores the result.
+    fn resolve_cached(
+        &self,
+        key: Vec<u8>,
+        compute: impl FnOnce() -> Result<SeriesIdSet, String>,
+    ) -> Result<Arc<SeriesIdSet>, String> {
+        if let Some((cache, version)) = self.cache {
+            if let Some(set) = cache.get(&key, version) {
+                return Ok(set);
+            }
+        }
+        let set = Arc::new(compute()?);
+        if let Some((cache, version)) = self.cache {
+            cache.put(key, version, Arc::clone(&set));
+        }
+        Ok(set)
     }
 
     /// Resolves the plan to the set of matching series IDs.
@@ -318,12 +491,12 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
         // The metric group narrows every namespace: ns1 postings are global,
         // so without it a filter would return series of other metrics.
         if let Some(group) = &plan.metric_group {
-            candidate = Some(self.group_postings(group)?);
+            candidate = Some((*self.group_postings(group)?).clone());
         }
         for filter in &plan.positives {
             let posting = self.lookup_positive(filter)?;
             candidate = Some(match candidate {
-                None => posting,
+                None => (*posting).clone(),
                 Some(acc) => SeriesIdSet::intersect(&acc, &posting),
             });
         }
@@ -334,7 +507,7 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
         } else {
             let mut per_day = SeriesIdSet::new();
             for &day in days {
-                per_day.extend_from(&self.day_series(day)?);
+                per_day.extend_from(self.day_series(day)?.as_ref());
             }
             Some(per_day)
         };
@@ -353,24 +526,32 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
         Ok(candidate)
     }
 
-    fn group_postings(&self, group: &[u8]) -> Result<SeriesIdSet, String> {
+    fn group_postings(&self, group: &[u8]) -> Result<Arc<SeriesIdSet>, String> {
         let prefix = indexdb::group_posting_row_prefix(group);
-        self.postings_exact(&prefix)
+        let mut key = Vec::with_capacity(1 + prefix.len());
+        key.push(b'e');
+        key.extend_from_slice(&prefix);
+        self.resolve_cached(key, || self.postings_exact(&prefix))
     }
 
-    fn day_series(&self, day: u64) -> Result<SeriesIdSet, String> {
+    fn day_series(&self, day: u64) -> Result<Arc<SeriesIdSet>, String> {
         let prefix = indexdb::date_series_prefix(day);
-        // A day set can have one row per series (before a flush collapses them)
-        // or one row for the whole day, so read every trailing ID.
-        let mut ids = Vec::new();
-        if let Ok(rows) = self.db.search_prefix(&prefix) {
-            for row in rows {
-                if let Some(row_ids) = indexdb::decode_date_series_ids(&prefix, &row) {
-                    ids.extend_from_slice(&row_ids);
+        let mut key = Vec::with_capacity(9);
+        key.push(b'd');
+        key.extend_from_slice(&day.to_be_bytes());
+        self.resolve_cached(key, || {
+            // A day set can have one row per series (before a flush collapses
+            // them) or one row for the whole day, so read every trailing ID.
+            let mut ids = Vec::new();
+            if let Ok(rows) = self.db.search_prefix(&prefix) {
+                for row in rows {
+                    if let Some(row_ids) = indexdb::decode_date_series_ids(&prefix, &row) {
+                        ids.extend_from_slice(&row_ids);
+                    }
                 }
             }
-        }
-        Ok(SeriesIdSet::from_ids(ids))
+            Ok(SeriesIdSet::from_ids(ids))
+        })
     }
 
     /// Reads the posting rows of a tag key and unions their IDs, optionally
@@ -413,8 +594,9 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
         Ok(SeriesIdSet::from_ids(ids))
     }
 
-    fn lookup_positive(&self, filter: &PositiveFilter) -> Result<SeriesIdSet, String> {
-        match &filter.kind {
+    fn lookup_positive(&self, filter: &PositiveFilter) -> Result<Arc<SeriesIdSet>, String> {
+        let cache_key = filter_cache_key(filter);
+        self.resolve_cached(cache_key, || match &filter.kind {
             PositiveKind::Equal(value) => {
                 let prefix = indexdb::posting_row_prefix(&filter.key, value);
                 self.postings_exact(&prefix)
@@ -442,24 +624,34 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
                 })?;
                 Ok(ids)
             }
-        }
+        })
     }
 
-    fn lookup_negative(&self, matcher: &TagMatcher) -> Result<SeriesIdSet, String> {
+    fn lookup_negative(&self, matcher: &TagMatcher) -> Result<Arc<SeriesIdSet>, String> {
         match matcher {
             TagMatcher::NotEqual { key, value } => {
                 let prefix = indexdb::posting_row_prefix(key, value);
-                self.postings_exact(&prefix)
+                let mut cache_key = Vec::with_capacity(1 + prefix.len());
+                cache_key.push(b'e');
+                cache_key.extend_from_slice(&prefix);
+                self.resolve_cached(cache_key, || self.postings_exact(&prefix))
             }
             TagMatcher::Nre { key, regex } => {
-                let Some(re) = compile_regex(regex) else {
-                    return Ok(SeriesIdSet::new());
-                };
-                let (_, ids) =
-                    self.postings(&indexdb::tag_key_prefix(key), |value| re.is_match(value))?;
-                Ok(ids)
+                let mut cache_key = Vec::with_capacity(2 + key.len() + regex.len());
+                cache_key.push(b'r');
+                cache_key.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                cache_key.extend_from_slice(key);
+                cache_key.extend_from_slice(regex);
+                self.resolve_cached(cache_key, || {
+                    let Some(re) = compile_regex(regex) else {
+                        return Ok(SeriesIdSet::new());
+                    };
+                    let (_, ids) =
+                        self.postings(&indexdb::tag_key_prefix(key), |value| re.is_match(value))?;
+                    Ok(ids)
+                })
             }
-            TagMatcher::Equal { .. } | TagMatcher::Re { .. } => Ok(SeriesIdSet::new()),
+            TagMatcher::Equal { .. } | TagMatcher::Re { .. } => Ok(Arc::new(SeriesIdSet::new())),
         }
     }
 }
@@ -783,5 +975,96 @@ mod tests {
         assert_eq!(tag_posting_key(b"job", b"api")[0], indexdb::ns::TAG);
         assert_eq!(composite_tag_key(b"foo", b"job")[1], 0xfe);
         assert_eq!(escape_value(b"a\x01b"), b"a\x00\x31b");
+    }
+
+    #[test]
+    fn test_filter_cache_key_is_collision_free() {
+        let split = PositiveFilter {
+            key: b"a".to_vec(),
+            kind: PositiveKind::Equal(b"bc".to_vec()),
+        };
+        let joined = PositiveFilter {
+            key: b"ab".to_vec(),
+            kind: PositiveKind::Equal(b"c".to_vec()),
+        };
+        assert_ne!(filter_cache_key(&split), filter_cache_key(&joined));
+
+        let same_key = [
+            PositiveKind::Equal(b"a".to_vec()),
+            PositiveKind::Prefix(b"a".to_vec()),
+            PositiveKind::Regex(b"a".to_vec()),
+            PositiveKind::AnyOf(vec![b"a".to_vec()]),
+        ];
+        let mut keys: Vec<Vec<u8>> = same_key
+            .into_iter()
+            .map(|kind| {
+                filter_cache_key(&PositiveFilter {
+                    key: b"k".to_vec(),
+                    kind,
+                })
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 4);
+    }
+
+    #[test]
+    fn test_filter_cache_counts_hits_and_misses() {
+        let cache = FilterCache::new(1024);
+        let set = Arc::new(SeriesIdSet::from_ids([1, 2, 3]));
+        assert!(cache.get(b"k", 0).is_none());
+        assert_eq!(cache.misses(), 1);
+        cache.put(b"k".to_vec(), 0, Arc::clone(&set));
+        let hit = cache.get(b"k", 0).expect("entry is live");
+        assert_eq!(hit.ids(), set.ids());
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.retained_ids(), 3);
+    }
+
+    #[test]
+    fn test_filter_cache_invalidates_on_version_bump() {
+        let cache = FilterCache::new(1024);
+        cache.put(b"k".to_vec(), 0, Arc::new(SeriesIdSet::from_ids([1, 2, 3])));
+        cache.invalidate();
+        assert_eq!(cache.version(), 1);
+        // The stale entry is neither returned nor retained.
+        assert!(cache.get(b"k", cache.version()).is_none());
+        assert_eq!(cache.retained_ids(), 0);
+        assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn test_filter_cache_evicts_when_over_budget() {
+        let cache = FilterCache::new(4);
+        cache.put(b"a".to_vec(), 0, Arc::new(SeriesIdSet::from_ids([1, 2])));
+        cache.put(b"b".to_vec(), 0, Arc::new(SeriesIdSet::from_ids([3, 4])));
+        assert_eq!(cache.retained_ids(), 4);
+        // The third set would exceed the budget, so the cache starts over.
+        cache.put(b"c".to_vec(), 0, Arc::new(SeriesIdSet::from_ids([5, 6])));
+        assert_eq!(cache.retained_ids(), 2);
+        assert!(cache.get(b"a", 0).is_none());
+        assert!(cache.get(b"c", 0).is_some());
+    }
+
+    #[test]
+    fn test_resolver_reuses_cached_sets() {
+        let rows = rows();
+        let cache = FilterCache::new(1024);
+        let plan = QueryPlan::from_matchers(&[name("http_requests"), eq("job", "api")]);
+        let first = IndexResolver::new(&rows)
+            .with_cache(&cache)
+            .resolve(&plan, &[20000])
+            .unwrap();
+        assert_eq!(first.ids(), &[1, 2]);
+        let misses = cache.misses();
+        let first = IndexResolver::new(&rows)
+            .with_cache(&cache)
+            .resolve(&plan, &[20000])
+            .unwrap();
+        assert_eq!(first.ids(), &[1, 2]);
+        // Metric group, `job=api` and day 20000 all came from the cache.
+        assert_eq!(cache.misses(), misses);
+        assert_eq!(cache.hits(), 3);
     }
 }

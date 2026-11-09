@@ -145,14 +145,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   indexDB），写出始终双写 legacy + mergeset；`IndexMode::{Legacy,New,DualRead}`
   默认双读，`try_open_with_index_mode` 可切换；query 双读合并，支持 `=`/`!=`/`=~`/`!~`；
   server 配置 `metric_engine.index_mode` 并接通 RE/NRE matcher。一致性测试：同一批
-  数据在 Legacy 与 New 下对空/eq/neq/re/nre/交集/越界查询结果完全一致。182 项
+  数据在 Legacy 与 New 下对空/eq/neq/re/nre/交集/越界查询结果完全一致。191 项
   storage_kernel 测试 + kill9 集成测试、14 项 metric_engine 测试通过。flush 时按 row key
   折叠 posting 行（`MAX_POSTING_IDS_PER_ROW=1024` 分片，保证单行小于 64 KiB block），
   regex 每 matcher 只编译一次；新增 `index_query_bench`：20 万序列 / 320 万行实测索引
-  51.8 B/序列（目标 <200）、写放大 1.46×（目标 <5×）、写入 ~1.99 万序列/s；Eq p99
-  27.9 ms、正则 p99 38.9 ms（20k 序列时 3.4/3.9 ms）。查询热点是每次查询都要物化并排序
-  metric group 与当日序列集合（O(指标/当日序列数)），10M 序列 p99<5ms 目标需要位图/缓存集合
-  表示，留待 Phase 3。剩余验收项：该集合优化、1000 万序列容量基准、同负载写入吞吐对比。
+  51.8 B/序列（目标 <200）、写放大 1.46×（目标 <5×）、写入 ~1.44 万序列/s。
+  查询侧新增 `FilterCache`（版本号失效 + 长度前缀 key + 按 retained IDs 计预算），
+  缓存 metric group、当日集合和每个过滤器的 posting 集合；同一基准 800 次查询
+  命中 2593 / 未命中 7（保留 78 万 IDs），Eq p99 从 27.9 ms 降到 3.3 ms（p50 0.50 ms），
+  两标签 Eq p99 8.4 ms，前缀/通用正则 p99 5.1/5.8 ms。剩余成本是缓存集合与当日
+  集合的线性交集（以及结果克隆），10M 序列 p99<5ms 目标仍需位图/roaring 表示，
+  留待 Phase 3。剩余验收项：位图集合、1000 万序列容量基准、同负载 legacy 写入吞吐对比。
 - TSID：24B 布局（metricGroupID/jobID/instanceID/metricID）或等价 u64+冲突检测；
   tsid→metric name/labels 持久化；tsid 缓存。
 - IndexDB：命名空间 tag→metricID、metricID→tsid、metricID→name、date metricName→tsid；

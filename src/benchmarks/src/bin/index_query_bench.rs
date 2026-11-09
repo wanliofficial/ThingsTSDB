@@ -180,6 +180,14 @@ fn main() {
         );
     }
 
+    let cache = db.cache();
+    println!(
+        "cache: hits={} misses={} retained_ids={}",
+        cache.hits(),
+        cache.misses(),
+        cache.retained_ids()
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

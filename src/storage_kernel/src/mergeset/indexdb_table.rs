@@ -44,7 +44,7 @@ use crate::mergeset::{
     part_manager::{ManagerConfig, MergeStats, PartManager},
     series_id_set::SeriesIdSet,
     table::Table,
-    tag_filter::{IndexResolver, QueryPlan, RowSource},
+    tag_filter::{FilterCache, IndexResolver, QueryPlan, RowSource},
     timeutil,
     wal::WalWriter,
 };
@@ -73,6 +73,7 @@ pub struct IndexDb {
     partition: u16,
     table: Arc<Mutex<Table>>,
     manager: Arc<PartManager>,
+    cache: FilterCache,
 }
 
 impl Drop for IndexDb {
@@ -118,6 +119,7 @@ impl IndexDb {
             partition,
             table,
             manager,
+            cache: FilterCache::default(),
         })
     }
 
@@ -133,6 +135,11 @@ impl IndexDb {
     /// Shared write-amplification and WAL counters.
     pub fn stats(&self) -> Arc<MergeStats> {
         self.manager.stats()
+    }
+
+    /// The posting-set cache shared by every query against this partition.
+    pub fn cache(&self) -> &FilterCache {
+        &self.cache
     }
 
     /// Registers one series and its data days (ADR-0001 §4, every namespace).
@@ -176,6 +183,9 @@ impl IndexDb {
         }
         let count = items.len();
         self.manager.write_index_items(items)?;
+        // The rows are searchable right away (pending buffer included), so the
+        // resolved sets of the previous generation are now incomplete.
+        self.cache.invalidate();
         Ok(count)
     }
 
@@ -198,7 +208,9 @@ impl IndexDb {
     /// constraint" and skips the ns5 intersection.
     pub fn search_series_ids(&self, plan: &QueryPlan, days: &[u64]) -> Result<SeriesIdSet, String> {
         let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
-        IndexResolver::new(&TableRows(&table)).resolve(plan, days)
+        IndexResolver::new(&TableRows(&table))
+            .with_cache(&self.cache)
+            .resolve(plan, days)
     }
 
     /// Alias matching the ADR's `indexdb.search_tsids` name.
@@ -590,5 +602,23 @@ mod tests {
         assert_eq!(all.len(), 20);
         // ns2 rows stay one per series.
         let _ = series_id_row;
+    }
+
+    #[test]
+    fn test_cache_invalidated_on_write() {
+        let (_root, db) = db();
+        db.write_series(1, b"m", &[(b"job", b"api")], &[10])
+            .unwrap();
+        let q = plan(&[eq("job", "api")]);
+        assert_eq!(db.search_series_ids(&q, &[10]).unwrap().ids(), &[1]);
+        let hits = db.cache().hits();
+        // The second read is served from the cache.
+        assert_eq!(db.search_series_ids(&q, &[10]).unwrap().ids(), &[1]);
+        assert!(db.cache().hits() > hits);
+        // A new series bumps the generation, so the stale sets are not reused
+        // and the query sees the new ID.
+        db.write_series(2, b"m", &[(b"job", b"api")], &[10])
+            .unwrap();
+        assert_eq!(db.search_series_ids(&q, &[10]).unwrap().ids(), &[1, 2]);
     }
 }
