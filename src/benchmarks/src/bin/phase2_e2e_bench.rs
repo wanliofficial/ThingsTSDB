@@ -268,6 +268,27 @@ async fn run_format(
         stats.bytes_written,
         stats.bytes_written as f64 / ds.rows() as f64,
     );
+    // The flush `write` stage is split into encode (CPU) and upload (object
+    // PUT) for TSF; the streaming Parquet writer cannot separate them.
+    let flush = storage.stats().flush;
+    if file_format == FileFormat::Tsf {
+        match flush.write_split() {
+            Some((encode, upload)) => println!(
+                "Flush write split: encode {:.0}% / upload {:.0}% ({} / {} ms of {} ms)",
+                encode * 100.0,
+                upload * 100.0,
+                flush.encode_millis,
+                flush.upload_millis,
+                flush.write_millis,
+            ),
+            None => println!(
+                "Flush write split: encode/upload too short to time (write {} ms)",
+                flush.write_millis
+            ),
+        }
+    } else {
+        println!("Flush write split: not reported (streaming writer)");
+    }
     if file_format == FileFormat::Tsf {
         // The size target is dominated by the value payload, so report what
         // each codec actually produced (ADR-0002 §4.4, §13).
