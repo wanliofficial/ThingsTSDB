@@ -125,6 +125,16 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `recover_from_disk` 从 `parts.json` 恢复并跳过损坏 part。含 crash/restart、并发 merger
   不重复 claim、`1 + merge_threads` 线程启动测试。写放大实测：1M 条 / 250 次 flush /
   22 次 merge 为 2.95×（目标 < 5×），`index_mergeset_bench` 可复现。
+- 已完成（M4，2026-11-09）：Arrow-free index WAL（`wal.rs`，帧头 magic/len/type/
+  partition/min_seq/max_seq/max_series_id/crc32c + varuint items 载荷，big-endian，
+  CRC-32C 校验，撕裂尾帧检测）、`WalWriter` 段写与 fsync、按大小轮转段；`Table` 序列
+  预留（`reserve_seq_range` 单调不重叠）与 flush 回调（失效 tag-filter 缓存）、
+  `flush`/`merge_all` 把序列范围写入 part 头（merge 取源并集，不产生覆盖空洞）；
+  `PartManager::write_index_items` 按 §6.1 先写 WAL+fsync 再缓冲、flush/merge 后
+  原子写 `parts.json` 并按帧级 `SeqIntervalSet` 覆盖检查回收 WAL 段、`recover_from_disk`
+  （冷启动无 `parts.json` 视为空）后 `replay_wal` 重放未覆盖帧。含真实
+  `kill -9` 集成测试：子进程写 500 帧后被 SIGKILL，父进程从存活的 WAL 恢复全部
+  item、无孤儿数据行。171 项测试通过。
 - TSID：24B 布局（metricGroupID/jobID/instanceID/metricID）或等价 u64+冲突检测；
   tsid→metric name/labels 持久化；tsid 缓存。
 - IndexDB：命名空间 tag→metricID、metricID→tsid、metricID→name、date metricName→tsid；

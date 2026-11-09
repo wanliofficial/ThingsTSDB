@@ -525,6 +525,10 @@ pub struct PartWriter {
     sealed: Vec<InmemoryBlock>,
     last_item: Option<Vec<u8>>,
     item_count: u64,
+    /// Index item sequence range covered by this part (ADR-0001 §6.3). `0..0`
+    /// means no tracked range.
+    min_seq: u64,
+    max_seq: u64,
 }
 
 impl PartWriter {
@@ -535,7 +539,16 @@ impl PartWriter {
             sealed: Vec::new(),
             last_item: None,
             item_count: 0,
+            min_seq: 0,
+            max_seq: 0,
         }
+    }
+
+    /// Stamps the part header with the index item sequence range `[min_seq,
+    /// max_seq]` so WAL reclamation can tell the part covers those frames.
+    pub fn set_seq_range(&mut self, min_seq: u64, max_seq: u64) {
+        self.min_seq = min_seq;
+        self.max_seq = max_seq;
     }
 
     pub fn add(&mut self, item: &[u8]) -> Result<(), String> {
@@ -651,8 +664,8 @@ impl PartWriter {
                     .as_deref()
                     .ok_or("part writer has no last item")?,
             ),
-            min_seq: 0,
-            max_seq: 0,
+            min_seq: self.min_seq,
+            max_seq: self.max_seq,
             max_series_id: 0,
         };
 
@@ -804,7 +817,13 @@ pub fn write_parts_json(indexdb_dir: &Path, part_dirs: &[&Path]) -> Result<(), S
 /// Reads and validates `parts.json`, returning the part directory names.
 pub fn read_parts_json(indexdb_dir: &Path) -> Result<Vec<String>, String> {
     let path = indexdb_dir.join(PARTS_FILE);
-    let bytes = fs::read(&path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        // A cold indexDB has no `parts.json` yet; treat it as an empty part
+        // set.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {path:?}: {e}")),
+    };
     let names: Vec<String> =
         serde_json::from_slice(&bytes).map_err(|e| format!("cannot parse {path:?}: {e}"))?;
     for pair in names.windows(2) {

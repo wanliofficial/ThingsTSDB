@@ -43,6 +43,7 @@ use crate::mergeset::{
     part::{Part, PartWriter},
     table::Table,
     table_search::TableSearch,
+    wal::{read_segments, reclaim_covered, WalFrame, WalWriter},
 };
 
 /// Tunables for the part manager. The ADR fixes the defaults (§3.6).
@@ -58,7 +59,15 @@ pub struct ManagerConfig {
     pub cached_part_threshold: u64,
     /// Number of file-merger threads (`max(cpus, 4)` by default, ADR §3.6).
     pub merge_threads: usize,
+    /// Fsync each index WAL frame after appending (ADR §6.1). Disable only when
+    /// the deployment accepts potential index/data divergence on crash.
+    pub wal_sync_on_write: bool,
+    /// Soft cap per WAL segment; a new segment is opened past this size.
+    pub max_wal_segment_bytes: u64,
 }
+
+/// Soft cap per index WAL segment before rotation.
+const MAX_WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Default for ManagerConfig {
     fn default() -> Self {
@@ -68,6 +77,8 @@ impl Default for ManagerConfig {
             small_part_compress_level: -5,
             cached_part_threshold: 1_000_000,
             merge_threads: default_merge_threads(),
+            wal_sync_on_write: true,
+            max_wal_segment_bytes: MAX_WAL_SEGMENT_BYTES,
         }
     }
 }
@@ -125,6 +136,7 @@ pub struct MergeStats {
     merges: AtomicU64,
     merge_input_bytes: AtomicU64,
     merge_output_bytes: AtomicU64,
+    wal_reclaimed: AtomicU64,
 }
 
 impl MergeStats {
@@ -143,6 +155,11 @@ impl MergeStats {
         self.merges.fetch_add(1, Ordering::Relaxed);
         self.merge_input_bytes.fetch_add(input, Ordering::Relaxed);
         self.merge_output_bytes.fetch_add(output, Ordering::Relaxed);
+    }
+
+    /// Records the number of WAL segments reclaimed after a part swap.
+    fn record_wal_reclaimed(&self, count: u64) {
+        self.wal_reclaimed.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Number of flushes that wrote a part.
@@ -170,6 +187,11 @@ impl MergeStats {
         self.merge_output_bytes.load(Ordering::Relaxed)
     }
 
+    /// Number of WAL segments reclaimed after part swaps.
+    pub fn wal_reclaimed(&self) -> u64 {
+        self.wal_reclaimed.load(Ordering::Relaxed)
+    }
+
     /// Write amplification: total bytes written (flush + merge output) divided
     /// by the bytes written by flushes alone. A steady-state LSM target is
     /// below 5x; the value is `0.0` before the first flush.
@@ -191,6 +213,12 @@ pub struct PartManager {
     stop: Arc<AtomicBool>,
     file_parts: Arc<Mutex<Vec<Part>>>,
     stats: Arc<MergeStats>,
+    /// Index WAL writer, when durable registration is enabled (ADR-0001 §6.2).
+    wal: Option<Arc<Mutex<WalWriter>>>,
+    /// Directory holding the WAL segments.
+    wal_dir: Option<PathBuf>,
+    /// Month partition id stamped into WAL frame headers.
+    partition_id: u64,
 }
 
 impl PartManager {
@@ -203,12 +231,76 @@ impl PartManager {
             stop: Arc::new(AtomicBool::new(false)),
             file_parts: Arc::new(Mutex::new(Vec::new())),
             stats: Arc::new(MergeStats::new()),
+            wal: None,
+            wal_dir: None,
+            partition_id: 0,
         }
     }
 
     /// Returns the write-amplification counters (shared with the loops).
     pub fn stats(&self) -> Arc<MergeStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Attaches an index WAL so writes are durable before they are searchable
+    /// and can be replayed after a crash (ADR-0001 §6.1/§6.2). `partition_id`
+    /// is the month partition stamped into every frame header.
+    pub fn with_wal(mut self, wal: WalWriter, wal_dir: PathBuf, partition_id: u64) -> Self {
+        self.wal = Some(Arc::new(Mutex::new(wal)));
+        self.wal_dir = Some(wal_dir);
+        self.partition_id = partition_id;
+        self
+    }
+
+    /// Appends `items` to the index WAL (fsynced) and then to the pending
+    /// buffer, following the durability ordering of ADR-0001 §6.1: a durable
+    /// data row may never reference an unrecoverable series id, so the index
+    /// WAL is written and fsynced **before** the items become searchable.
+    ///
+    /// Returns the reserved sequence range the frame was stamped with.
+    pub fn write_index_items(&self, items: Vec<Vec<u8>>) -> Result<(u64, u64), String> {
+        if items.is_empty() {
+            return Ok((0, 0));
+        }
+        let (min_seq, max_seq) = {
+            let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            table.reserve_seq_range(items.len() as u64)
+        };
+        if let Some(wal) = &self.wal {
+            let frame = WalFrame::new(self.partition_id, min_seq, max_seq, 0, items.clone());
+            let mut wal = wal.lock().unwrap_or_else(|e| e.into_inner());
+            // Rotate the segment before appending when it is already large, so
+            // a single segment is bounded and reclaimable in one piece.
+            if wal.bytes_written() > 0 && wal.bytes_written() >= MAX_WAL_SEGMENT_BYTES {
+                let old = std::mem::replace(
+                    &mut *wal,
+                    WalWriter::open(
+                        self.wal_dir.as_ref().expect("wal dir set with wal"),
+                        self.partition_id,
+                        self.config.wal_sync_on_write,
+                    )?,
+                );
+                old.finish()?;
+                wal.append(frame)?;
+            } else {
+                wal.append(frame)?;
+            }
+        }
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        table.add_items_with_seq_range(items, min_seq, max_seq);
+        Ok((min_seq, max_seq))
+    }
+
+    /// Reclaims WAL segments fully covered by the current file parts, then
+    /// re-evaluates after every part swap (ADR-0001 §6.3). No-op without a WAL.
+    fn reclaim_wal(&self) -> Result<(), String> {
+        let (Some(wal_dir), Some(_wal)) = (&self.wal_dir, &self.wal) else {
+            return Ok(());
+        };
+        let parts = self.file_parts();
+        let removed = reclaim_covered(wal_dir, &parts)?;
+        self.stats.record_wal_reclaimed(removed.len() as u64);
+        Ok(())
     }
 
     /// Allocates the next zero-padded part directory name.
@@ -251,6 +343,34 @@ impl PartManager {
         Ok(recovered)
     }
 
+    /// Replays index WAL frames that are not yet covered by a persisted part
+    /// (ADR-0001 §6.4 recovery ordering: parts first, then the remaining WAL).
+    /// Replayed items are appended to the pending buffer; a subsequent flush
+    /// makes them searchable. Replaying an already-covered frame is idempotent,
+    /// so the coverage check is an optimization.
+    ///
+    /// Returns the number of frames replayed. No-op without a WAL.
+    pub fn replay_wal(&self) -> Result<usize, String> {
+        let Some(wal_dir) = &self.wal_dir else {
+            return Ok(0);
+        };
+        let parts = self.file_parts();
+        let segments = read_segments(wal_dir, true)?;
+        let covered = crate::mergeset::wal::parts_covered_set(&parts);
+        let mut replayed = 0usize;
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        for segment in &segments {
+            for frame in &segment.frames {
+                if covered.covers(frame.min_seq, frame.max_seq) {
+                    continue;
+                }
+                table.add_items_with_seq_range(frame.items.clone(), frame.min_seq, frame.max_seq);
+                replayed += 1;
+            }
+        }
+        Ok(replayed)
+    }
+
     /// Returns the current file parts, sorted by first item.
     pub fn file_parts(&self) -> Vec<Part> {
         let mut parts = self
@@ -264,11 +384,12 @@ impl PartManager {
 
     /// Runs one flush cycle: writes pending items to a file part.
     pub fn flush_once(&self) -> Result<FlushOutcome, String> {
-        let pending = self
+        let (pending, min_seq, max_seq) = self
             .table
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take_pending();
+            .take_pending_with_seq()
+            .unwrap_or((Vec::new(), 0, 0));
         if pending.is_empty() {
             return Ok(FlushOutcome {
                 items_flushed: 0,
@@ -288,6 +409,7 @@ impl PartManager {
         let out = self.alloc_part_path("part");
         let part = {
             let mut writer = PartWriter::new(level);
+            writer.set_seq_range(min_seq, max_seq);
             for item in &pending {
                 writer.add(item)?;
             }
@@ -296,11 +418,20 @@ impl PartManager {
         let count = pending.len();
         let part_bytes = part.size;
         self.register_part(part);
-        {
-            let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
-            table.clear_pending();
-        }
         self.stats.record_flush(part_bytes);
+        // Persist the part list so recovery finds the flushed part. Written
+        // atomically (temp + rename + dir fsync) so a crash never leaves a torn
+        // parts.json (ADR-0001 §6.5).
+        let paths: Vec<PathBuf> = self
+            .file_parts()
+            .iter()
+            .map(|p| p.path().to_path_buf())
+            .collect();
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        crate::mergeset::part::write_parts_json(&self.dir, &refs)?;
+        // The flushed part now covers its sequence range, so WAL segments whose
+        // frames are all covered can be reclaimed (ADR-0001 §6.3).
+        let _ = self.reclaim_wal();
         Ok(FlushOutcome {
             items_flushed: count,
             file_parts: self
@@ -360,6 +491,16 @@ impl PartManager {
             let _ = std::fs::remove_dir_all(path);
         }
         self.stats.record_merge(input_bytes, output_bytes);
+        // Persist the updated part list (the merged part replaces its sources),
+        // then reclaim WAL segments the merged part now covers.
+        let paths: Vec<PathBuf> = self
+            .file_parts()
+            .iter()
+            .map(|p| p.path().to_path_buf())
+            .collect();
+        let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        crate::mergeset::part::write_parts_json(&self.dir, &refs)?;
+        let _ = self.reclaim_wal();
         Ok(MergeOutcome {
             merged_ids,
             input_bytes,
@@ -857,5 +998,115 @@ mod tests {
         // The corrupt part is skipped, not loaded.
         assert_eq!(pm2.recover_from_disk().unwrap(), 0);
         assert!(pm2.file_parts().is_empty());
+    }
+
+    fn wal_pm(table: Arc<Mutex<Table>>, dir: &TempDir, partition_id: u64) -> PartManager {
+        let wal_dir = dir.0.join("wal");
+        let wal = WalWriter::open(&wal_dir, partition_id, true).unwrap();
+        PartManager::new(table, &dir.0, ManagerConfig::default()).with_wal(
+            wal,
+            wal_dir,
+            partition_id,
+        )
+    }
+
+    #[test]
+    fn test_write_index_items_durable_before_searchable() {
+        let dir = TempDir::new();
+        let table = Arc::new(Mutex::new(Table::new()));
+        let pm = wal_pm(table.clone(), &dir, 202610);
+        let stats = pm.stats();
+
+        // Write items: they land in the pending buffer (not yet a searchable
+        // file part), but the WAL frame is already durable and fsynced.
+        let (min_seq, max_seq) = pm
+            .write_index_items(vec![b"metric{id=0}".to_vec(), b"metric{id=1}".to_vec()])
+            .unwrap();
+        assert!(min_seq >= 1 && max_seq >= min_seq);
+        assert_eq!(table.lock().unwrap().pending_len(), 2);
+        assert!(pm.file_parts().is_empty());
+        // The WAL segment exists on disk.
+        assert!(dir.0.join("wal").read_dir().unwrap().count() >= 1);
+        assert_eq!(stats.merges(), 0);
+
+        // After flush the item is searchable and the part records its seq
+        // range.
+        pm.flush_once().unwrap();
+        let parts = pm.file_parts();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].header().min_seq, min_seq);
+        assert_eq!(parts[0].header().max_seq, max_seq);
+    }
+
+    #[test]
+    fn test_wal_reclaimed_after_flush_covers_range() {
+        let dir = TempDir::new();
+        let table = Arc::new(Mutex::new(Table::new()));
+        let pm = wal_pm(table, &dir, 202610);
+
+        pm.write_index_items(vec![b"metric{id=0}".to_vec()])
+            .unwrap();
+        // The WAL segment exists before the flush covers it.
+        let segments_before = read_segments(dir.0.join("wal"), false).unwrap();
+        assert_eq!(segments_before.len(), 1);
+        assert_eq!(segments_before[0].frames.len(), 1);
+
+        pm.flush_once().unwrap();
+
+        // The flushed part covers the frame's range, so the segment is
+        // reclaimed.
+        assert_eq!(pm.stats().wal_reclaimed(), 1);
+        let segments_after = read_segments(dir.0.join("wal"), false).unwrap();
+        assert!(
+            segments_after.is_empty(),
+            "covered segment should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_replay_wal_restores_unflushed_items() {
+        let dir = TempDir::new();
+        // "First process": write items to the WAL but never flush.
+        {
+            let table = Arc::new(Mutex::new(Table::new()));
+            let pm = wal_pm(table, &dir, 202610);
+            for i in 0..50 {
+                pm.write_index_items(vec![format!("metric{{id={i:08}}}").into_bytes()])
+                    .unwrap();
+            }
+            // No flush: every frame must be replayed on recovery.
+        }
+        // "Second process": recover parts (none) then replay the WAL.
+        let table = Arc::new(Mutex::new(Table::new()));
+        let pm = wal_pm(table.clone(), &dir, 202610);
+        assert_eq!(pm.recover_from_disk().unwrap(), 0);
+        let replayed = pm.replay_wal().unwrap();
+        assert_eq!(replayed, 50);
+        assert_eq!(table.lock().unwrap().pending_len(), 50);
+        // Flush makes them searchable.
+        pm.flush_once().unwrap();
+        assert_eq!(count_items(&pm.file_parts()), 50);
+    }
+
+    #[test]
+    fn test_replay_skips_frames_already_covered_by_part() {
+        let dir = TempDir::new();
+        // Write + flush so a part covers the range. flush_once reclaims the
+        // WAL, so the frame is gone — covered by the part, nothing to replay.
+        // This models a crash after the flush: recovery finds the part and no
+        // WAL.
+        let table = Arc::new(Mutex::new(Table::new()));
+        let pm = wal_pm(table, &dir, 202610);
+        pm.write_index_items(vec![b"metric{id=0}".to_vec()])
+            .unwrap();
+        pm.flush_once().unwrap();
+        let segments = read_segments(dir.0.join("wal"), false).unwrap();
+        assert!(segments.is_empty(), "flush reclaimed the covered segment");
+
+        // A fresh manager finds the part and replays nothing.
+        let table2 = Arc::new(Mutex::new(Table::new()));
+        let pm2 = wal_pm(table2, &dir, 202610);
+        assert_eq!(pm2.recover_from_disk().unwrap(), 1);
+        assert_eq!(pm2.replay_wal().unwrap(), 0, "covered frame not replayed");
     }
 }

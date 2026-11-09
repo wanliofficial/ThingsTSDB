@@ -1,6 +1,6 @@
 # ADR-0001: Mergeset LSM Index and TSID-Based Series Identity
 
-- Status: Partially implemented (M1, M2, M3)
+- Status: Partially implemented (M1, M2, M3, M4)
 - Date: 2026-10-28
 - Implemented: 2026-11-09 (M1 part layout and search; see §12.1)
 - Related: `docs/roadmap.md`, `docs/rfcs/20240827-metric-engine.md`, `docs/3high-design.md`
@@ -717,7 +717,7 @@ ported (Graphite, PromQL, cluster code) are not copied.
 | ~~M1~~ | `encoding`, `inmemory_block`, block marshal/unmarshal, part read/write, single-table search | round-trip and fuzz tests; golden byte layouts |
 | ~~M2~~ | TSID, namespaces, row merge callback, tag-filter planner, regex simplification | Eq/Neq/Re/Nre integration tests; 10M-row posting intersection benchmark |
 | ~~M3~~ | in-memory parts, merge selection, background workers, block caches | merge policy unit tests; crash/restart test; write amplification measured |
-| M4 | index WAL, segment coverage tracking, recovery ordering, periodic flush callback | kill -9 tests; no orphaned data rows; WAL reclamation verified |
+| ~~M4~~ | index WAL, segment coverage tracking, recovery ordering, periodic flush callback | kill -9 tests; no orphaned data rows; WAL reclamation verified |
 | M5 | `metric_engine` integration, dual-read, config switch, metrics | end-to-end query parity with legacy; throughput and p99 benchmarks |
 
 Acceptance targets from the roadmap:
@@ -819,6 +819,44 @@ Done, in `storage_kernel::mergeset`:
   (target < 5x) at ~391k items/s on this machine. A small 160k-item run is
   1.98x. The 10M-series scale run remains for the capacity test but the
   steady-state ratio is flat, so the M3 acceptance metric is closed.
+
+## 12.4 Implementation status (2026-11-09)
+
+Done, in `storage_kernel::mergeset`:
+
+- `wal.rs` is the Arrow-free index WAL (ADR-0001 §6.2). A frame is
+  `magic(4) | len(4) | frame_type(1) | partition_id(8) | min_seq(8) | max_seq(8)
+  | max_series_id(8) | crc32c(4)` then a `varuint(count) + items` payload, all
+  integers big-endian and the checksum covering the header (minus the checksum
+  field) plus the payload. `WalWriter` appends frames to `wal-{seq}.iwal`,
+  fsyncs each frame when `sync_on_write` is set, and rotates past
+  `max_wal_segment_bytes`. `read_segments` decodes every segment and treats a
+  torn tail frame (short header/payload or a checksum mismatch) as the tail,
+  truncating it when asked.
+- `Table` gained sequence tracking: `reserve_seq_range(n)` hands out a
+  monotonic, non-overlapping range before the WAL append; `add_items_with_seq_range`
+  buffers items with their union range; `set_flush_callback` registers the flush
+  callback that invalidates the tag-filter cache once items become searchable.
+  `flush` and `merge_all` stamp the part header with the range (merge takes the
+  union of its sources, so merging never creates a coverage hole).
+- `PartWriter::set_seq_range` fills `PartHeader.min_seq/max_seq`, which is what
+  the reclamation coverage check reads.
+- `PartManager::with_wal` attaches a WAL; `write_index_items` reserves a range,
+  appends the frame to the WAL and fsyncs it, then buffers the items — the
+  durability ordering of §6.1. After every flush and merge the manager persists
+  `parts.json` atomically and calls `reclaim_wal`, which deletes segments whose
+  frames are all covered by persisted parts using the per-frame
+  `SeqIntervalSet` coverage check (§6.3). `recover_from_disk` (cold start, no
+  `parts.json` is an empty set) then `replay_wal` re-apply uncovered frames
+  (§6.4); replaying a covered frame is a safe no-op.
+- Tests: 6 WAL frame/codec tests (round trip, checksum rejection, torn tail,
+  writer read-back, interval merge, replay-all-when-uncovered), 4 `Table`
+  tests (flush stamps seq range, flush callback fires, monotonic reservation,
+  merge union range), 5 manager WAL tests (durable-before-searchable, reclaim
+  after flush, replay restores unflushed items, covered frames skipped, cold
+  start), and the `index_wal_kill9` integration test: a child writes 500 index
+  frames, prints `READY`, is SIGKILLed, and the parent recovers every item from
+  the surviving WAL with no orphaned data rows.
 
 ## 13. Observability
 

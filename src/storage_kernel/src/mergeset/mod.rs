@@ -37,3 +37,4 @@ pub mod series_id_set;
 pub mod table;
 pub mod table_search;
 pub mod tag_filter;
+pub mod wal;
