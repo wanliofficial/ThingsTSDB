@@ -268,8 +268,8 @@ async fn run_format(
         stats.bytes_written,
         stats.bytes_written as f64 / ds.rows() as f64,
     );
-    // The flush `write` stage is split into encode (CPU) and upload (object
-    // PUT) for TSF; the streaming Parquet writer cannot separate them.
+    // The flush `write` stage is split into encode (all CPU work) and upload
+    // (object PUT) for TSF; the streaming Parquet writer cannot separate them.
     let flush = storage.stats().flush;
     if file_format == FileFormat::Tsf {
         match flush.write_split() {

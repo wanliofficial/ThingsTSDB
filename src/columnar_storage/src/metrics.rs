@@ -169,7 +169,8 @@ pub struct FlushStages {
     pub sort: Duration,
     /// Encoding and uploading the segment files.
     pub write: Duration,
-    /// CPU part of `write`: Arrow conversion, page encoding, header read-back.
+    /// CPU part of `write`: Arrow conversion, UTC-day grouping, page encoding
+    /// and header read-back.
     pub encode: Duration,
     /// Object-store PUT part of `write`.
     pub upload: Duration,
@@ -247,8 +248,9 @@ pub struct FlushStats {
     pub sort_millis: u64,
     /// Time spent encoding and uploading files.
     pub write_millis: u64,
-    /// CPU part of `write_millis`: Arrow conversion, page encoding and header
-    /// read-back. Always zero for the Parquet writer (see [`FlushStages`]).
+    /// CPU part of `write_millis`: Arrow conversion, UTC-day grouping, page
+    /// encoding and header read-back. Always zero for the Parquet writer (see
+    /// [`FlushStages`]).
     pub encode_millis: u64,
     /// Object-store PUT part of `write_millis`. Always zero for Parquet.
     pub upload_millis: u64,

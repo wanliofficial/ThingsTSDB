@@ -197,14 +197,15 @@ fewer bytes but is not proportionally faster, because page encoding is CPU-bound
 the predictive codec at five orders before choosing.
 
 **The TSF flush is encode-bound, not upload-bound.** The benchmark now prints the flush
-`write` split (`FlushStats::encode_millis` / `upload_millis`). On a small two-day run,
-encoding — Arrow conversion, page encoding and header read-back — takes ~96% of the
-`write` stage and the object PUT about 1%, with the rest being per-segment bookkeeping.
-That matches the 6.8x-smaller-file observation above: the format has already removed the
-bytes, so the remaining cost is the CPU that produces them. It also means a remote object
-store changes the upload share far more than the total on this laptop; the split makes
-that visible instead of hiding it inside one `write` number. The Parquet path reports
-zero for both, because its streaming writer interleaves page encoding with the PUT.
+`write` split (`FlushStats::encode_millis` / `upload_millis`). Encoding — Arrow conversion,
+UTC-day grouping, page encoding and header read-back — accounts for essentially the whole
+`write` stage. On the full 30-day gauge run the object PUT was 43 ms of the 5,167 ms
+`write` stage (~1%); the rest is CPU. That matches the 6.8x-smaller-file observation
+above: the format has already removed the bytes, so the remaining cost is the CPU that
+produces them. It also means a remote object store changes the upload share far more than
+the total on this laptop; the split makes that visible instead of hiding it inside one
+`write` number. The Parquet path reports zero for both, because its streaming writer
+interleaves page encoding with the PUT.
 
 **Size is shape-dependent, and the gauge now passes.** On the noisy gauge, TSF is 6.8x
 smaller than Parquet (2.46 vs 16.71 B/sample): the value payload went from 7.14 to

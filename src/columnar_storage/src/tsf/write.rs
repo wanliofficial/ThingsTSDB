@@ -198,9 +198,10 @@ pub fn day_partition(time_range: &TimeRange) -> crate::Result<(i64, i64)> {
 
 /// Wall time spent inside the TSF write path.
 ///
-/// `encode` is CPU work (Arrow conversion, page encoding, header read-back);
-/// `upload` is the object-store PUT. Keeping them apart tells an operator
-/// whether a slow flush is a codec problem or a network problem.
+/// `encode` is all CPU work (Arrow conversion, UTC-day grouping, page encoding,
+/// header read-back); `upload` is the object-store PUT. Keeping them apart
+/// tells an operator whether a slow flush is a codec problem or a network
+/// problem.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct WriteTimings {
     pub encode: std::time::Duration,
@@ -232,10 +233,11 @@ pub(crate) async fn write_batches_by_day(
                 .map_err(|e| anyhow::anyhow!("convert batch to TSF rows: {e}"))?,
         );
     }
+    let days = split_rows_by_day(rows, time_range)?;
     timings.encode += encode_started.elapsed();
 
     let mut out = Vec::new();
-    for (day, day_rows) in split_rows_by_day(rows, time_range)? {
+    for (day, day_rows) in days {
         let file_id = crate::sst::SstFile::allocate_id();
         let (file, written) = write_rows(store, path_gen, file_id, day_rows, &day).await?;
         timings.encode += written.encode;
