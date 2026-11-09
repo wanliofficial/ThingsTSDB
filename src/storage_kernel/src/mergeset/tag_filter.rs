@@ -183,16 +183,20 @@ fn split_alternation(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Compiles a regex under Prometheus full-match semantics (`^(?:expr)$`).
+///
+/// The planner compiles once per matcher and reuses the handle across every
+/// value of a tag key; compiling inside the per-value closure made a regex
+/// filter compile one regex per row.
+pub fn compile_regex(regex: &[u8]) -> Option<regex::bytes::Regex> {
+    let pattern = std::str::from_utf8(regex).ok()?;
+    regex::bytes::Regex::new(&format!("^(?:{pattern})$")).ok()
+}
+
 /// Tests whether `value` matches the regex under Prometheus full-match
 /// semantics (`^(?:expr)$`). Used as the fallback when simplification fails.
 pub fn regex_matches(regex: &[u8], value: &[u8]) -> bool {
-    let Ok(pattern) = std::str::from_utf8(regex) else {
-        return false;
-    };
-    let Ok(re) = regex::bytes::Regex::new(&format!("^(?:{pattern})$")) else {
-        return false;
-    };
-    re.is_match(value)
+    compile_regex(regex).is_some_and(|re| re.is_match(value))
 }
 
 /// A compiled positive filter the planner can seek directly.
@@ -356,13 +360,13 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
 
     fn day_series(&self, day: u64) -> Result<SeriesIdSet, String> {
         let prefix = indexdb::date_series_prefix(day);
-        // A day set can have one row per series, so the prefix scan is the only
-        // way to read it; the rows are `[ns][date][seriesID]`.
+        // A day set can have one row per series (before a flush collapses them)
+        // or one row for the whole day, so read every trailing ID.
         let mut ids = Vec::new();
         if let Ok(rows) = self.db.search_prefix(&prefix) {
             for row in rows {
-                if let Some((_, id)) = indexdb::decode_date_series_row(&row) {
-                    ids.push(id);
+                if let Some(row_ids) = indexdb::decode_date_series_ids(&prefix, &row) {
+                    ids.extend_from_slice(&row_ids);
                 }
             }
         }
@@ -430,8 +434,11 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
                 Ok(ids)
             }
             PositiveKind::Regex(regex) => {
+                let Some(re) = compile_regex(regex) else {
+                    return Ok(SeriesIdSet::new());
+                };
                 let (_, ids) = self.postings(&indexdb::tag_key_prefix(&filter.key), |value| {
-                    regex_matches(regex, value)
+                    re.is_match(value)
                 })?;
                 Ok(ids)
             }
@@ -445,9 +452,11 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
                 self.postings_exact(&prefix)
             }
             TagMatcher::Nre { key, regex } => {
-                let (_, ids) = self.postings(&indexdb::tag_key_prefix(key), |value| {
-                    regex_matches(regex, value)
-                })?;
+                let Some(re) = compile_regex(regex) else {
+                    return Ok(SeriesIdSet::new());
+                };
+                let (_, ids) =
+                    self.postings(&indexdb::tag_key_prefix(key), |value| re.is_match(value))?;
                 Ok(ids)
             }
             TagMatcher::Equal { .. } | TagMatcher::Re { .. } => Ok(SeriesIdSet::new()),

@@ -102,11 +102,9 @@ impl IndexDb {
             config.manager.wal_sync_on_write,
         )?;
         let manager = Arc::new(
-            PartManager::new(Arc::clone(&table), &dir, config.manager).with_wal(
-                wal,
-                wal_dir,
-                u64::from(partition),
-            ),
+            PartManager::new(Arc::clone(&table), &dir, config.manager)
+                .with_wal(wal, wal_dir, u64::from(partition))
+                .with_row_merger(Arc::new(indexdb::collapse_posting_items)),
         );
         manager.recover_from_disk()?;
         manager.replay_wal()?;
@@ -184,6 +182,14 @@ impl IndexDb {
     /// Makes the pending rows searchable immediately (tests, read-your-writes).
     pub fn flush(&self) -> Result<usize, String> {
         Ok(self.manager.flush_once()?.items_flushed)
+    }
+
+    /// Runs one merge cycle and reports whether a merge happened.
+    ///
+    /// Background loops do this on their own; tests and benchmarks that disable
+    /// the workers call it directly to reach the merged steady state.
+    pub fn merge_once(&self) -> Result<bool, String> {
+        Ok(self.manager.merge_once()?.merged)
     }
 
     /// Resolves a query plan to the matching series IDs (ADR-0001 §5, §7).

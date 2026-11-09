@@ -69,6 +69,14 @@ pub struct ManagerConfig {
 /// Soft cap per index WAL segment before rotation.
 const MAX_WAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Rewrites the sorted pending rows of one flush into the rows of the new part.
+///
+/// An indexDB uses this to collapse the per-value posting rows of many series
+/// into one row per value (ADR-0001 §3.7), so a prefix or regex filter scans
+/// one row per distinct value instead of one row per series. The merger must
+/// keep the result sorted and deduplicated.
+pub type RowMerger = Arc<dyn Fn(Vec<Vec<u8>>) -> Vec<Vec<u8>> + Send + Sync>;
+
 impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
@@ -219,6 +227,8 @@ pub struct PartManager {
     wal_dir: Option<PathBuf>,
     /// Month partition id stamped into WAL frame headers.
     partition_id: u64,
+    /// Optional row collapser applied to the sorted flush output.
+    row_merger: Option<RowMerger>,
 }
 
 impl PartManager {
@@ -234,12 +244,21 @@ impl PartManager {
             wal: None,
             wal_dir: None,
             partition_id: 0,
+            row_merger: None,
         }
     }
 
     /// Returns the write-amplification counters (shared with the loops).
     pub fn stats(&self) -> Arc<MergeStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Installs a row collapser for flush output (ADR-0001 §3.7). The indexDB
+    /// passes one that unions the posting rows of a value, turning one row per
+    /// series into one row per value.
+    pub fn with_row_merger(mut self, merger: RowMerger) -> Self {
+        self.row_merger = Some(merger);
+        self
     }
 
     /// Attaches an index WAL so writes are durable before they are searchable
@@ -447,6 +466,11 @@ impl PartManager {
         // list, so sort and dedup before handing the items to the writer.
         pending.sort_unstable();
         pending.dedup();
+        // Collapse duplicate posting rows (same tag pair, different series) so
+        // the part holds one row per value, not one row per series.
+        if let Some(merger) = &self.row_merger {
+            pending = merger(pending);
+        }
         let level = if (pending.len() as u64) < self.config.cached_part_threshold {
             self.config.small_part_compress_level
         } else {

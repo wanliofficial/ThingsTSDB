@@ -401,6 +401,20 @@ pub fn decode_date_series_row(row: &[u8]) -> Option<(u64, u64)> {
     Some((date, series_id))
 }
 
+/// Decodes the series IDs that follow a namespace 5 prefix.
+///
+/// A flushed day row holds every series of that day in one row
+/// (`[ns][date][seriesID]*`); a row that was not collapsed still holds one ID,
+/// which this decoder returns as a one-element vector.
+pub fn decode_date_series_ids(prefix: &[u8], row: &[u8]) -> Option<Vec<u64>> {
+    let rest = row.strip_prefix(prefix)?;
+    if rest.is_empty() || rest.len() % 8 != 0 {
+        return None;
+    }
+    let (chunks, _) = rest.as_chunks::<8>();
+    Some(chunks.iter().map(|c| u64::from_be_bytes(*c)).collect())
+}
+
 /// The marshaled TSID size (ADR-0001 §2.2).
 pub const TSID_LEN: usize = 24;
 
@@ -512,6 +526,124 @@ fn marshal_var_uint64(dst: &mut Vec<u8>, mut v: u64) {
 /// canonical encoding of `prefix`.
 pub fn key_starts_with_canonical(key: &[u8], prefix: &[u8]) -> bool {
     key.starts_with(prefix)
+}
+
+/// Collapses the posting rows of a sorted item list into one row per value.
+///
+/// Ingestion writes one posting row per series (`code=200` for every series
+/// that carries it). Rows with the same tag pair (or the same day) sort next
+/// to each other, so one linear pass can union their series IDs. The result is
+/// what a flush writes: a prefix or regex filter then scans one row per
+/// distinct value instead of one row per series (ADR-0001 §3.7).
+///
+/// Non-posting namespaces are passed through untouched; the input must be
+/// sorted and deduplicated.
+pub fn collapse_posting_items(items: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(items.len());
+    // Current group: the row key (namespace + escaped key/value) and its IDs.
+    let mut group: Option<(Vec<u8>, Vec<u64>)> = None;
+    for row in items {
+        let Some(key_len) = posting_row_key_len(&row) else {
+            if let Some((key, ids)) = group.take() {
+                push_posting_rows(&mut out, &key, ids);
+            }
+            out.push(row);
+            continue;
+        };
+        let key = &row[..key_len];
+        let ids = decode_ids(&row[key_len..]);
+        match group.as_mut() {
+            Some((current, current_ids)) if current.as_slice() == key => {
+                current_ids.extend_from_slice(&ids);
+            }
+            _ => {
+                if let Some((key, ids)) = group.take() {
+                    push_posting_rows(&mut out, &key, ids);
+                }
+                group = Some((key.to_vec(), ids));
+            }
+        }
+    }
+    if let Some((key, ids)) = group.take() {
+        push_posting_rows(&mut out, &key, ids);
+    }
+    out
+}
+
+/// Largest number of IDs kept in one posting row. A part block is capped at
+/// 64 KiB, so a day with millions of series must be split over several rows
+/// that share the same key. Readers concatenate them.
+pub const MAX_POSTING_IDS_PER_ROW: usize = 1024;
+
+fn push_posting_rows(out: &mut Vec<Vec<u8>>, key: &[u8], mut ids: Vec<u64>) {
+    ids.sort_unstable();
+    ids.dedup();
+    for chunk in ids.chunks(MAX_POSTING_IDS_PER_ROW) {
+        let mut row = Vec::with_capacity(key.len() + chunk.len() * 8);
+        row.extend_from_slice(key);
+        for id in chunk {
+            row.extend_from_slice(&id.to_be_bytes());
+        }
+        out.push(row);
+    }
+}
+
+fn decode_ids(src: &[u8]) -> Vec<u64> {
+    let (chunks, rest) = src.as_chunks::<8>();
+    debug_assert!(
+        rest.is_empty(),
+        "posting row id suffix is not 8-byte aligned"
+    );
+    chunks.iter().map(|c| u64::from_be_bytes(*c)).collect()
+}
+
+/// The length of the row key of a posting row: everything before its fixed
+/// width series IDs. Returns `None` for namespaces that store single values.
+fn posting_row_key_len(row: &[u8]) -> Option<usize> {
+    let ns = *row.first()?;
+    let (start, tag_terminated) = match ns {
+        // `tagKey 0x02 tagValue 0x01 seriesID*`
+        ns::TAG => (1, true),
+        // `date(8B) tagKey 0x02 tagValue 0x01 seriesID*`
+        ns::DATE_TAG => (9, true),
+        // `date(8B) seriesID*`
+        ns::DATE_SERIES => (9, false),
+        _ => return None,
+    };
+    let key_len = if tag_terminated {
+        tag_row_key_len(row, start)?
+    } else {
+        start
+    };
+    if key_len >= row.len() || (row.len() - key_len) % 8 != 0 {
+        return None;
+    }
+    Some(key_len)
+}
+
+/// The end of `tagKey 0x02 tagValue 0x01` starting at `start`.
+fn tag_row_key_len(row: &[u8], start: usize) -> Option<usize> {
+    // Key terminates at KV_SEP; escaped bytes are `0x00 next`.
+    let mut i = start;
+    while i < row.len() {
+        match row[i] {
+            0x00 => i += 2,
+            KV_SEP => {
+                i += 1;
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    // Value terminates at TAG_SEP.
+    while i < row.len() {
+        match row[i] {
+            0x00 => i += 2,
+            TAG_SEP => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -661,5 +793,83 @@ mod tests {
                 .chain(42u64.to_be_bytes())
                 .collect::<Vec<u8>>()
         );
+    }
+
+    #[test]
+    fn test_collapse_posting_items_unions_ids_per_value() {
+        let tsid = Tsid::build(b"http_requests", &[]);
+        let mut items = vec![
+            tag_posting_row(b"code", b"200", &[7]),
+            tag_posting_row(b"code", b"200", &[3]),
+            tag_posting_row(b"code", b"404", &[9]),
+            tag_posting_row(b"job", b"api", &[1]),
+            tag_posting_row(b"job", b"api", &[2]),
+            metric_name_row(b"http_requests", &tsid),
+        ];
+        items.extend(date_series_rows(20000, &[5]));
+        items.extend(date_series_rows(20000, &[6]));
+        items.sort_unstable();
+        items.dedup();
+
+        let collapsed = collapse_posting_items(items);
+        let mut expected = vec![
+            tag_posting_row(b"code", b"200", &[3, 7]),
+            tag_posting_row(b"code", b"404", &[9]),
+            tag_posting_row(b"job", b"api", &[1, 2]),
+            metric_name_row(b"http_requests", &tsid),
+        ];
+        // The day rows of both series collapse into one row with two IDs.
+        let mut day_row = vec![ns::DATE_SERIES];
+        day_row.extend_from_slice(&20000u64.to_be_bytes());
+        day_row.extend_from_slice(&5u64.to_be_bytes());
+        day_row.extend_from_slice(&6u64.to_be_bytes());
+        expected.push(day_row);
+        expected.sort_unstable();
+
+        assert_eq!(collapsed, expected);
+        // One row per value, not one row per series.
+        assert_eq!(collapsed.len(), expected.len());
+    }
+
+    #[test]
+    fn test_collapse_splits_rows_past_the_block_cap() {
+        let mut items: Vec<Vec<u8>> = (1..=MAX_POSTING_IDS_PER_ROW as u64 + 500)
+            .map(|id| tag_posting_row(b"code", b"200", &[id]))
+            .collect();
+        items.sort_unstable();
+        let collapsed = collapse_posting_items(items);
+        // 1524 IDs do not fit one row: two rows share the key and together
+        // carry every ID exactly once.
+        assert_eq!(collapsed.len(), 2);
+        let mut ids = Vec::new();
+        for row in &collapsed {
+            assert!(row.len() <= 65_536, "row must fit a part block");
+            let key_len = posting_row_key_len(row).unwrap();
+            ids.extend(decode_ids(&row[key_len..]));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 1_524);
+        assert_eq!(ids.first(), Some(&1));
+        assert_eq!(ids.last(), Some(&1_524));
+    }
+
+    #[test]
+    fn test_collapse_keeps_escaped_values_distinct() {
+        // Values containing the separators are escaped, so their row keys stay
+        // distinct and must not be merged together.
+        let mut items = vec![
+            tag_posting_row(b"path", b"a\x01b", &[1]),
+            tag_posting_row(b"path", b"a\x01b", &[2]),
+            tag_posting_row(b"path", b"a\x02b", &[3]),
+        ];
+        items.sort_unstable();
+        let collapsed = collapse_posting_items(items);
+        assert_eq!(collapsed.len(), 2);
+        let mut expected = vec![
+            tag_posting_row(b"path", b"a\x01b", &[1, 2]),
+            tag_posting_row(b"path", b"a\x02b", &[3]),
+        ];
+        expected.sort_unstable();
+        assert_eq!(collapsed, expected);
     }
 }

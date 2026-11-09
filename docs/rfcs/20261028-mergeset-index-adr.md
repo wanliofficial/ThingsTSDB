@@ -896,13 +896,46 @@ Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
 - `src/server` reads `metric_engine.index_mode` (`legacy` | `new` |
   `dual-read`) and maps `EQ`/`NEQ`/`RE`/`NRE` remote-read matchers
   (`__name__` still requires `EQ`).
-- Tests: 182 `storage_kernel` lib tests + the `index_wal_kill9` integration
+- Flush collapses posting rows: ingestion writes one ns1/ns5/ns6 row per
+  series, and `PartManager::with_row_merger` now unions the IDs of the same row
+  key (`collapse_posting_items`), splitting at
+  `MAX_POSTING_IDS_PER_ROW = 1024` so a row fits a 64 KiB block. A prefix or
+  regex filter scans one row per distinct value instead of one row per series
+  (the naive shape made a regex query compile one regex per row and take
+  2.3 s at 20k series). `IndexDb::merge_once` drives the same steady state for
+  tests and benchmarks that disable the workers.
+- Tests: 185 `storage_kernel` lib tests + the `index_wal_kill9` integration
   test, and 14 `metric_engine` tests, including the migration gate: identical
   data served in `Legacy` and `New` mode must return identical results for
   empty, Eq, Neq, Re, Nre, intersected and out-of-range queries.
-- Remaining for the acceptance targets: the 10M-series memory/p99 capacity run
-  and a write-throughput comparison against the legacy path on the same
-  workload. Query parity and the config switch are closed.
+
+Measured (`cargo run --release -p benchmarks --bin index_query_bench --
+200000 800`, 200k series on one day, 3.2M index rows, 10 flushes merged into
+one part, WAL fsync disabled):
+
+| Metric | Value | Target |
+|---|---|---|
+| on-disk index size | 51.8 B/series | < 200 B/series ✅ |
+| write amplification | 1.46x | < 5x ✅ |
+| write throughput | ~19.9k series/s, 318k rows/s | — |
+| Eq exact p50/p99 | 21.2 / 27.9 ms | < 5 ms ❌ |
+| Eq two tags p50/p99 | 41.8 / 52.1 ms | < 5 ms ❌ |
+| Regex (prefix) p50/p99 | 120.5 / 139.8 ms | < 5 ms ❌ |
+| Regex (general) p50/p99 | 31.4 / 38.9 ms | < 5 ms ❌ |
+
+The bottleneck is not the part search: the resolver materializes and sorts the
+metric-group set (`ns1`, one row per metric) and the per-day series set
+(`ns5`) on every query, so query cost scales with the number of series in the
+metric/day rather than with the number of matched series. At 20k series the
+same run is 3.4 ms (Eq), 13.2 ms (prefix) and 3.9 ms (general regex) after the
+row collapse and the single-pass regex compile. The 10M-series p99 target needs
+a cheaper set representation (roaring/bitmap day sets or a cached series set per
+metric and day) and is deferred to the Phase 3 execution work.
+
+- Remaining for the acceptance targets: the bitmap/cached set representation
+  above, the 10M-series capacity run and a write-throughput comparison against
+  the legacy path on the same workload. Query parity, the config switch and the
+  index-size/write-amplification targets are closed.
 
 ## 13. Observability
 
