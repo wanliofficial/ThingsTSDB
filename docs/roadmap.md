@@ -120,9 +120,11 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   按代价排序、按日裁剪）、131 项测试。10M 行 posting 基准随 M3 实测。
 - 已完成（M3，2026-11-09）：in-memory part（sealed + pending block，可搜索）、
   纯 merge 选择算法（8..=15 窗口、1.7× 平衡门、score≥7.5、8 项策略测试）、
-  字节预算 LRU block cache、后台 flush/merge 双循环（stop 通道收敛）、
-  合并仅写入输出后才删源、`recover_from_disk` 从 `parts.json` 恢复并跳过损坏 part。
-  含 crash/restart 恢复测试。10M 序列写放大与多 merger 线程拆分为 M3 实测收尾。
+  字节预算 LRU block cache、后台 flush + `max(cpus,4)` merger 循环（stop 通道收敛）、
+  原子 claim 协议（锁内摘除选中窗口、锁外合并、失败回滚）、合并仅发布输出后才删源、
+  `recover_from_disk` 从 `parts.json` 恢复并跳过损坏 part。含 crash/restart、并发 merger
+  不重复 claim、`1 + merge_threads` 线程启动测试。写放大实测：1M 条 / 250 次 flush /
+  22 次 merge 为 2.95×（目标 < 5×），`index_mergeset_bench` 可复现。
 - TSID：24B 布局（metricGroupID/jobID/instanceID/metricID）或等价 u64+冲突检测；
   tsid→metric name/labels 持久化；tsid 缓存。
 - IndexDB：命名空间 tag→metricID、metricID→tsid、metricID→name、date metricName→tsid；

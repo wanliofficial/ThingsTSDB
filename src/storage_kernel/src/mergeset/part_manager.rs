@@ -32,7 +32,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -56,6 +56,8 @@ pub struct ManagerConfig {
     pub small_part_compress_level: i32,
     /// The item count above which a part bypasses the page cache.
     pub cached_part_threshold: u64,
+    /// Number of file-merger threads (`max(cpus, 4)` by default, ADR §3.6).
+    pub merge_threads: usize,
 }
 
 impl Default for ManagerConfig {
@@ -65,8 +67,17 @@ impl Default for ManagerConfig {
             merge_interval: std::time::Duration::from_secs(1),
             small_part_compress_level: -5,
             cached_part_threshold: 1_000_000,
+            merge_threads: default_merge_threads(),
         }
     }
+}
+
+/// `max(cpus, 4)` merger threads as fixed by ADR-0001 §3.6.
+fn default_merge_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(4)
 }
 
 /// Outcome of one flush cycle.
@@ -85,10 +96,90 @@ pub struct FlushOutcome {
 pub struct MergeOutcome {
     /// The part ids that were merged, when a merge ran.
     pub merged_ids: Vec<usize>,
+    /// Bytes read from the merged sources.
+    pub input_bytes: u64,
     /// Bytes written to the output part.
     pub output_bytes: u64,
     /// Whether a merge ran.
     pub merged: bool,
+}
+
+impl MergeOutcome {
+    /// The outcome of a cycle that found nothing to merge.
+    fn skipped() -> Self {
+        Self {
+            merged_ids: Vec::new(),
+            input_bytes: 0,
+            output_bytes: 0,
+            merged: false,
+        }
+    }
+}
+
+/// Counters for the flush and merge loops, used to measure write
+/// amplification (ADR-0001 §3.6). All fields are monotonic.
+#[derive(Debug, Default)]
+pub struct MergeStats {
+    flushes: AtomicU64,
+    flush_bytes: AtomicU64,
+    merges: AtomicU64,
+    merge_input_bytes: AtomicU64,
+    merge_output_bytes: AtomicU64,
+}
+
+impl MergeStats {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one flush that wrote `bytes` to a file part.
+    fn record_flush(&self, bytes: u64) {
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        self.flush_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Records one merge that read `input` bytes and wrote `output` bytes.
+    fn record_merge(&self, input: u64, output: u64) {
+        self.merges.fetch_add(1, Ordering::Relaxed);
+        self.merge_input_bytes.fetch_add(input, Ordering::Relaxed);
+        self.merge_output_bytes.fetch_add(output, Ordering::Relaxed);
+    }
+
+    /// Number of flushes that wrote a part.
+    pub fn flushes(&self) -> u64 {
+        self.flushes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes written by flushes (the baseline for write amplification).
+    pub fn flush_bytes(&self) -> u64 {
+        self.flush_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Number of completed merges.
+    pub fn merges(&self) -> u64 {
+        self.merges.load(Ordering::Relaxed)
+    }
+
+    /// Bytes read from merge sources.
+    pub fn merge_input_bytes(&self) -> u64 {
+        self.merge_input_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes written by merges.
+    pub fn merge_output_bytes(&self) -> u64 {
+        self.merge_output_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Write amplification: total bytes written (flush + merge output) divided
+    /// by the bytes written by flushes alone. A steady-state LSM target is
+    /// below 5x; the value is `0.0` before the first flush.
+    pub fn write_amplification(&self) -> f64 {
+        let base = self.flush_bytes() as f64;
+        if base == 0.0 {
+            return 0.0;
+        }
+        (self.flush_bytes() + self.merge_output_bytes()) as f64 / base
+    }
 }
 
 /// Drives the flush and merge loops for one indexDB.
@@ -99,6 +190,7 @@ pub struct PartManager {
     next_part_id: Arc<Mutex<u64>>,
     stop: Arc<AtomicBool>,
     file_parts: Arc<Mutex<Vec<Part>>>,
+    stats: Arc<MergeStats>,
 }
 
 impl PartManager {
@@ -110,7 +202,13 @@ impl PartManager {
             next_part_id: Arc::new(Mutex::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             file_parts: Arc::new(Mutex::new(Vec::new())),
+            stats: Arc::new(MergeStats::new()),
         }
+    }
+
+    /// Returns the write-amplification counters (shared with the loops).
+    pub fn stats(&self) -> Arc<MergeStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Allocates the next zero-padded part directory name.
@@ -196,11 +294,13 @@ impl PartManager {
             writer.finish(&out)?
         };
         let count = pending.len();
+        let part_bytes = part.size;
         self.register_part(part);
         {
             let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
             table.clear_pending();
         }
+        self.stats.record_flush(part_bytes);
         Ok(FlushOutcome {
             items_flushed: count,
             file_parts: self
@@ -212,58 +312,57 @@ impl PartManager {
         })
     }
 
-    /// Runs one merge cycle: selects and merges a window of file parts.
+    /// Runs one merge cycle: claims a window of file parts, merges them, and
+    /// publishes the output.
+    ///
+    /// The window is selected **and removed** from the file-part set under one
+    /// lock, so several merger threads can run concurrently without ever
+    /// selecting the same part twice. The merge itself runs outside the lock.
+    /// If it fails, the claimed sources are put back unchanged.
     pub fn merge_once(&self) -> Result<MergeOutcome, String> {
-        let parts = self.file_parts();
-        if parts.len() < 8 {
-            return Ok(MergeOutcome {
-                merged_ids: Vec::new(),
-                output_bytes: 0,
-                merged: false,
-            });
-        }
-        let candidates: Vec<MergeCandidate> = parts
-            .iter()
-            .map(|p| MergeCandidate {
-                id: part_identity(p),
-                size: p.size,
-            })
-            .collect();
-        // Candidates must be sorted by ascending size for the policy.
-        let mut sorted_idx: Vec<usize> = (0..candidates.len()).collect();
-        sorted_idx.sort_by_key(|&i| candidates[i].size);
-        let sorted: Vec<MergeCandidate> = sorted_idx.iter().map(|&i| candidates[i]).collect();
-        let Selection::Merge(window) = select_parts_to_merge(&sorted) else {
-            return Ok(MergeOutcome {
-                merged_ids: Vec::new(),
-                output_bytes: 0,
-                merged: false,
-            });
+        let claimed = {
+            let mut file_parts = self.file_parts.lock().unwrap_or_else(|e| e.into_inner());
+            let claimed = claim_merge_window(&mut file_parts);
+            if claimed.len() < 2 {
+                // Nothing claimed: put back anything we removed defensively.
+                file_parts.extend(claimed);
+                return Ok(MergeOutcome::skipped());
+            }
+            claimed
         };
-        // Map selected ids back to their parts.
-        let selected: Vec<Part> = window
-            .iter()
-            .filter_map(|c| parts.iter().find(|p| part_identity(p) == c.id).cloned())
-            .collect();
-        if selected.len() < 2 {
-            return Ok(MergeOutcome {
-                merged_ids: Vec::new(),
-                output_bytes: 0,
-                merged: false,
-            });
-        }
         let out = self.alloc_part_path("merged");
-        let merged = merge_parts(&selected, &out, self.config.small_part_compress_level)?;
+        let compressed_level = compress_level_for(&claimed, &self.config);
+        let merged = match merge_parts(&claimed, &out, compressed_level) {
+            Ok(part) => part,
+            Err(err) => {
+                // Roll back: the sources were never deleted, only claimed.
+                self.file_parts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(claimed);
+                return Err(err);
+            }
+        };
+        let input_bytes: u64 = claimed.iter().map(|p| p.size).sum();
         let output_bytes = merged.size;
-        let merged_ids: Vec<usize> = selected.iter().map(part_identity).collect();
-        // Remove the sources only after the output is fully written.
+        let merged_ids: Vec<usize> = claimed.iter().map(part_identity).collect();
+        // Publish the output and drop the sources from the manager's set. The
+        // source directories are only deleted once the output is registered.
         {
             let mut file_parts = self.file_parts.lock().unwrap_or_else(|e| e.into_inner());
-            file_parts.retain(|p| !selected.iter().any(|s| s.path() == p.path()));
             file_parts.push(merged);
         }
+        for part in &claimed {
+            let path = part.path();
+            // Files are still open in `part`; drop the handle first on Unix it
+            // does not matter, but be explicit and remove after the merge is
+            // fully published.
+            let _ = std::fs::remove_dir_all(path);
+        }
+        self.stats.record_merge(input_bytes, output_bytes);
         Ok(MergeOutcome {
             merged_ids,
+            input_bytes,
             output_bytes,
             merged: true,
         })
@@ -278,31 +377,35 @@ impl PartManager {
         self.stop.load(Ordering::Relaxed)
     }
 
-    /// Spawns the flush and merge loops on background threads. Returns the
-    /// join handles; joining a loop ends when `stop()` is called.
+    /// Spawns the flush loop and `merge_threads` merger loops on background
+    /// threads. Returns the join handles; joining a loop ends when `stop()` is
+    /// called.
     ///
     /// Takes `&Arc<Self>` so the loop closures hold a real shared handle to the
     /// manager rather than a stack reconstruction.
     pub fn spawn(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
-        let flush = spawn_loop(
-            "indexdb-flush",
+        let mut handles = Vec::with_capacity(1 + self.config.merge_threads);
+        handles.push(spawn_loop(
+            "indexdb-flush".to_string(),
             self.config.flush_interval,
             self.stop.clone(),
             {
                 let this = Arc::clone(self);
                 move || this.flush_once().map(|_| ())
             },
-        );
-        let merge = spawn_loop(
-            "indexdb-merge",
-            self.config.merge_interval,
-            self.stop.clone(),
-            {
-                let this = Arc::clone(self);
-                move || this.merge_once().map(|_| ())
-            },
-        );
-        vec![flush, merge]
+        ));
+        for n in 0..self.config.merge_threads {
+            handles.push(spawn_loop(
+                format!("indexdb-merge-{n}"),
+                self.config.merge_interval,
+                self.stop.clone(),
+                {
+                    let this = Arc::clone(self);
+                    move || this.merge_once().map(|_| ())
+                },
+            ));
+        }
+        handles
     }
 }
 
@@ -315,6 +418,53 @@ fn part_identity(part: &Part) -> usize {
     let mut hasher = DefaultHasher::new();
     part.path().hash(&mut hasher);
     hasher.finish() as usize
+}
+
+/// Selects a merge window and removes it from `file_parts` (the claim).
+///
+/// Returns the claimed parts, or an empty vector when the policy found no
+/// window worth merging. The caller merges the claimed parts outside the lock
+/// and either publishes the output or puts the claim back on failure.
+fn claim_merge_window(file_parts: &mut Vec<Part>) -> Vec<Part> {
+    if file_parts.len() < 8 {
+        return Vec::new();
+    }
+    let candidates: Vec<MergeCandidate> = file_parts
+        .iter()
+        .map(|p| MergeCandidate {
+            id: part_identity(p),
+            size: p.size,
+        })
+        .collect();
+    // Candidates must be sorted by ascending size for the policy.
+    let mut sorted: Vec<MergeCandidate> = candidates;
+    sorted.sort_by_key(|c| c.size);
+    let Selection::Merge(window) = select_parts_to_merge(&sorted) else {
+        return Vec::new();
+    };
+    let wanted: Vec<usize> = window.iter().map(|c| c.id).collect();
+    // Partition: keep the unselected parts, return the selected ones.
+    let mut claimed = Vec::with_capacity(wanted.len());
+    let mut keep = Vec::with_capacity(file_parts.len() - wanted.len());
+    for part in file_parts.drain(..) {
+        if wanted.contains(&part_identity(&part)) {
+            claimed.push(part);
+        } else {
+            keep.push(part);
+        }
+    }
+    *file_parts = keep;
+    claimed
+}
+
+/// Picks the zstd level for merged output from the source item count.
+fn compress_level_for(sources: &[Part], config: &ManagerConfig) -> i32 {
+    let items: u64 = sources.iter().map(|p| p.item_count).sum();
+    if items < config.cached_part_threshold {
+        config.small_part_compress_level
+    } else {
+        3
+    }
 }
 
 /// Merges the given parts into one, streaming items through a k-way search.
@@ -331,7 +481,7 @@ fn merge_parts(sources: &[Part], out: &Path, compress_level: i32) -> Result<Part
 /// string on failure, which is dropped here (the loops are best-effort; a
 /// failed cycle does not abort the index).
 fn spawn_loop<F>(
-    name: &str,
+    name: String,
     interval: std::time::Duration,
     stop: Arc<AtomicBool>,
     work: F,
@@ -339,7 +489,6 @@ fn spawn_loop<F>(
 where
     F: Fn() -> Result<(), String> + Send + 'static,
 {
-    let name = name.to_string();
     thread::Builder::new()
         .name(name)
         .spawn(move || {
@@ -467,6 +616,177 @@ mod tests {
         // Only a few parts: below the merge window minimum.
         let outcome = pm.merge_once().unwrap();
         assert!(!outcome.merged);
+    }
+
+    /// Writes `n` parts of `items_per_part` items each, in disjoint id ranges,
+    /// and returns the item total.
+    fn seed_parts(pm: &PartManager, dir: &Path, n: u32, items_per_part: u32) -> usize {
+        for part_no in 0..n {
+            let mut writer = PartWriter::new(1);
+            for i in 0..items_per_part {
+                let id = part_no * items_per_part + i;
+                writer
+                    .add(format!("metric{{id={id:08}}}").as_bytes())
+                    .unwrap();
+            }
+            let path = dir.join(format!("seed-{part_no:04}"));
+            pm.register_part(writer.finish(path).unwrap());
+        }
+        (n * items_per_part) as usize
+    }
+
+    fn count_items(parts: &[Part]) -> usize {
+        let mut search = TableSearch::new(parts, None).unwrap();
+        let mut count = 0;
+        while search.next_item().unwrap().is_some() {
+            count += 1;
+        }
+        count
+    }
+
+    #[test]
+    fn test_stats_record_flush_and_merge() {
+        let dir = TempDir::new();
+        let table = Arc::new(Mutex::new(Table::new()));
+        let pm = PartManager::new(table.clone(), &dir.0, ManagerConfig::default());
+        let stats = pm.stats();
+
+        // A flush records its bytes.
+        for item in make_items(500) {
+            table.lock().unwrap().add(&item);
+        }
+        let flush = pm.flush_once().unwrap();
+        assert!(flush.flushed);
+        assert_eq!(stats.flushes(), 1);
+        assert!(stats.flush_bytes() > 0);
+        assert_eq!(stats.merges(), 0);
+        // Before any merge the amplification is exactly 1 (flush bytes /
+        // flush).
+        assert!((stats.write_amplification() - 1.0).abs() < 1e-9);
+
+        // A merge records input and output bytes.
+        seed_parts(&pm, &dir.0, 8, 200);
+        let merge = pm.merge_once().unwrap();
+        assert!(merge.merged);
+        assert_eq!(stats.merges(), 1);
+        assert_eq!(stats.merge_input_bytes(), merge.input_bytes);
+        assert_eq!(stats.merge_output_bytes(), merge.output_bytes);
+        assert!(stats.write_amplification() > 1.0);
+    }
+
+    #[test]
+    fn test_write_amplification_stays_below_target() {
+        let dir = TempDir::new();
+        let table = Arc::new(Mutex::new(Table::new()));
+        let pm = PartManager::new(table.clone(), &dir.0, ManagerConfig::default());
+        let stats = pm.stats();
+
+        // Drive several rounds of "8 flushes then merge", the steady state the
+        // merge policy is designed for. ADR §3.6 targets write amplification
+        // below 5x for index ingestion.
+        let rounds = 5;
+        let per_flush = 400;
+        for round in 0..rounds {
+            for _ in 0..8 {
+                let base = round * 8 * per_flush;
+                for i in 0..per_flush {
+                    let id = base + i;
+                    table
+                        .lock()
+                        .unwrap()
+                        .add(format!("metric{{id={id:08}}}").as_bytes());
+                }
+                assert!(pm.flush_once().unwrap().flushed);
+            }
+            // At least one merge should run once 8 similar parts exist.
+            let outcome = pm.merge_once().unwrap();
+            assert!(outcome.merged, "round {round} should trigger a merge");
+        }
+        let wa = stats.write_amplification();
+        assert!(
+            wa < 5.0,
+            "write amplification {wa:.2} exceeds the 5x target"
+        );
+        // The manager still answers every flushed item exactly once.
+        assert_eq!(stats.flushes(), (rounds * 8) as u64);
+        assert_eq!(
+            count_items(&pm.file_parts()),
+            (rounds * 8 * per_flush) as usize
+        );
+    }
+
+    #[test]
+    fn test_concurrent_mergers_do_not_duplicate_work() {
+        let dir = TempDir::new();
+        let table = Arc::new(Mutex::new(Table::new()));
+        let config = ManagerConfig {
+            merge_threads: 4,
+            ..ManagerConfig::default()
+        };
+        let pm = Arc::new(PartManager::new(table, &dir.0, config));
+        // 16 equal parts: the policy can pick two disjoint windows of 8.
+        let total = seed_parts(&pm, &dir.0, 16, 300);
+
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let pm = Arc::clone(&pm);
+                std::thread::spawn(move || pm.merge_once().unwrap())
+            })
+            .collect();
+        let outcomes: Vec<MergeOutcome> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+
+        // Every part claimed by exactly one merge: the merged-id sets are
+        // disjoint and together cover the claimed parts.
+        let mut all_ids = Vec::new();
+        for o in &outcomes {
+            all_ids.extend_from_slice(&o.merged_ids);
+        }
+        let mut unique = all_ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(all_ids.len(), unique.len(), "a part was claimed twice");
+
+        // No item is lost or duplicated.
+        assert_eq!(count_items(&pm.file_parts()), total);
+    }
+
+    #[test]
+    fn test_default_merge_threads_is_max_cpus_or_four() {
+        let config = ManagerConfig::default();
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(config.merge_threads, cpus.max(4));
+    }
+
+    #[test]
+    fn test_spawn_runs_flush_and_configured_mergers() {
+        let dir = TempDir::new();
+        let table = Arc::new(Mutex::new(Table::new()));
+        let config = ManagerConfig {
+            flush_interval: std::time::Duration::from_millis(20),
+            merge_interval: std::time::Duration::from_millis(20),
+            merge_threads: 3,
+            ..ManagerConfig::default()
+        };
+        let pm = Arc::new(PartManager::new(table.clone(), &dir.0, config));
+        for item in make_items(200) {
+            table.lock().unwrap().add(&item);
+        }
+        let handles = pm.spawn();
+        // One flush loop plus `merge_threads` merger loops.
+        assert_eq!(handles.len(), 1 + 3);
+        // Wait for the flush to land, then stop and join.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pm.file_parts().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        pm.stop();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(pm.stats().flushes() >= 1);
+        assert_eq!(count_items(&pm.file_parts()), 200);
     }
 
     #[test]

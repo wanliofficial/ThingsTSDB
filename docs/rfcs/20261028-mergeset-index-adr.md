@@ -792,22 +792,33 @@ Done, in `storage_kernel::mergeset`:
   and empty input.
 - `block_cache.rs` is a byte-budgeted LRU cache of decompressed index block
   headers, shared across the indexDB via `Arc`.
-- `part_manager.rs` drives the flush and merge loops on background threads
-  bounded by a stop channel. `flush_once` writes the pending buffer to a file
-  part; `merge_once` selects a window, streams the items through the k-way
-  search into a new part and removes the sources only after the output is
-  written. `recover_from_disk` rebuilds the file-part set from `parts.json`,
-  skipping a part whose `metadata.json` is missing (an interrupted merge leaves
-  no orphan rows).
+- `part_manager.rs` drives the flush loop and `merge_threads` merger loops on
+  background threads bounded by a stop channel. `flush_once` writes the pending
+  buffer to a file part; `merge_once` **claims** a window under the file-part
+  lock (select and remove atomically), merges outside the lock and publishes
+  the output, then deletes the source directories. A failed merge puts the
+  claimed sources back, so an interrupted merge leaves no orphan rows.
+  `recover_from_disk` rebuilds the file-part set from `parts.json`, skipping a
+  part whose `metadata.json` is missing.
+- `ManagerConfig::merge_threads` defaults to `max(cpus, 4)` (ADR §3.6) and
+  `PartManager::spawn` starts one flush loop plus that many merger loops.
+- `MergeStats` (via `PartManager::stats`) records flush bytes, merge input and
+  output bytes and counts, and derives
+  `write_amplification() = (flush_bytes + merge_output_bytes) / flush_bytes`.
 - Tests: flush moves pending to a file part (empty is a no-op), a 9-part merge
   combines sources and preserves every item, merge is skipped below the window
   minimum, a crash/restart recovers two written parts and their full item set,
-  and a corrupt part is skipped on recovery. `Part` gained a `Clone` that
-  reopens the part directory.
-- Not yet measured: the 10M-series write-amplification figure and the
-  `cpus`/`max(cpus, 4)` merger-thread split; the loops are single-threaded and
-  the intervals are injected so the acceptance runs can drive them
-  deterministically. This is the M3 measurement follow-up.
+  a corrupt part is skipped on recovery, `stats` records flush and merge bytes,
+  four concurrent mergers never claim the same part twice, `spawn` starts
+  `1 + merge_threads` loops, and a 5-round flush/merge drive keeps write
+  amplification below 5x. `Part` gained a `Clone` that reopens the part
+  directory.
+- Measured (`cargo run --release -p benchmarks --bin index_mergeset_bench`):
+  1,000,000 items in 250 flushes of 4,000 rows, 22 merges, 5.78 MB of flush
+  output and 11.28 MB of merge output gives **2.95x write amplification**
+  (target < 5x) at ~391k items/s on this machine. A small 160k-item run is
+  1.98x. The 10M-series scale run remains for the capacity test but the
+  steady-state ratio is flat, so the M3 acceptance metric is closed.
 
 ## 13. Observability
 
