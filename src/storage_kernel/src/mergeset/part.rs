@@ -703,9 +703,9 @@ fn push_index_block(
     first_item: &[u8],
     count: usize,
     compress_level: i32,
-) -> Result<(), String> {
+) {
     if count == 0 {
-        return Ok(());
+        return;
     }
     let offset = index.len() as u64;
     compress_zstd_level(index, raw, compress_level);
@@ -716,7 +716,6 @@ fn push_index_block(
         index_block_offset: offset,
         index_block_size: size,
     });
-    Ok(())
 }
 
 fn decode_metaindex(raw: &[u8]) -> Result<Vec<MetaindexRow>, String> {
@@ -806,6 +805,8 @@ fn hex_decode(src: &str) -> Result<Vec<u8>, String> {
     }
     let mut dst = Vec::with_capacity(src.len() / 2);
     let bytes = src.as_bytes();
+    // The input length is validated even, so every pair is complete.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for pair in bytes.chunks_exact(2) {
         let hi = hex_value(pair[0])?;
         let lo = hex_value(pair[1])?;

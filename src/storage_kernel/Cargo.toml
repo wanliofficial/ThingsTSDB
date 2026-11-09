@@ -26,6 +26,8 @@ homepage.workspace = true
 description.workspace = true
 
 [dependencies]
+regex = "1.13.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+xxhash-rust = { version = "0.8.16", features = ["xxh64"] }
 zstd = { workspace = true }

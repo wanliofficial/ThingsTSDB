@@ -19,12 +19,17 @@
 //!
 //! M1 covers block marshaling (plain/ZSTD), the directory part layout
 //! (`metaindex -> index block -> block header -> data block`), sorted part
-//! search and the k-way merge cursor. Background merging, caches and the index
-//! WAL come in later milestones.
+//! search and the k-way merge cursor. M2 adds the indexDB item encoding, the
+//! row merge callbacks and the sorted series-ID set. Background merging,
+//! caches and the index WAL come in later milestones.
 
 pub mod block_header;
+pub mod indexdb;
 pub mod inmemory_block;
+pub mod merge_callbacks;
 pub mod metaindex_row;
 pub mod part;
+pub mod series_id_set;
 pub mod table;
 pub mod table_search;
+pub mod tag_filter;

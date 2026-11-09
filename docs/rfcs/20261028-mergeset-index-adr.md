@@ -1,6 +1,6 @@
 # ADR-0001: Mergeset LSM Index and TSID-Based Series Identity
 
-- Status: Partially implemented (M1)
+- Status: Partially implemented (M1, M2)
 - Date: 2026-10-28
 - Implemented: 2026-11-09 (M1 part layout and search; see §12.1)
 - Related: `docs/roadmap.md`, `docs/rfcs/20240827-metric-engine.md`, `docs/3high-design.md`
@@ -715,7 +715,7 @@ ported (Graphite, PromQL, cluster code) are not copied.
 | Milestone | Scope | Exit criteria |
 |---|---|---|
 | ~~M1~~ | `encoding`, `inmemory_block`, block marshal/unmarshal, part read/write, single-table search | round-trip and fuzz tests; golden byte layouts |
-| M2 | TSID, namespaces, row merge callback, tag-filter planner, regex simplification | Eq/Neq/Re/Nre integration tests; 10M-row posting intersection benchmark |
+| ~~M2~~ | TSID, namespaces, row merge callback, tag-filter planner, regex simplification | Eq/Neq/Re/Nre integration tests; 10M-row posting intersection benchmark |
 | M3 | in-memory parts, merge selection, background workers, block caches | merge policy unit tests; crash/restart test; write amplification measured |
 | M4 | index WAL, segment coverage tracking, recovery ordering, periodic flush callback | kill -9 tests; no orphaned data rows; WAL reclamation verified |
 | M5 | `metric_engine` integration, dual-read, config switch, metrics | end-to-end query parity with legacy; throughput and p99 benchmarks |
@@ -754,6 +754,27 @@ Done, in `storage_kernel::mergeset`:
 
 Not in M1: in-memory parts, background merging (M3) and the index WAL (M4);
 `PartWriter` requires pre-sorted items today.
+
+### 12.2 Implementation status (2026-11-09)
+
+Done, in `storage_kernel::mergeset`:
+
+- `indexdb.rs` owns the canonical item encoding (ADR-0001 §2.1, §4): the
+  escaped tag-value encoding with `0x00 'n'` escaping, the namespace table, the
+  24-byte `Tsid` (xxhash64 grouping hints + the encoded 40-bit series counter),
+  the composite tag-key encoding and the row builders for every namespace.
+- `series_id_set.rs` is a sorted, deduplicated set used for posting
+  intersection/union/subtraction; `merge_callbacks.rs` deduplicates rows per
+  value and collapses duplicate registrations.
+- `tag_filter.rs` compiles `=`/`!=`/`=~`/`!~` matchers, simplifies the regex
+  shapes (`^api$` -> equality, `api.*` -> prefix, `a|b|c` -> or-branch),
+  orders positives by cost, resolves against the per-day rows and subtracts the
+  negative filters (ADR-0001 §5).
+- Tests: 131 total (8 indexdb encoding, 5 series-id-set, 7 merge-callback,
+  6 tag-filter). The `regex` crate is now a dependency for the general engine.
+- Remaining for M2: the 10M-row posting intersection benchmark (deferred to the
+  M3 measurement), and the `uint64set`-style intersection over real flushed
+  parts instead of the in-memory snapshot used by the resolver today.
 
 ## 13. Observability
 

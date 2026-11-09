@@ -111,6 +111,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
 
 - 新增 `src/storage_kernel/mergeset`（可先移植 `esm-mergeset`，本地磁盘 Part + 后台合并；
   对象存储作为 checkpoint，Phase 4 再评估纯对象存储实现）。
+- 已完成（M1，2026-11-09）：目录式 Part（`metaindex → index block → block header`）、
+  golden 字节布局、`Part::open` 全链路校验、单一 Table 的 k 路搜索游标、
+  `parts.json` 原子替换、`mergeset_part` fuzz target（30 s smoke 无崩溃）。
+- 已完成（M2，2026-11-09）：canonical 编码与命名空间行（ns0–ns7）、24 字节 TSID
+  （xxhash64 分组提示 + 40 位编码 series_id）、composite key、行合并回调与去重、
+  `SeriesIdSet` 交集/并集/差集、标签过滤 planner（`=`/`!=`/`=~`/`!~`、regex 简化、
+  按代价排序、按日裁剪）、131 项测试。10M 行 posting 基准随 M3 实测。
 - TSID：24B 布局（metricGroupID/jobID/instanceID/metricID）或等价 u64+冲突检测；
   tsid→metric name/labels 持久化；tsid 缓存。
 - IndexDB：命名空间 tag→metricID、metricID→tsid、metricID→name、date metricName→tsid；
