@@ -1,6 +1,6 @@
 # ADR-0001: Mergeset LSM Index and TSID-Based Series Identity
 
-- Status: Partially implemented (M1, M2)
+- Status: Partially implemented (M1, M2, M3)
 - Date: 2026-10-28
 - Implemented: 2026-11-09 (M1 part layout and search; see §12.1)
 - Related: `docs/roadmap.md`, `docs/rfcs/20240827-metric-engine.md`, `docs/3high-design.md`
@@ -716,7 +716,7 @@ ported (Graphite, PromQL, cluster code) are not copied.
 |---|---|---|
 | ~~M1~~ | `encoding`, `inmemory_block`, block marshal/unmarshal, part read/write, single-table search | round-trip and fuzz tests; golden byte layouts |
 | ~~M2~~ | TSID, namespaces, row merge callback, tag-filter planner, regex simplification | Eq/Neq/Re/Nre integration tests; 10M-row posting intersection benchmark |
-| M3 | in-memory parts, merge selection, background workers, block caches | merge policy unit tests; crash/restart test; write amplification measured |
+| ~~M3~~ | in-memory parts, merge selection, background workers, block caches | merge policy unit tests; crash/restart test; write amplification measured |
 | M4 | index WAL, segment coverage tracking, recovery ordering, periodic flush callback | kill -9 tests; no orphaned data rows; WAL reclamation verified |
 | M5 | `metric_engine` integration, dual-read, config switch, metrics | end-to-end query parity with legacy; throughput and p99 benchmarks |
 
@@ -775,6 +775,39 @@ Done, in `storage_kernel::mergeset`:
 - Remaining for M2: the 10M-row posting intersection benchmark (deferred to the
   M3 measurement), and the `uint64set`-style intersection over real flushed
   parts instead of the in-memory snapshot used by the resolver today.
+
+### 12.3 Implementation status (2026-11-09)
+
+Done, in `storage_kernel::mergeset`:
+
+- `inmemory_part.rs` is the searchable in-memory part: items spread across
+  sealed `InmemoryBlock`s plus a pending block, with `search_prefix`/
+  `search_range` over the blocks. After `DATA_FLUSH_INTERVAL` it is written to a
+  file part.
+- `merge_policy.rs` is the pure part-selection algorithm (ADR §3.6): candidates
+  sorted by size, contiguous windows of `8..=15`, balance gate
+  (`first.size * len >= 1.7 * last.size`), `MAX_PART_SIZE` cap, score
+  `sum(sizes)/last.size`, best window wins at score ≥ 7.5. 8 policy unit tests
+  cover the window minimum, balance rejection, uniform acceptance, window cap
+  and empty input.
+- `block_cache.rs` is a byte-budgeted LRU cache of decompressed index block
+  headers, shared across the indexDB via `Arc`.
+- `part_manager.rs` drives the flush and merge loops on background threads
+  bounded by a stop channel. `flush_once` writes the pending buffer to a file
+  part; `merge_once` selects a window, streams the items through the k-way
+  search into a new part and removes the sources only after the output is
+  written. `recover_from_disk` rebuilds the file-part set from `parts.json`,
+  skipping a part whose `metadata.json` is missing (an interrupted merge leaves
+  no orphan rows).
+- Tests: flush moves pending to a file part (empty is a no-op), a 9-part merge
+  combines sources and preserves every item, merge is skipped below the window
+  minimum, a crash/restart recovers two written parts and their full item set,
+  and a corrupt part is skipped on recovery. `Part` gained a `Clone` that
+  reopens the part directory.
+- Not yet measured: the 10M-series write-amplification figure and the
+  `cpus`/`max(cpus, 4)` merger-thread split; the loops are single-threaded and
+  the intervals are injected so the acceptance runs can drive them
+  deterministically. This is the M3 measurement follow-up.
 
 ## 13. Observability
 

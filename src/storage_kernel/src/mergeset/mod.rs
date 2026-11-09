@@ -23,12 +23,16 @@
 //! row merge callbacks and the sorted series-ID set. Background merging,
 //! caches and the index WAL come in later milestones.
 
+pub mod block_cache;
 pub mod block_header;
 pub mod indexdb;
 pub mod inmemory_block;
+pub mod inmemory_part;
 pub mod merge_callbacks;
+pub mod merge_policy;
 pub mod metaindex_row;
 pub mod part;
+pub mod part_manager;
 pub mod series_id_set;
 pub mod table;
 pub mod table_search;

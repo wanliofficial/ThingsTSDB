@@ -72,6 +72,17 @@ impl Table {
         self.pending.push(item);
     }
 
+    /// Takes the pending items out of the table, leaving it empty. Used by the
+    /// part manager flush loop, which writes the pending buffer to a file part.
+    pub fn take_pending(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Ensures the pending buffer is empty (drops any items).
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
     /// Sorts pending items and writes them as a new file part.
     pub fn flush(&mut self, path: impl AsRef<Path>, compress_level: i32) -> Result<(), String> {
         if self.pending.is_empty() {

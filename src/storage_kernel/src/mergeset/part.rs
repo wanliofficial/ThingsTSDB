@@ -106,6 +106,32 @@ pub struct Part {
     pub size: u64,
 }
 
+impl Clone for Part {
+    /// Reopens the underlying files. `Part` holds `Mutex<File>` handles that
+    /// are not `Clone`, but a part is just a directory on disk, so a clone is a
+    /// fresh open of the same path. The metadata (header, bounds, counts) is
+    /// copied from the source without re-reading it.
+    fn clone(&self) -> Self {
+        let items = File::open(self.path.join(ITEMS_FILE)).expect("reopen items");
+        let lens = File::open(self.path.join(LENS_FILE)).expect("reopen lens");
+        let index = File::open(self.path.join(INDEX_FILE)).expect("reopen index");
+        Self {
+            path: self.path.clone(),
+            items: Mutex::new(items),
+            lens: Mutex::new(lens),
+            index: Mutex::new(index),
+            metaindex: self.metaindex.clone(),
+            header: self.header.clone(),
+            first_item: self.first_item.clone(),
+            last_item: self.last_item.clone(),
+            items_size: self.items_size,
+            lens_size: self.lens_size,
+            item_count: self.item_count,
+            size: self.size,
+        }
+    }
+}
+
 impl Part {
     /// Opens a part directory previously written by [`PartWriter`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
