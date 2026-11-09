@@ -16,3 +16,6 @@
 # under the License.
 
 large-error-threshold = 1024
+
+# The hex decoder processes a validated even-length slice pair by pair.
+allow = ["chunks_exact_to_as_chunks"]

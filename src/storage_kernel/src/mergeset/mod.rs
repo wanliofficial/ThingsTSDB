@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Minimal mergeset LSM table used by the Phase 0 benchmark.
+//! Mergeset LSM table for the Phase 1 index (ADR-0001).
 //!
-//! The prototype covers the parts that dominate the design's performance:
-//! block marshaling (plain/ZSTD), sorted part search and k-way merges.
+//! M1 covers block marshaling (plain/ZSTD), the directory part layout
+//! (`metaindex -> index block -> block header -> data block`), sorted part
+//! search and the k-way merge cursor. Background merging, caches and the index
+//! WAL come in later milestones.
 
+pub mod block_header;
 pub mod inmemory_block;
+pub mod metaindex_row;
 pub mod part;
 pub mod table;
+pub mod table_search;

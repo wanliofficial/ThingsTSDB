@@ -1,7 +1,8 @@
 # ADR-0001: Mergeset LSM Index and TSID-Based Series Identity
 
-- Status: Proposed
+- Status: Partially implemented (M1)
 - Date: 2026-10-28
+- Implemented: 2026-11-09 (M1 part layout and search; see §12.1)
 - Related: `docs/roadmap.md`, `docs/rfcs/20240827-metric-engine.md`, `docs/3high-design.md`
 - Reference implementation: `esmetrics` (Rust port of VictoriaMetrics v1.146.0,
   commit `4d9901f`), Apache-2.0
@@ -713,7 +714,7 @@ ported (Graphite, PromQL, cluster code) are not copied.
 
 | Milestone | Scope | Exit criteria |
 |---|---|---|
-| M1 | `encoding`, `inmemory_block`, block marshal/unmarshal, part read/write, single-table search | round-trip and fuzz tests; golden byte layouts |
+| ~~M1~~ | `encoding`, `inmemory_block`, block marshal/unmarshal, part read/write, single-table search | round-trip and fuzz tests; golden byte layouts |
 | M2 | TSID, namespaces, row merge callback, tag-filter planner, regex simplification | Eq/Neq/Re/Nre integration tests; 10M-row posting intersection benchmark |
 | M3 | in-memory parts, merge selection, background workers, block caches | merge policy unit tests; crash/restart test; write amplification measured |
 | M4 | index WAL, segment coverage tracking, recovery ordering, periodic flush callback | kill -9 tests; no orphaned data rows; WAL reclamation verified |
@@ -726,6 +727,33 @@ Acceptance targets from the roadmap:
 - write throughput and p99 no worse than the legacy index path;
 - `kill -9` recovery under 30 s with no data row referencing a missing series;
 - no query regression for the existing `SearchRequest` test suite.
+
+### 12.1 Implementation status (2026-11-09)
+
+Done, in `storage_kernel::mergeset`:
+
+- The part is a **directory** (`metaindex.bin`, `index.bin`, `items.bin`,
+  `lens.bin`, `metadata.json`) per §3.3/§3.4; `metadata.json` carries the part
+  header with hex-encoded first/last item, item/block counts and the seq and
+  series-ID ranges (fields default to zero until M2 populates them).
+- `BlockHeader` (`block_header.rs`) and `MetaindexRow` (`metaindex_row.rs`) have
+  golden-byte layout tests, and `PartWriter` groups headers into zstd index
+  blocks with a fully in-memory metaindex loaded on open.
+- `Part::open` walks the metaindex/index-block/header chain, bounds-checks the
+  block ranges against the data files and decodes the last block to verify the
+  metadata's first/last item, so an unfinished or corrupt part is rejected.
+- `TableSearch` is the single-table k-way cursor; `Table::search_range`/
+  `search_prefix` are deduplicated on the way out. `Table::merge_all` removes
+  its input part directories.
+- `parts.json` is written atomically (temp + fsync + rename + directory fsync)
+  and rejected unless sorted and deduplicated.
+- Tests: 23 mergeset tests (directory layout/metadata, duplicate items across
+  blocks, multi-index-block builds, corrupt-directory rejection, parts.json
+  atomicity, range search against a brute-force oracle) plus the
+  `mergeset_part` fuzz target (30 s smoke run, ~8k executions, no crash).
+
+Not in M1: in-memory parts, background merging (M3) and the index WAL (M4);
+`PartWriter` requires pre-sorted items today.
 
 ## 13. Observability
 

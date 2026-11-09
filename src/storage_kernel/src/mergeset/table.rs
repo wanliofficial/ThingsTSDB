@@ -22,7 +22,10 @@
 
 use std::path::Path;
 
-use crate::mergeset::part::{Part, PartWriter};
+use crate::mergeset::{
+    part::{Part, PartWriter},
+    table_search::TableSearch,
+};
 
 /// A mergeset table over sorted byte items.
 pub struct Table {
@@ -86,10 +89,13 @@ impl Table {
     /// Returns the union of all items with `prefix`, sorted and deduplicated.
     pub fn search_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let mut dst = Vec::new();
-        for part in &self.parts {
-            dst.extend(part.search_prefix(prefix)?);
+        let mut search = TableSearch::new(&self.parts, Some(prefix))?;
+        while let Some(item) = search.next_item()? {
+            if !item.starts_with(prefix) {
+                break;
+            }
+            dst.push(item);
         }
-        dst.sort_unstable();
         dst.dedup();
         Ok(dst)
     }
@@ -98,10 +104,13 @@ impl Table {
     /// deduplicated.
     pub fn search_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let mut dst = Vec::new();
-        for part in &self.parts {
-            dst.extend(part.search_range(start, end)?);
+        let mut search = TableSearch::new(&self.parts, Some(start))?;
+        while let Some(item) = search.next_item()? {
+            if item.as_slice() >= end {
+                break;
+            }
+            dst.push(item);
         }
-        dst.sort_unstable();
         dst.dedup();
         Ok(dst)
     }
@@ -147,7 +156,7 @@ impl Table {
         let new_part = writer.finish(out_path)?;
         let old_parts = std::mem::replace(&mut self.parts, vec![new_part]);
         for part in old_parts {
-            let _ = std::fs::remove_file(part.path());
+            let _ = std::fs::remove_dir_all(part.path());
         }
         Ok(())
     }

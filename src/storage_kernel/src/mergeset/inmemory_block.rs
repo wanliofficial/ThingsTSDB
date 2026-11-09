@@ -46,7 +46,7 @@ pub(crate) struct StorageBlock {
 
 /// Marshal type used for block compression.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum MarshalType {
+pub enum MarshalType {
     #[default]
     Plain = 0,
     Zstd = 1,

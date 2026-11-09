@@ -43,3 +43,10 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "mergeset_part"
+path = "fuzz_targets/mergeset_part.rs"
+test = false
+doc = false
+bench = false
