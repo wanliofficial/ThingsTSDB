@@ -293,12 +293,38 @@ impl PartManager {
 
     /// Reclaims WAL segments fully covered by the current file parts, then
     /// re-evaluates after every part swap (ADR-0001 §6.3). No-op without a WAL.
+    ///
+    /// The segment the writer is appending to is never unlinked: that would
+    /// make later appends invisible. When the active segment is already fully
+    /// covered by the persisted parts, it is closed and rotated first, so the
+    /// covered segment can be reclaimed while the new one stays writable.
     fn reclaim_wal(&self) -> Result<(), String> {
-        let (Some(wal_dir), Some(_wal)) = (&self.wal_dir, &self.wal) else {
+        let (Some(wal_dir), Some(wal)) = (&self.wal_dir, &self.wal) else {
             return Ok(());
         };
         let parts = self.file_parts();
-        let removed = reclaim_covered(wal_dir, &parts)?;
+        let covered = crate::mergeset::wal::parts_covered_set(&parts);
+        {
+            let mut writer = wal.lock().unwrap_or_else(|e| e.into_inner());
+            let all_covered = !writer.frames().is_empty()
+                && writer
+                    .frames()
+                    .iter()
+                    .all(|f| covered.covers(f.min_seq, f.max_seq));
+            if all_covered {
+                let old = std::mem::replace(
+                    &mut *writer,
+                    WalWriter::open(wal_dir, self.partition_id, self.config.wal_sync_on_write)?,
+                );
+                old.finish()?;
+            }
+        }
+        let active = wal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path()
+            .to_path_buf();
+        let removed = reclaim_covered(wal_dir, &parts, Some(&active))?;
         self.stats.record_wal_reclaimed(removed.len() as u64);
         Ok(())
     }
@@ -316,6 +342,21 @@ impl PartManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(part);
+        self.publish_parts();
+    }
+
+    /// Pushes the manager's file-part list into the table, which is what the
+    /// search path reads. Called after every change to the part set.
+    fn publish_parts(&self) {
+        let parts = self
+            .file_parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_parts(parts);
     }
 
     /// Rebuilds the file-part set from `parts.json` after a restart.
@@ -384,7 +425,7 @@ impl PartManager {
 
     /// Runs one flush cycle: writes pending items to a file part.
     pub fn flush_once(&self) -> Result<FlushOutcome, String> {
-        let (pending, min_seq, max_seq) = self
+        let (mut pending, min_seq, max_seq) = self
             .table
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -401,6 +442,11 @@ impl PartManager {
                 flushed: false,
             });
         }
+        // The pending buffer collects rows in write order, which is not sorted
+        // (one series writes ns0, ns2, ns3, ns1, ...). A part is a sorted item
+        // list, so sort and dedup before handing the items to the writer.
+        pending.sort_unstable();
+        pending.dedup();
         let level = if (pending.len() as u64) < self.config.cached_part_threshold {
             self.config.small_part_compress_level
         } else {
@@ -490,6 +536,7 @@ impl PartManager {
             // fully published.
             let _ = std::fs::remove_dir_all(path);
         }
+        self.publish_parts();
         self.stats.record_merge(input_bytes, output_bytes);
         // Persist the updated part list (the merged part replaces its sources),
         // then reclaim WAL segments the merged part now covers.

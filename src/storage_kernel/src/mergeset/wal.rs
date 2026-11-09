@@ -350,6 +350,11 @@ pub fn read_segments(dir: impl AsRef<Path>, truncate: bool) -> Result<Vec<WalSeg
     paths.sort();
     let mut segments = Vec::with_capacity(paths.len());
     for path in paths {
+        // An empty segment is a freshly rotated writer that has not appended
+        // yet; it carries no frames and must not show up in the segment list.
+        if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+            continue;
+        }
         let data = fs::read(&path).map_err(|e| format!("cannot read {path:?}: {e}"))?;
         let mut pos = 0usize;
         let mut good = 0usize;
@@ -478,15 +483,23 @@ pub fn parts_covered_set(parts: &[super::part::Part]) -> SeqIntervalSet {
 
 /// Deletes every WAL segment in `dir` whose frames are all covered by the
 /// persisted parts, after fsyncing each unlink. Returns the segments removed.
+///
+/// `active` is the segment the writer is currently appending to. It is never
+/// removed even when its frames are covered: the writer still holds the file
+/// descriptor, so an unlink would make every later append invisible.
 pub fn reclaim_covered(
     dir: impl AsRef<Path>,
     parts: &[super::part::Part],
+    active: Option<&Path>,
 ) -> Result<Vec<PathBuf>, String> {
     let dir = dir.as_ref();
     let covered = parts_covered_set(parts);
     let segments = read_segments(dir, false)?;
     let mut removed = Vec::new();
     for segment in segments {
+        if active.is_some_and(|a| a == segment.path.as_path()) {
+            continue;
+        }
         if segment
             .frames
             .iter()

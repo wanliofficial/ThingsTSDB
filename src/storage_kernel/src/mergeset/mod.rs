@@ -26,6 +26,7 @@
 pub mod block_cache;
 pub mod block_header;
 pub mod indexdb;
+pub mod indexdb_table;
 pub mod inmemory_block;
 pub mod inmemory_part;
 pub mod merge_callbacks;
@@ -37,4 +38,5 @@ pub mod series_id_set;
 pub mod table;
 pub mod table_search;
 pub mod tag_filter;
+pub mod timeutil;
 pub mod wal;

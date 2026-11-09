@@ -34,12 +34,15 @@ impl SeriesIdSet {
         Self { ids: Vec::new() }
     }
 
+    /// Builds a set from an arbitrary iterator.
+    ///
+    /// Bulk creation sorts and deduplicates once instead of doing a sorted
+    /// insert per ID, which would be quadratic on a 10M-ID posting list.
     pub fn from_ids(ids: impl IntoIterator<Item = u64>) -> Self {
-        let mut set = Self::new();
-        for id in ids {
-            set.insert(id);
-        }
-        set
+        let mut ids: Vec<u64> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Self { ids }
     }
 
     /// Returns the number of IDs.
@@ -67,10 +70,39 @@ impl SeriesIdSet {
     }
 
     /// Inserts every ID from `other`.
+    ///
+    /// Merges the two sorted vectors in one pass; the previous per-ID sorted
+    /// insert was quadratic on large posting lists.
     pub fn extend_from(&mut self, other: &SeriesIdSet) {
-        for &id in other.ids() {
-            self.insert(id);
+        if other.is_empty() {
+            return;
         }
+        if self.is_empty() {
+            self.ids = other.ids.clone();
+            return;
+        }
+        let mut out = Vec::with_capacity(self.ids.len() + other.ids.len());
+        let (mut i, mut j) = (0, 0);
+        while i < self.ids.len() && j < other.ids.len() {
+            match self.ids[i].cmp(&other.ids[j]) {
+                std::cmp::Ordering::Less => {
+                    out.push(self.ids[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push(other.ids[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    out.push(self.ids[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&self.ids[i..]);
+        out.extend_from_slice(&other.ids[j..]);
+        self.ids = out;
     }
 
     /// Removes `id` if present. Returns whether it was present.
@@ -84,11 +116,28 @@ impl SeriesIdSet {
         }
     }
 
-    /// Removes every ID in `other`.
+    /// Removes every ID in `other` in one merge pass.
     pub fn subtract(&mut self, other: &SeriesIdSet) {
-        for &id in other.ids() {
-            self.remove(id);
+        if other.is_empty() || self.is_empty() {
+            return;
         }
+        let mut out = Vec::with_capacity(self.ids.len());
+        let (mut i, mut j) = (0, 0);
+        while i < self.ids.len() && j < other.ids.len() {
+            match self.ids[i].cmp(&other.ids[j]) {
+                std::cmp::Ordering::Less => {
+                    out.push(self.ids[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&self.ids[i..]);
+        self.ids = out;
     }
 
     /// Returns `self ∩ other`. Both inputs must be sorted and deduplicated.

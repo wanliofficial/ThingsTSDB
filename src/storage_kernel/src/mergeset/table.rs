@@ -131,6 +131,17 @@ impl Table {
         &self.parts
     }
 
+    /// Replaces the file-part set with `parts`, which the part manager owns.
+    ///
+    /// The manager keeps the authoritative list (flush, merge, recovery) and
+    /// pushes it here so the search path sees the same parts as the WAL
+    /// coverage check. Parts are cheap to clone (an open of the same directory)
+    /// and the list is bounded by the merge policy.
+    pub fn set_parts(&mut self, mut parts: Vec<Part>) {
+        parts.sort_by(|a, b| a.first_item().cmp(b.first_item()));
+        self.parts = parts;
+    }
+
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -192,7 +203,17 @@ impl Table {
     }
 
     /// Returns the union of all items with `prefix`, sorted and deduplicated.
+    ///
+    /// The pending buffer is included: a write must be searchable as soon as it
+    /// is acknowledged, and the buffer is bounded by the flush interval.
     pub fn search_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        let mut dst = self.search_prefix_parts(prefix)?;
+        self.merge_pending(&mut dst, |item| item.starts_with(prefix));
+        Ok(dst)
+    }
+
+    /// Like [`Table::search_prefix`] but without the pending buffer.
+    pub fn search_prefix_parts(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let mut dst = Vec::new();
         let mut search = TableSearch::new(&self.parts, Some(prefix))?;
         while let Some(item) = search.next_item()? {
@@ -206,7 +227,7 @@ impl Table {
     }
 
     /// Returns the union of all items in `[start, end)`, sorted and
-    /// deduplicated.
+    /// deduplicated, including the pending buffer.
     pub fn search_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         let mut dst = Vec::new();
         let mut search = TableSearch::new(&self.parts, Some(start))?;
@@ -217,7 +238,49 @@ impl Table {
             dst.push(item);
         }
         dst.dedup();
+        self.merge_pending(&mut dst, |item| item >= start && item < end);
         Ok(dst)
+    }
+
+    /// Merges the matching pending items into a sorted, deduplicated item list.
+    fn merge_pending(&self, dst: &mut Vec<Vec<u8>>, keep: impl Fn(&[u8]) -> bool) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut pending: Vec<&Vec<u8>> = self.pending.iter().filter(|it| keep(it)).collect();
+        if pending.is_empty() {
+            return;
+        }
+        if dst.is_empty() {
+            pending.sort_unstable();
+            pending.dedup();
+            dst.extend(pending.into_iter().cloned());
+            return;
+        }
+        pending.sort_unstable();
+        pending.dedup();
+        let mut merged = Vec::with_capacity(dst.len() + pending.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < dst.len() && j < pending.len() {
+            match dst[i].as_slice().cmp(pending[j].as_slice()) {
+                std::cmp::Ordering::Less => {
+                    merged.push(std::mem::take(&mut dst[i]));
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(pending[j].clone());
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    merged.push(std::mem::take(&mut dst[i]));
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        merged.extend(dst.drain(i..));
+        merged.extend(pending[j..].iter().map(|it| (*it).clone()));
+        *dst = merged;
     }
 
     /// Merges every part into a single part at `out_path`, deduplicating

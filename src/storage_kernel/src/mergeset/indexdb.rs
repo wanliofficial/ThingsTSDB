@@ -86,6 +86,75 @@ pub fn append_group(dst: &mut Vec<u8>, group: &[u8]) {
     dst.push(TAG_SEP);
 }
 
+/// Builds the full canonical name of a series: the metric group followed by
+/// every tag, each escaped and terminated (`group 0x01 (key 0x02 value
+/// 0x01)*`).
+///
+/// This is what namespace 3 stores, so label reconstruction needs only one row
+/// per series instead of a lookup per tag.
+pub fn canonical_name(group: &[u8], tags: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(group.len() + 2);
+    append_group(&mut dst, group);
+    append_tags(&mut dst, tags);
+    dst
+}
+
+/// Appends the escaped, terminated tag pairs of a canonical name.
+pub fn append_tags(dst: &mut Vec<u8>, tags: &[(&[u8], &[u8])]) {
+    for (key, value) in tags {
+        escape(dst, key);
+        dst.push(KV_SEP);
+        escape(dst, value);
+        dst.push(TAG_SEP);
+    }
+}
+
+/// A canonical series identity: metric group plus sorted `(key, value)` tags.
+pub type SeriesName = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// Decodes a [`canonical_name`] back into the metric group and its tags.
+///
+/// Returns `None` on a malformed encoding (missing terminator, dangling key).
+pub fn decode_canonical_name(mut src: &[u8]) -> Option<SeriesName> {
+    let group = take_escaped(&mut src, TAG_SEP)?;
+    let mut tags = Vec::new();
+    while !src.is_empty() {
+        let key = take_escaped(&mut src, KV_SEP)?;
+        let value = take_escaped(&mut src, TAG_SEP)?;
+        tags.push((key, value));
+    }
+    Some((group, tags))
+}
+
+/// Reads one escaped field terminated by `sep`, unescaping `0x00 'n'` pairs.
+fn take_escaped(src: &mut &[u8], sep: u8) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < src.len() {
+        match src[i] {
+            0x00 => {
+                let escaped = *src.get(i + 1)?;
+                out.push(match escaped {
+                    b'0' => 0x00,
+                    b'1' => 0x01,
+                    b'2' => 0x02,
+                    _ => return None,
+                });
+                i += 2;
+            }
+            b if b == sep => {
+                *src = &src[i + 1..];
+                return Some(out);
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 /// Returns the canonical metric-name prefix used by namespace 0 rows:
 /// `marshal_tag_value(metric_group)`.
 pub fn canonical_metric_name(group: &[u8]) -> Vec<u8> {
@@ -137,13 +206,199 @@ pub fn append_date_series_id(dst: &mut Vec<u8>, prefix: u8, date: u64, series_id
 }
 
 /// Appends a name->TSID row (namespaces 0 and 7).
+///
+/// `name` is the already-encoded canonical name (see [`canonical_name`]): the
+/// metric group followed by its tags. It is copied verbatim, since it carries
+/// its own escaping and terminators.
 pub fn append_name_tsid(dst: &mut Vec<u8>, prefix: u8, date: Option<u64>, name: &[u8]) {
     dst.push(prefix);
     if let Some(date) = date {
         dst.extend_from_slice(&date.to_be_bytes());
     }
-    append_group(dst, name);
+    dst.extend_from_slice(name);
     dst.extend_from_slice(&TSID_LEN.to_be_bytes());
+}
+
+/// Builds the namespace 0 row `canonicalName + TSID(24B)`.
+pub fn metric_name_row(name: &[u8], tsid: &Tsid) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + name.len() + 8 + TSID_LEN);
+    append_name_tsid(&mut dst, ns::METRIC_NAME, None, name);
+    dst.extend_from_slice(&tsid.marshal());
+    dst
+}
+
+/// Builds the namespace 7 row `date(8B) + canonicalName + TSID(24B)`.
+pub fn date_metric_name_row(date: u64, name: &[u8], tsid: &Tsid) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + 8 + name.len() + 8 + TSID_LEN);
+    append_name_tsid(&mut dst, ns::DATE_METRIC_NAME, Some(date), name);
+    dst.extend_from_slice(&tsid.marshal());
+    dst
+}
+
+/// Builds the namespace 2 row `seriesID(8B) + TSID(24B)`.
+pub fn series_id_row(series_id: u64, tsid: &Tsid) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + 8 + TSID_LEN);
+    dst.push(ns::SERIES_ID);
+    dst.extend_from_slice(&series_id.to_be_bytes());
+    dst.extend_from_slice(&tsid.marshal());
+    dst
+}
+
+/// Builds the namespace 3 row `seriesID(8B) + canonical name`.
+///
+/// The canonical name carries its own terminators, so it needs no length
+/// prefix and the row stays prefix-orderable by series ID.
+pub fn series_id_name_row(series_id: u64, canonical_name: &[u8]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + 8 + canonical_name.len());
+    dst.push(ns::METRIC_NAME_BY_SERIES_ID);
+    dst.extend_from_slice(&series_id.to_be_bytes());
+    dst.extend_from_slice(canonical_name);
+    dst
+}
+
+/// Builds the namespace 1 row for one tag pair and its posting IDs.
+pub fn tag_posting_row(key: &[u8], value: &[u8], ids: &[u64]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + key.len() + value.len() + 2 + ids.len() * 8);
+    dst.push(ns::TAG);
+    append_tag(&mut dst, key, value);
+    append_ids(&mut dst, ids);
+    dst
+}
+
+/// Builds the namespace 6 row `date + tagKey + tagValue + seriesID(8B)*`.
+pub fn date_tag_posting_row(date: u64, key: &[u8], value: &[u8], ids: &[u64]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + 8 + key.len() + value.len() + 2 + ids.len() * 8);
+    dst.push(ns::DATE_TAG);
+    dst.extend_from_slice(&date.to_be_bytes());
+    append_tag(&mut dst, key, value);
+    append_ids(&mut dst, ids);
+    dst
+}
+
+/// Builds one namespace 5 row `date(8B) + seriesID(8B)` per ID.
+///
+/// The per-day series set is one row per series: a posting row would need a
+/// value slot that this namespace does not have.
+pub fn date_series_rows(date: u64, ids: &[u64]) -> Vec<Vec<u8>> {
+    ids.iter()
+        .map(|id| {
+            let mut dst = Vec::with_capacity(1 + 16);
+            append_date_series_id(&mut dst, ns::DATE_SERIES, date, *id);
+            dst
+        })
+        .collect()
+}
+
+/// Appends the fixed-width big-endian posting IDs.
+pub fn append_ids(dst: &mut Vec<u8>, ids: &[u64]) {
+    for &id in ids {
+        dst.extend_from_slice(&id.to_be_bytes());
+    }
+}
+
+/// Decodes the posting IDs that follow a namespace 1 row's value terminator.
+///
+/// `prefix` is `[ns][escaped key][0x02]`; the value is read with the same
+/// escaping as a key, then every remaining byte is a fixed-width ID. Returns
+/// `(value, ids)`, or `None` when the row is not a posting row of this prefix.
+pub fn decode_posting_row(prefix: &[u8], row: &[u8]) -> Option<(Vec<u8>, Vec<u64>)> {
+    let rest = row.strip_prefix(prefix)?;
+    let mut src = rest;
+    let value = take_escaped(&mut src, TAG_SEP)?;
+    if src.len() % 8 != 0 {
+        return None;
+    }
+    let (chunks, _) = src.as_chunks::<8>();
+    let ids = chunks.iter().map(|c| u64::from_be_bytes(*c)).collect();
+    Some((value, ids))
+}
+
+/// Decodes the IDs of a posting row after a prefix that already ends at the
+/// value terminator.
+///
+/// `prefix` is `[ns][escaped key][0x02][escaped value][0x01]`, i.e.
+/// [`posting_row_prefix`]; every remaining byte is a fixed-width ID. Returns
+/// `None` when the row does not extend the prefix or is malformed.
+pub fn decode_posting_ids(prefix: &[u8], row: &[u8]) -> Option<Vec<u64>> {
+    let rest = row.strip_prefix(prefix)?;
+    if rest.len() % 8 != 0 {
+        return None;
+    }
+    let (chunks, _) = rest.as_chunks::<8>();
+    Some(chunks.iter().map(|c| u64::from_be_bytes(*c)).collect())
+}
+
+/// The namespace 1 prefix for a tag key: `[ns][escaped key][0x02]`.
+pub fn tag_key_prefix(key: &[u8]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + key.len() + 1);
+    dst.push(ns::TAG);
+    escape(&mut dst, key);
+    dst.push(KV_SEP);
+    dst
+}
+
+/// The namespace 6 prefix for a day and tag key:
+/// `[ns][date(8B)][escaped key][0x02]`.
+pub fn date_tag_key_prefix(date: u64, key: &[u8]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(1 + 8 + key.len() + 1);
+    dst.push(ns::DATE_TAG);
+    dst.extend_from_slice(&date.to_be_bytes());
+    escape(&mut dst, key);
+    dst.push(KV_SEP);
+    dst
+}
+
+/// The namespace 3 prefix for one series: `[ns][seriesID(8B)]`.
+pub fn series_id_prefix(series_id: u64) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(9);
+    dst.push(ns::METRIC_NAME_BY_SERIES_ID);
+    dst.extend_from_slice(&series_id.to_be_bytes());
+    dst
+}
+
+/// The full row prefix of one namespace 1 posting row:
+/// `[ns][escaped key][0x02][escaped value][0x01]`.
+///
+/// seeking this prefix returns only the rows of exactly that tag pair, so a
+/// lookup does not have to scan every value of the tag key.
+pub fn posting_row_prefix(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut dst = tag_key_prefix(key);
+    escape(&mut dst, value);
+    dst.push(TAG_SEP);
+    dst
+}
+
+/// The row prefix of the metric-group posting row (namespace 1, empty key).
+pub fn group_posting_row_prefix(group: &[u8]) -> Vec<u8> {
+    posting_row_prefix(b"", group)
+}
+
+/// The row prefix of one day's series set (namespace 5):
+/// `[ns][date(8B)]`. Every matching row is `prefix + seriesID(8B)`.
+pub fn date_series_prefix(date: u64) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(9);
+    dst.push(ns::DATE_SERIES);
+    dst.extend_from_slice(&date.to_be_bytes());
+    dst
+}
+
+/// Decodes a namespace 3 row `[ns][seriesID(8B)][canonical name]`.
+pub fn decode_series_id_name_row(row: &[u8]) -> Option<(u64, Vec<u8>)> {
+    if row.len() < 9 || row[0] != ns::METRIC_NAME_BY_SERIES_ID {
+        return None;
+    }
+    let series_id = u64::from_be_bytes(row[1..9].try_into().ok()?);
+    Some((series_id, row[9..].to_vec()))
+}
+
+/// Decodes a namespace 5 row `[ns][date(8B)][seriesID(8B)]`.
+pub fn decode_date_series_row(row: &[u8]) -> Option<(u64, u64)> {
+    if row.len() != 17 || row[0] != ns::DATE_SERIES {
+        return None;
+    }
+    let date = u64::from_be_bytes(row[1..9].try_into().ok()?);
+    let series_id = u64::from_be_bytes(row[9..17].try_into().ok()?);
+    Some((date, series_id))
 }
 
 /// The marshaled TSID size (ADR-0001 §2.2).
@@ -196,6 +451,25 @@ impl Tsid {
     /// Returns the trailing 8-byte `series_id` stored in data rows.
     pub fn series_id(self) -> u64 {
         self.series_id
+    }
+
+    /// Returns a copy of this TSID carrying an allocated `series_id`.
+    ///
+    /// The grouping hints stay as built from the tags; only the identity slot
+    /// is replaced, which is what the allocator owns (ADR-0001 §2.3).
+    pub fn with_series_id(mut self, series_id: u64) -> Self {
+        self.series_id = series_id;
+        self
+    }
+
+    /// Allocates a globally unique series ID for a partition (ADR-0001 §2.3).
+    ///
+    /// `bits 63..56` node, `bits 55..40` month partition, `bits 39..0` dense
+    /// counter. IDs from different partitions can therefore never collide, and
+    /// the low 40 bits stay dense for the `uint64set` fast path.
+    pub fn allocate_series_id(node_id: u8, partition_id: u16, counter: u64) -> u64 {
+        let counter = counter & 0xff_ffff_ffff;
+        (u64::from(node_id) << 56) | (u64::from(partition_id) << 40) | counter
     }
 
     pub fn marshal(&self) -> [u8; TSID_LEN] {
