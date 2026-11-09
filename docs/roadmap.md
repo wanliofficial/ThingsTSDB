@@ -135,6 +135,19 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   （冷启动无 `parts.json` 视为空）后 `replay_wal` 重放未覆盖帧。含真实
   `kill -9` 集成测试：子进程写 500 帧后被 SIGKILL，父进程从存活的 WAL 恢复全部
   item、无孤儿数据行。171 项测试通过。
+- 已完成（M5，2026-11-09）：`metric_engine` 集成。`indexdb_table.rs` 月分区 `IndexDb`
+  门面（写 ns0/ns1/ns1-composite/ns2/ns3/ns5/ns6/ns7，`search_series_ids`/
+  `series_names`/`lookup_series_id`/`flush`）、`timeutil.rs` UTC 日/月运算；
+  `Table::search_prefix`/`search_range` 合入 pending，`Table::set_parts` 让
+  PartManager 发布 part；`flush_once` 写前排序去重，WAL 回收不删 active 段。
+  `metric_engine::IndexDbManager` 按 `{root}/indexdb/{YYYY_MM}` 路由写入并去重
+  `(series_id, day)`，查询只遍历磁盘上存在的月分区（宽时间范围不再打开数百个空
+  indexDB），写出始终双写 legacy + mergeset；`IndexMode::{Legacy,New,DualRead}`
+  默认双读，`try_open_with_index_mode` 可切换；query 双读合并，支持 `=`/`!=`/`=~`/`!~`；
+  server 配置 `metric_engine.index_mode` 并接通 RE/NRE matcher。一致性测试：同一批
+  数据在 Legacy 与 New 下对空/eq/neq/re/nre/交集/越界查询结果完全一致。182 项
+  storage_kernel 测试 + kill9 集成测试、14 项 metric_engine 测试通过。剩余验收项为
+  1000 万序列容量基准（内存/ p99）与同负载写入吞吐对比。
 - TSID：24B 布局（metricGroupID/jobID/instanceID/metricID）或等价 u64+冲突检测；
   tsid→metric name/labels 持久化；tsid 缓存。
 - IndexDB：命名空间 tag→metricID、metricID→tsid、metricID→name、date metricName→tsid；

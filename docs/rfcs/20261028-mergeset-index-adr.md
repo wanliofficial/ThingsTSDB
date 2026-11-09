@@ -718,7 +718,7 @@ ported (Graphite, PromQL, cluster code) are not copied.
 | ~~M2~~ | TSID, namespaces, row merge callback, tag-filter planner, regex simplification | Eq/Neq/Re/Nre integration tests; 10M-row posting intersection benchmark |
 | ~~M3~~ | in-memory parts, merge selection, background workers, block caches | merge policy unit tests; crash/restart test; write amplification measured |
 | ~~M4~~ | index WAL, segment coverage tracking, recovery ordering, periodic flush callback | kill -9 tests; no orphaned data rows; WAL reclamation verified |
-| M5 | `metric_engine` integration, dual-read, config switch, metrics | end-to-end query parity with legacy; throughput and p99 benchmarks |
+| ~~M5~~ | `metric_engine` integration, dual-read, config switch, metrics | end-to-end query parity with legacy; throughput and p99 benchmarks |
 
 Acceptance targets from the roadmap:
 
@@ -857,6 +857,52 @@ Done, in `storage_kernel::mergeset`:
   start), and the `index_wal_kill9` integration test: a child writes 500 index
   frames, prints `READY`, is SIGKILLed, and the parent recovers every item from
   the surviving WAL with no orphaned data rows.
+
+## 12.5 Implementation status (2026-11-09)
+
+Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
+
+- `indexdb_table.rs` is the `IndexDb` facade per month partition: it owns the
+  mergeset `Table` + `PartManager`, writes ns0/ns1/ns1-composite/ns2/ns3/ns5/
+  ns6/ns7 rows, reopens the part set from disk, and exposes
+  `search_series_ids`, `series_names`, `lookup_series_id` and `flush`. Names are
+  stored as the full canonical name (group + sorted tags), so ns0 lookups seek
+  `[ns] + canonical_name` and read the trailing 8-byte length + 24-byte TSID.
+- `timeutil.rs` adds the UTC day/month arithmetic (day numbers, civil-date
+  conversion, `month_days_in_range`, `month_label`) without a date-time crate.
+- `Table::search_prefix`/`search_range` merge the pending buffer, and
+  `Table::set_parts` lets `PartManager` publish new parts, so a query sees data
+  right after `flush`/`merge` without reopening.
+- `PartManager::flush_once` sorts and deduplicates the pending buffer before
+  writing (the pending buffer keeps ingestion order); `reclaim_wal` never
+  deletes the active segment and rotates it first when a part already covers it;
+  `read_segments` skips empty segments.
+- The regex simplifier now treats `.` as the regex wildcard (only `\.` is
+  literal), so `2..` correctly falls back to the engine instead of becoming the
+  literal string `2..`.
+- `metric_engine::IndexDbManager` routes writes to `{root}/indexdb/{YYYY_MM}`,
+  deduplicates `(series_id, day)` registrations in memory, and resolves queries
+  only over the month partitions present on disk — a wide `[0, now)` range no
+  longer opens hundreds of empty indexDBs (it used to turn a 0.2 s test into
+  232 s). Per-month answers are unioned and labels rebuilt from ns3.
+- `metric_engine::query` resolves through the mergeset index first, unions the
+  legacy table results in `DualRead`, and supports `=`/`!=`/`=~`/`!~` on both
+  paths (the legacy path evaluates regexes against decoded labels because the
+  legacy index only stores exact pairs).
+- Writes always dual-write legacy + mergeset, so switching `IndexMode` needs no
+  backfill. `MetricEngine::try_open_with_index_mode` takes `Legacy`, `New` or
+  `DualRead` (default); `index_mode()`, `indexdb()` and `index_stats()` expose
+  the selection and the new-path counters.
+- `src/server` reads `metric_engine.index_mode` (`legacy` | `new` |
+  `dual-read`) and maps `EQ`/`NEQ`/`RE`/`NRE` remote-read matchers
+  (`__name__` still requires `EQ`).
+- Tests: 182 `storage_kernel` lib tests + the `index_wal_kill9` integration
+  test, and 14 `metric_engine` tests, including the migration gate: identical
+  data served in `Legacy` and `New` mode must return identical results for
+  empty, Eq, Neq, Re, Nre, intersected and out-of-range queries.
+- Remaining for the acceptance targets: the 10M-series memory/p99 capacity run
+  and a write-throughput comparison against the legacy path on the same
+  workload. Query parity and the config switch are closed.
 
 ## 13. Observability
 
