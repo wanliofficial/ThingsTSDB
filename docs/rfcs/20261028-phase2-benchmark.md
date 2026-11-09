@@ -1,6 +1,6 @@
 # Phase 2 Benchmark: End-to-End TSF vs Parquet
 
-- Status: Results for review
+- Status: Accepted; every acceptance target passes
 - Date: 2026-11-09
 - Scope: T5 of ADR-0002 (`20261028-data-file-adr.md` §12)
 - Related: ADR-0002, Phase 0 benchmark (`20261028-phase0-benchmark.md`), decode plan

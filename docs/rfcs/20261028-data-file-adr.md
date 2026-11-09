@@ -1,8 +1,9 @@
 # ADR-0002: Partitioned TSF Data Files and the Single-Value Series Model
 
-- Status: Implemented for T1-T4 on the sample schema (T5 benchmark matrix pending)
+- Status: Implemented for T1-T5 on the sample schema; every acceptance target passes
 - Date: 2026-10-28
-- Implemented: 2026-11-07 (see `docs/rfcs/20261029-vectorized-decode-plan.md`)
+- Implemented: 2026-11-07 (kernels and flush path), 2026-11-09 (T5 results and the
+  final observability follow-up); see `docs/rfcs/20261029-vectorized-decode-plan.md`
 - Related: `docs/rfcs/20261028-mergeset-index-adr.md` (ADR-0001), `docs/roadmap.md`,
   `docs/3high-design.md`
 - Reference implementations: `esmetrics` (Rust port of VictoriaMetrics v1.146.0,
@@ -940,7 +941,7 @@ emission, hardware CRC, SIMD kernels, parallel page decoding) is in
 parity against the scalar decoder on all codecs; T2 requires at least 2x the prototype
 scan throughput with selective-query latency unchanged or better.
 
-### 12.1 Implementation status (2026-11-08)
+### 12.1 Implementation status (2026-11-09)
 
 Done:
 

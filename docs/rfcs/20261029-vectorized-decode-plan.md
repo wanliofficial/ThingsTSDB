@@ -274,8 +274,10 @@ document or the Phase 0 report.
 # 11. Implementation status and measurements
 
 Implemented on 2026-11-07. Milestones 0-5 and the §4.8 compliance fix are in
-`storage_kernel::tsf` and `columnar_storage::tsf`; the T3/T4 manifest, flush and
-dual-read integration remain follow-up work.
+`storage_kernel::tsf` and `columnar_storage::tsf`. The T3/T4 manifest, flush,
+partition/TTL/compaction and dual-read integration that were follow-up work at the
+time were completed as part of ADR-0002 Phase 2; end-to-end results are in
+`docs/rfcs/20261028-phase2-benchmark.md`.
 
 | # | Status | Where |
 |---|---|---|

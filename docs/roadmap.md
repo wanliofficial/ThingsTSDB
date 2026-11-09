@@ -130,6 +130,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
 - Compaction：分区内 small/big part 合并（内层/外层），索引 mergeset 独立后台合并；
   写放大目标 < 5×。
 - 验收：1–2 B/样本；单设备 30 天查询 p99 < 50 ms；kill -9 恢复 < 30 s；TTL 分区删除可观测。
+- 已完成（2026-11-09）：双格式写入/查询（`StorageConfig::format`）、UTC 天分区与 O(1) TTL、
+  manifest 单一真相的崩溃恢复与孤儿 GC、count/bytes/close 三触发 compaction、LWW 去重、
+  跨天 Parquet 重写；TSF v1 文件/页编解码、CRC32C、列投影、SIMD 与并行解码、Arrow 零拷贝输出；
+  `cargo-fuzz` 4 个 target 接入 CI 流程。浮点编码未采用 GORILLA/CHIMP（在此负载实测约
+  65 B/样本），改为 `PredictedF64` 多项式预测 + 位模式残差。
+- 已完成（T5 实测，50 序列 × 30 天 / 8.64M 行）：TSF 体积 2.46 B/样本（gauge；Parquet 16.71）、
+  0.06（counter）。体积验收以 ADR-0002 的 2.5 B/样本为准（本节早期的 1–2 B 目标因浮点位模式
+  噪声被 ADR 上调，理由记录在 ADR §4.2/§12）；其余指标：落盘吞吐 1.2–1.8M rows/s
+  （Parquet 1.2–1.5M）；全扫描 36–50M rows/s（Parquet 24–25M）；1 天查询 p99 1.4–2.1 ms，
+  30 天单序列 p99 9.5–17.3 ms（Parquet 51 ms）；页裁剪 3.3%；重启 187–314 ms。
+  全部验收目标通过，详见 `docs/rfcs/20261028-phase2-benchmark.md`。
 
 ### Phase 3：查询执行、rollup 与缓存（3–4 周）
 
