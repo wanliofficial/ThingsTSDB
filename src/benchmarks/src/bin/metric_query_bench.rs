@@ -126,6 +126,35 @@ fn main() {
         );
     }
 
+    // Last-value (instant) query: served from the per-series cache the write
+    // path maintains, so it should stay far below the range-query latencies.
+    let last_req = SearchRequest {
+        metric_name: b"http_requests".to_vec(),
+        matchers: vec![eq(b"instance", b"host-12345")],
+        start_ms: 0,
+        end_ms: ts + 1,
+    };
+    let mut latencies = Vec::with_capacity(per_shape);
+    let mut matched = 0usize;
+    for _ in 0..per_shape {
+        let started = Instant::now();
+        let found = rt
+            .block_on(engine.last_values(&last_req))
+            .expect("last values");
+        latencies.push(started.elapsed().as_micros() as u64);
+        matched += found.len();
+    }
+    latencies.sort_unstable();
+    let p = |q: f64| latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)];
+    println!(
+        "query {:<14} p50={:>7} us  p99={:>7} us  max={:>7} us  avg_matched={}",
+        "last eq instance",
+        p(0.50),
+        p(0.99),
+        latencies[latencies.len() - 1],
+        matched / per_shape
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

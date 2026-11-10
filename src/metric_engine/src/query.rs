@@ -50,13 +50,6 @@ use crate::{
     MetricEngine, Result,
 };
 
-/// Regex matchers force the legacy path to decode every series key.
-fn needs_key_scan(matchers: &[LabelMatcher]) -> bool {
-    matchers
-        .iter()
-        .any(|m| matches!(m.matcher_type, MatcherType::Re | MatcherType::Nre))
-}
-
 /// The label matcher types Prometheus remote read and PromQL use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatcherType {
@@ -87,7 +80,7 @@ pub struct SearchRequest {
     pub end_ms: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SamplePoint {
     pub timestamp: i64,
     pub value: f64,
@@ -101,6 +94,26 @@ pub struct SeriesSamples {
     pub samples: Vec<SamplePoint>,
 }
 
+/// One matched series' newest sample inside the requested range.
+#[derive(Debug, Clone)]
+pub struct SeriesLatest {
+    pub metric_name: Vec<u8>,
+    pub labels: Vec<Label>,
+    pub timestamp: i64,
+    pub value: f64,
+}
+
+/// Aggregation applied to every downsampling bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aggregation {
+    Avg,
+    Min,
+    Max,
+    Sum,
+    Count,
+    Last,
+}
+
 /// Above this series count, tsids are filtered in the engine instead of being
 /// pushed down as an IN list, to keep the predicate size reasonable.
 const IN_LIST_LIMIT: usize = 10_000;
@@ -108,58 +121,8 @@ const IN_LIST_LIMIT: usize = 10_000;
 impl MetricEngine {
     pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SeriesSamples>> {
         let metric_id = crate::hash(&req.metric_name);
-
-        // Step 1: resolve matchers to series id -> labels. The new index is
-        // authoritative once fully migrated; the legacy tables are still read
-        // in `DualRead` so data written before the switch stays visible.
-        let mut series: HashMap<u64, (Vec<u8>, Vec<Label>)> = HashMap::new();
-        let use_new = self.indexdb.is_some() && self.index_mode != IndexMode::Legacy;
-        let use_legacy = self.index_mode != IndexMode::New;
-
-        if use_new {
-            let indexdb = self.indexdb.as_ref().expect("checked above");
-            let found = indexdb.search(
-                &req.metric_name,
-                &tag_matchers(&req.matchers),
-                req.start_ms,
-                req.end_ms,
-            )?;
-            for (tsid, (name, tags)) in found {
-                let labels = tags
-                    .into_iter()
-                    .map(|(name, value)| Label { name, value })
-                    .collect();
-                series.insert(tsid, (name, labels));
-            }
-        }
-
-        if use_legacy {
-            let series_keys = self.fetch_series_keys(metric_id).await?;
-            // Regex matchers make the legacy union decode every series key of
-            // the metric. During migration the new index eventually holds every
-            // legacy series; once it covers the queried range for this metric,
-            // the union cannot add anything and is skipped.
-            let covered = use_new
-                && needs_key_scan(&req.matchers)
-                && self.legacy_covered(&req.metric_name, &series_keys, req.start_ms, req.end_ms);
-            if !covered {
-                let candidates = self
-                    .resolve_legacy(metric_id, &req.matchers, series_keys.as_ref())
-                    .await?;
-                for tsid in candidates {
-                    if series.contains_key(&tsid) {
-                        continue;
-                    }
-                    let Some(key) = series_keys.get(&tsid) else {
-                        continue;
-                    };
-                    let (name, labels) = decode_series_key(key).context("decode series key")?;
-                    series.insert(tsid, (name, labels));
-                }
-            } else if let Some(indexdb) = self.indexdb.as_ref() {
-                indexdb.stats().record_legacy_union_skip();
-            }
-        }
+        // Step 1: resolve matchers to series id -> labels.
+        let series = self.resolve_series(req).await?;
 
         // Step 2: scan data.
         let candidates: HashSet<u64> = series.keys().copied().collect();
@@ -190,6 +153,159 @@ impl MetricEngine {
             .collect();
         matched.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(matched.into_iter().map(|(_, series)| series).collect())
+    }
+
+    /// Resolves matchers to `series id -> (name, labels)`.
+    ///
+    /// The new index is authoritative once fully migrated; the legacy tables
+    /// are still read in `DualRead` so data written before the switch stays
+    /// visible.
+    async fn resolve_series(
+        &self,
+        req: &SearchRequest,
+    ) -> Result<HashMap<u64, (Vec<u8>, Vec<Label>)>> {
+        let metric_id = crate::hash(&req.metric_name);
+        let mut series: HashMap<u64, (Vec<u8>, Vec<Label>)> = HashMap::new();
+        let use_new = self.indexdb.is_some() && self.index_mode != IndexMode::Legacy;
+        let use_legacy = self.index_mode != IndexMode::New;
+
+        if use_new {
+            let indexdb = self.indexdb.as_ref().expect("checked above");
+            let found = indexdb.search(
+                &req.metric_name,
+                &tag_matchers(&req.matchers),
+                req.start_ms,
+                req.end_ms,
+            )?;
+            for (tsid, (name, tags)) in found {
+                let labels = tags
+                    .into_iter()
+                    .map(|(name, value)| Label { name, value })
+                    .collect();
+                series.insert(tsid, (name, labels));
+            }
+        }
+
+        if use_legacy {
+            let series_keys = self.fetch_series_keys(metric_id).await?;
+            // During migration the new index eventually holds every legacy
+            // series; once it covers the queried range for this metric, the
+            // union cannot add anything and is skipped. The check is cheap
+            // (cached metric-day set), while the legacy resolve is either a
+            // full series-key pass for regex or an index-table scan for eq.
+            let covered = use_new
+                && self.legacy_covered(&req.metric_name, &series_keys, req.start_ms, req.end_ms);
+            if !covered {
+                let candidates = self
+                    .resolve_legacy(metric_id, &req.matchers, series_keys.as_ref())
+                    .await?;
+                for tsid in candidates {
+                    if series.contains_key(&tsid) {
+                        continue;
+                    }
+                    let Some(key) = series_keys.get(&tsid) else {
+                        continue;
+                    };
+                    let (name, labels) = decode_series_key(key).context("decode series key")?;
+                    series.insert(tsid, (name, labels));
+                }
+            } else if let Some(indexdb) = self.indexdb.as_ref() {
+                indexdb.stats().record_legacy_union_skip();
+            }
+        }
+
+        Ok(series)
+    }
+
+    /// Newest sample per matched series inside `[start_ms, end_ms)`.
+    ///
+    /// Served from the per-series last-value cache the write path maintains. A
+    /// series whose cached sample falls outside the range (or a cache miss
+    /// after restart) is resolved with a range scan and promoted back into the
+    /// cache.
+    pub async fn last_values(&self, req: &SearchRequest) -> Result<Vec<SeriesLatest>> {
+        let series = self.resolve_series(req).await?;
+        if series.is_empty() {
+            return Ok(Vec::new());
+        }
+        let end_ms = if req.end_ms > req.start_ms {
+            req.end_ms
+        } else {
+            req.start_ms + 1
+        };
+
+        let mut latest: HashMap<u64, crate::last_cache::LastValue> = HashMap::new();
+        let mut missing: HashSet<u64> = HashSet::new();
+        for &tsid in series.keys() {
+            match self.last_cache.get(tsid) {
+                Some(value) if value.timestamp >= req.start_ms && value.timestamp < end_ms => {
+                    latest.insert(tsid, value);
+                }
+                _ => {
+                    missing.insert(tsid);
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            let metric_id = crate::hash(&req.metric_name);
+            let scanned = self
+                .scan_samples(metric_id, &missing, req.start_ms, end_ms)
+                .await?;
+            for (tsid, points) in scanned {
+                let Some(last) = points.into_iter().max_by_key(|p| p.timestamp) else {
+                    continue;
+                };
+                self.last_cache.observe(tsid, last.timestamp, last.value);
+                latest.insert(
+                    tsid,
+                    crate::last_cache::LastValue {
+                        timestamp: last.timestamp,
+                        value: last.value,
+                    },
+                );
+            }
+        }
+
+        let mut matched: Vec<(Vec<u8>, SeriesLatest)> = latest
+            .into_iter()
+            .filter_map(|(tsid, value)| {
+                let (name, labels) = series.get(&tsid)?;
+                let key = build_series_key(name, labels);
+                Some((
+                    key,
+                    SeriesLatest {
+                        metric_name: name.clone(),
+                        labels: labels.clone(),
+                        timestamp: value.timestamp,
+                        value: value.value,
+                    },
+                ))
+            })
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(matched.into_iter().map(|(_, series)| series).collect())
+    }
+
+    /// Buckets every series' samples into fixed `step_ms` windows and reduces
+    /// each window with `agg` (the range-query / rollup read shape).
+    ///
+    /// Buckets are aligned to the Unix epoch and labelled with their start
+    /// timestamp; empty windows produce no point.
+    pub async fn search_downsampled(
+        &self,
+        req: &SearchRequest,
+        step_ms: i64,
+        agg: Aggregation,
+    ) -> Result<Vec<SeriesSamples>> {
+        if step_ms <= 0 {
+            return Err(anyhow::anyhow!("step_ms must be positive, got {step_ms}").into());
+        }
+        let mut series = self.search(req).await?;
+        for series in &mut series {
+            series.samples = downsample(&series.samples, step_ms, agg);
+        }
+        Ok(series)
     }
 
     /// Whether the new index already holds every legacy series of the metric
@@ -371,6 +487,44 @@ impl MetricEngine {
         }
         Ok(result)
     }
+}
+
+/// Reduces sorted samples into `step_ms` buckets aligned to the epoch.
+pub fn downsample(samples: &[SamplePoint], step_ms: i64, agg: Aggregation) -> Vec<SamplePoint> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < samples.len() {
+        let bucket = samples[index].timestamp.div_euclid(step_ms) * step_ms;
+        let mut count = 0u64;
+        let mut sum = 0.0f64;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut last = 0.0f64;
+        while index < samples.len()
+            && samples[index].timestamp.div_euclid(step_ms) * step_ms == bucket
+        {
+            let value = samples[index].value;
+            count += 1;
+            sum += value;
+            min = min.min(value);
+            max = max.max(value);
+            last = value;
+            index += 1;
+        }
+        let value = match agg {
+            Aggregation::Avg => sum / count as f64,
+            Aggregation::Min => min,
+            Aggregation::Max => max,
+            Aggregation::Sum => sum,
+            Aggregation::Count => count as f64,
+            Aggregation::Last => last,
+        };
+        out.push(SamplePoint {
+            timestamp: bucket,
+            value,
+        });
+    }
+    out
 }
 
 /// Maps the engine matchers to the planner's canonical matchers.
@@ -702,6 +856,153 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn test_downsample_buckets_and_aggregations() {
+        let samples: Vec<SamplePoint> = (0..6)
+            .map(|i| SamplePoint {
+                timestamp: i * 10,
+                value: i as f64,
+            })
+            .collect();
+        let at = |agg| downsample(&samples, 30, agg);
+
+        assert_eq!(
+            at(Aggregation::Avg),
+            vec![
+                SamplePoint {
+                    timestamp: 0,
+                    value: 1.0
+                },
+                SamplePoint {
+                    timestamp: 30,
+                    value: 4.0
+                },
+            ]
+        );
+        assert_eq!(at(Aggregation::Sum)[0].value, 3.0);
+        assert_eq!(at(Aggregation::Min)[1].value, 3.0);
+        assert_eq!(at(Aggregation::Max)[0].value, 2.0);
+        assert_eq!(at(Aggregation::Count)[1].value, 3.0);
+        assert_eq!(at(Aggregation::Last)[0].value, 2.0);
+        assert_eq!(at(Aggregation::Last)[1].timestamp, 30);
+
+        // Buckets are aligned to the epoch, not to the first sample.
+        let offset = vec![SamplePoint {
+            timestamp: 35,
+            value: 7.0,
+        }];
+        assert_eq!(
+            downsample(&offset, 30, Aggregation::Last),
+            vec![SamplePoint {
+                timestamp: 30,
+                value: 7.0
+            }]
+        );
+
+        assert!(downsample(&[], 30, Aggregation::Avg).is_empty());
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_search_downsampled_by_series() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine_with_mode(&root, IndexMode::DualRead).await;
+        prepare_data(&engine).await;
+
+        // A has ts 10, 20, 30 (values 1, 2, 3); a 20 ms step makes two buckets.
+        let series = engine
+            .search_downsampled(
+                &search_req("m1", vec![matcher("code", "200", MatcherType::Eq)], 0, 100),
+                20,
+                Aggregation::Max,
+            )
+            .await
+            .unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(
+            series[0].samples,
+            vec![
+                SamplePoint {
+                    timestamp: 0,
+                    value: 1.0
+                },
+                SamplePoint {
+                    timestamp: 20,
+                    value: 3.0
+                },
+            ]
+        );
+
+        // A non-positive step is rejected.
+        let err = engine
+            .search_downsampled(&search_req("m1", vec![], 0, 100), 0, Aggregation::Avg)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("step_ms"));
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_last_values_from_cache_and_fallback() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine_with_mode(&root, IndexMode::DualRead).await;
+        prepare_data(&engine).await;
+
+        let req = |start, end| {
+            search_req(
+                "m1",
+                vec![matcher("code", "200", MatcherType::Eq)],
+                start,
+                end,
+            )
+        };
+
+        // The write path filled the cache: newest sample of A is ts=30.
+        let latest = engine.last_values(&req(0, 100)).await.unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].timestamp, 30);
+        assert_eq!(latest[0].value, 3.0);
+        assert_eq!(latest[0].labels.len(), 2);
+
+        // An out-of-order older sample must not replace the cached newest.
+        engine
+            .write(vec![make_sample("m1", "200", "api", 5, 99.0)])
+            .await
+            .unwrap();
+        let latest = engine.last_values(&req(0, 100)).await.unwrap();
+        assert_eq!(latest[0].timestamp, 30);
+        assert_eq!(latest[0].value, 3.0);
+
+        // A cache miss (restart) falls back to the data scan and refills.
+        engine.last_cache().clear();
+        assert!(engine.last_cache().is_empty());
+        let latest = engine.last_values(&req(0, 100)).await.unwrap();
+        assert_eq!(latest[0].timestamp, 30);
+        assert_eq!(latest[0].value, 3.0);
+        assert!(!engine.last_cache().is_empty());
+
+        // A range that excludes the cached newest falls back to the newest
+        // sample inside the range.
+        let latest = engine.last_values(&req(0, 25)).await.unwrap();
+        assert_eq!(latest[0].timestamp, 20);
+        assert_eq!(latest[0].value, 2.0);
+
+        // No match and an unknown metric return an empty result.
+        let none = engine
+            .last_values(&search_req(
+                "m1",
+                vec![matcher("code", "500", MatcherType::Eq)],
+                0,
+                100,
+            ))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+        let unknown = engine
+            .last_values(&search_req("m404", vec![], 0, 100))
+            .await
+            .unwrap();
+        assert!(unknown.is_empty());
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]

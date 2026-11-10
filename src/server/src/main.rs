@@ -34,7 +34,8 @@ use bytes::Bytes as BytesBuf;
 use clap::Parser;
 use common::now;
 use metric_engine::{
-    types::Label, LabelMatcher, MatcherType, MetricEngine, MetricEngineRef, Sample, SearchRequest,
+    types::Label, Aggregation, LabelMatcher, MatcherType, MetricEngine, MetricEngineRef, Sample,
+    SearchRequest,
 };
 use object_store::local::LocalFileSystem;
 use pb_types::prometheus::remote_read::{
@@ -247,8 +248,124 @@ async fn query_json(
     data: web::Data<AppState>,
     params: web::Query<std::collections::HashMap<String, String>>,
 ) -> impl Responder {
+    let request = match parse_search_request(&params) {
+        Ok(request) => request,
+        Err(message) => return HttpResponse::BadRequest().body(message),
+    };
+    match data.engine.search(&request).await {
+        Ok(series) => {
+            let series_json: Vec<serde_json::Value> = series
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "metric": String::from_utf8_lossy(&s.metric_name),
+                        "labels": serde_json::Map::from_iter(s.labels.iter().map(|l| (
+                            String::from_utf8_lossy(&l.name).into_owned(),
+                            serde_json::Value::String(String::from_utf8_lossy(&l.value).into_owned()),
+                        ))),
+                        "samples": s.samples.iter().map(|p| (
+                            p.timestamp, p.value
+                        )).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
+        }
+        Err(e) => HttpResponse::InternalServerError().body(format!("query failed: {e}")),
+    }
+}
+
+/// Latest value of every matched series, e.g.
+/// `/api/v1/last?metric=bench_cpu_usage&filter=job:api`. Served from the
+/// per-series last-value cache; a cold cache falls back to a data scan.
+#[get("/api/v1/last")]
+async fn last_json(
+    data: web::Data<AppState>,
+    params: web::Query<std::collections::HashMap<String, String>>,
+) -> impl Responder {
+    let request = match parse_search_request(&params) {
+        Ok(request) => request,
+        Err(message) => return HttpResponse::BadRequest().body(message),
+    };
+    match data.engine.last_values(&request).await {
+        Ok(series) => {
+            let series_json: Vec<serde_json::Value> = series
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "metric": String::from_utf8_lossy(&s.metric_name),
+                        "labels": serde_json::Map::from_iter(s.labels.iter().map(|l| (
+                            String::from_utf8_lossy(&l.name).into_owned(),
+                            serde_json::Value::String(String::from_utf8_lossy(&l.value).into_owned()),
+                        ))),
+                        "timestamp": s.timestamp,
+                        "value": s.value,
+                    })
+                })
+                .collect();
+            HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
+        }
+        Err(e) => HttpResponse::InternalServerError().body(format!("last query failed: {e}")),
+    }
+}
+
+/// Downsampled range query, e.g.
+/// `/api/v1/query_range?metric=http_requests&step=60000&agg=avg`.
+///
+/// `step` is in milliseconds and `agg` is one of `avg`, `min`, `max`, `sum`,
+/// `count`, `last` (default `avg`).
+#[get("/api/v1/query_range")]
+async fn query_range_json(
+    data: web::Data<AppState>,
+    params: web::Query<std::collections::HashMap<String, String>>,
+) -> impl Responder {
+    let request = match parse_search_request(&params) {
+        Ok(request) => request,
+        Err(message) => return HttpResponse::BadRequest().body(message),
+    };
+    let step: i64 = match params.get("step").map(|v| v.parse()).transpose() {
+        Ok(Some(step)) if step > 0 => step,
+        _ => return HttpResponse::BadRequest().body("step must be a positive integer (ms)"),
+    };
+    let agg = match params.get("agg").map(String::as_str).unwrap_or("avg") {
+        "avg" => Aggregation::Avg,
+        "min" => Aggregation::Min,
+        "max" => Aggregation::Max,
+        "sum" => Aggregation::Sum,
+        "count" => Aggregation::Count,
+        "last" => Aggregation::Last,
+        other => return HttpResponse::BadRequest().body(format!("unknown aggregation {other:?}")),
+    };
+    match data.engine.search_downsampled(&request, step, agg).await {
+        Ok(series) => {
+            let series_json: Vec<serde_json::Value> = series
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "metric": String::from_utf8_lossy(&s.metric_name),
+                        "labels": serde_json::Map::from_iter(s.labels.iter().map(|l| (
+                            String::from_utf8_lossy(&l.name).into_owned(),
+                            serde_json::Value::String(String::from_utf8_lossy(&l.value).into_owned()),
+                        ))),
+                        "samples": s.samples.iter().map(|p| (
+                            p.timestamp, p.value
+                        )).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
+        }
+        Err(e) => HttpResponse::InternalServerError().body(format!("range query failed: {e}")),
+    }
+}
+
+/// Parses `metric`, `start`, `end` and an exact-match `filter` list such as
+/// `job:api,code:200`.
+fn parse_search_request(
+    params: &std::collections::HashMap<String, String>,
+) -> std::result::Result<SearchRequest, String> {
     let Some(metric) = params.get("metric") else {
-        return HttpResponse::BadRequest().body("metric is required");
+        return Err("metric is required".to_string());
     };
     let start: i64 = params
         .get("start")
@@ -272,34 +389,12 @@ async fn query_json(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-
-    let request = SearchRequest {
+    Ok(SearchRequest {
         metric_name: metric.as_bytes().to_vec(),
         matchers,
         start_ms: start,
         end_ms: end,
-    };
-    match data.engine.search(&request).await {
-        Ok(series) => {
-            let series_json: Vec<serde_json::Value> = series
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "metric": String::from_utf8_lossy(&s.metric_name),
-                        "labels": serde_json::Map::from_iter(s.labels.iter().map(|l| (
-                            String::from_utf8_lossy(&l.name).into_owned(),
-                            serde_json::Value::String(String::from_utf8_lossy(&l.value).into_owned()),
-                        ))),
-                        "samples": s.samples.iter().map(|p| (
-                            p.timestamp, p.value
-                        )).collect::<Vec<_>>(),
-                    })
-                })
-                .collect();
-            HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
-        }
-        Err(e) => HttpResponse::InternalServerError().body(format!("query failed: {e}")),
-    }
+    })
 }
 
 /// Convert the remote write request to engine samples: the metric name is the
@@ -425,6 +520,8 @@ pub fn main() {
                 .service(prometheus_write)
                 .service(prometheus_read)
                 .service(query_json)
+                .service(last_json)
+                .service(query_range_json)
         })
         .workers(4)
         .bind(("127.0.0.1", port))

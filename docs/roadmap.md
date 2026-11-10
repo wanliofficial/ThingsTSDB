@@ -146,7 +146,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   默认双读，`try_open_with_index_mode` 可切换；query 双读合并，支持 `=`/`!=`/`=~`/`!~`；
   server 配置 `metric_engine.index_mode` 并接通 RE/NRE matcher。一致性测试：同一批
   数据在 Legacy 与 New 下对空/eq/neq/re/nre/交集/越界查询结果完全一致。196 项
-  storage_kernel 测试 + kill9 集成测试、17 项 metric_engine 测试通过。flush 时按 row key
+  storage_kernel 测试 + kill9 集成测试、21 项 metric_engine 测试通过。flush 时按 row key
   折叠 posting 行（`MAX_POSTING_IDS_PER_ROW=1024` 分片，保证单行小于 64 KiB block），
   regex 每 matcher 只编译一次；新增 `index_query_bench`：20 万序列 / 320 万行实测索引
   51.8 B/序列（目标 <200）、写放大 1.46×（目标 <5×）、写入 ~1.83 万序列/s。
@@ -212,6 +212,14 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   legacy 联合；保守判定（迁移前数据或范围内无数据的序列使检查失败）保证旧数据
   仍可见。正则选择器进一步降至 p50 76 ms / p99 179 ms（索引占比 35 ms 为 posting
   扫描本身）。剩余成本是宽选择的标签/样本物化与冷查询位图表示。
+- 已完成（部分，2026-11-10）：Last Cache 与降采样读路径。写入成功后在
+  `MetricEngine::write` 内镜像每序列最新样本到 `LastCache`（默认 100 万序列、满后不再
+  接纳新序列而不淘汰），`MetricEngine::last_values` 直接命中缓存，缺失时回退区间扫描
+  并回填；20 万序列下即时值查询 p50 8.5 ms / p99 17.5 ms（同选择器的区间查询
+  12.2 ms）。乱序写入保留最大时间戳、同时间戳后写覆盖。另加
+  `search_downsampled(req, step_ms, agg)`（epoch 对齐分桶，avg/min/max/sum/count/last），
+  即存储型 rollup 的读取形态；server 暴露 `/api/v1/last` 与
+  `/api/v1/query_range?step=&agg=`。剩余：写入时维护的 1m/1h rollup 表与自动选择。
 - 验收：黄金查询集进 CI；仪表盘类查询 p99 < 50 ms；全量 ad-hoc 明确为秒级 SLO。
 
 ### Phase 4：运维与生态（持续）

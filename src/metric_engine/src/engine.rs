@@ -37,6 +37,7 @@ use crate::{
     data::SampleManager,
     index::IndexManager,
     indexdb::{IndexDbManager, IndexMode, IndexQueryStats},
+    last_cache::LastCache,
     metric::MetricManager,
     types::Sample,
     Result,
@@ -73,6 +74,9 @@ pub struct MetricEngine {
     /// deployment can switch [`IndexMode`] without a backfill.
     pub(crate) indexdb: Option<Arc<IndexDbManager>>,
     pub(crate) index_mode: IndexMode,
+    /// Newest sample per series, mirrored by the write path so instant queries
+    /// avoid scanning the data table (roadmap Phase 3).
+    pub(crate) last_cache: Arc<LastCache>,
 }
 
 impl MetricEngine {
@@ -174,6 +178,7 @@ impl MetricEngine {
             data,
             indexdb: Some(indexdb),
             index_mode,
+            last_cache: Arc::new(LastCache::with_default_capacity()),
         };
         // Warm up caches so known metrics and series won't be re-persisted.
         engine.metric.load().await?;
@@ -201,7 +206,19 @@ impl MetricEngine {
                 .await
                 .map_err(|e| anyhow::anyhow!("indexdb write task: {e}"))??;
         }
-        self.data.persist(samples).await
+        // Data is about to become durable; capture the samples first because
+        // `persist` consumes the vector.
+        let last = self.last_cache.clone();
+        let mirrored: Vec<Sample> = samples
+            .iter()
+            .filter(|s| s.series_id.is_some())
+            .cloned()
+            .collect();
+        let result = self.data.persist(samples).await;
+        if result.is_ok() {
+            last.update(&mirrored);
+        }
+        result
     }
 
     /// The index mode this engine was opened with.
@@ -217,6 +234,11 @@ impl MetricEngine {
     /// Query counters of the new index path (ADR-0001 §12.5).
     pub fn index_stats(&self) -> Option<&IndexQueryStats> {
         self.indexdb.as_ref().map(|db| db.stats())
+    }
+
+    /// The per-series latest-value cache.
+    pub fn last_cache(&self) -> &LastCache {
+        &self.last_cache
     }
 
     /// Trigger compaction of all tables.

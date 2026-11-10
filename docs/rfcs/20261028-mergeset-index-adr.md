@@ -927,7 +927,7 @@ Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
   path fsynced once per series and capped ingestion at the fsync rate; the
   batch keeps the durability promise while amortizing the sync.
 - Tests: 196 `storage_kernel` lib tests + the `index_wal_kill9` integration
-  test, and 17 `metric_engine` tests, including the migration gate: identical
+  test, and 21 `metric_engine` tests, including the migration gate: identical
   data served in `Legacy` and `New` mode must return identical results for
   empty, Eq, Neq, Re, Nre, intersected and out-of-range queries. Cache tests
   cover lookup hits/misses, generation invalidation, budget eviction, key
@@ -1054,6 +1054,26 @@ dominated by materializing labels and samples for 100k+ series, and regex
 selectors by the posting scan over the series range plus materialization.
 Phase 3 follow-ups: sample/label materialization and the persisted bitmap
 representation for cold queries.
+
+### 12.5.4 Instant and rollup-style reads
+
+Two Phase 3 read shapes build on the same resolver:
+
+- **Last values.** `MetricEngine::last_values` answers "current value" queries
+  from a per-series cache (`last_cache`) that the write path mirrors after the
+  data write succeeds. At 200k series an instant query is 8.5 ms p50 / 17.5 ms
+  p99, down from 12.2 ms / 14.7 ms for the same range query that scans data; the
+  saving grows with the sample count per series. A miss (restart, range outside
+  the cached sample, full cache) falls back to a range scan and promotes the
+  result. Out-of-order writes keep the newest timestamp; equal timestamps use
+  the last write. The default cap is 1M series (16 B each); a full cache stops
+  admitting series instead of evicting, so a high-cardinality burst cannot
+  dislodge active dashboards.
+- **Downsampling.** `MetricEngine::search_downsampled(req, step_ms, agg)` buckets
+  samples into epoch-aligned windows and reduces them with avg/min/max/sum/
+  count/last, which is the read shape a stored 1m/1h rollup would serve. The
+  server exposes it at `/api/v1/query_range?metric=..&step=..&agg=..` (and
+  `/api/v1/last` for instant values).
 
 - Remaining: the persisted bitmap representation for cold p99 at 10M series
   (Phase 3). Query parity, the config switch, the caches, the index-size and
