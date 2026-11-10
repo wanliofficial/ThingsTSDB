@@ -574,6 +574,7 @@ pub fn main() {
     let storage_opts = config.metric_engine.storage.time_merge_storage;
     let segment_duration = config.metric_engine.segment_duration.0;
     let index_mode = config.metric_engine.index_mode.into();
+    let retention: metric_engine::RetentionPolicy = (&config.metric_engine.retention).into();
 
     let write_worker_num = config.test.write_worker_num;
     let write_interval = config.test.write_interval.0;
@@ -592,7 +593,8 @@ pub fn main() {
                 index_mode,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .with_retention(retention),
         );
 
         if enable_write {

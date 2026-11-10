@@ -39,6 +39,7 @@ use crate::{
     indexdb::{IndexDbManager, IndexMode, IndexQueryStats},
     last_cache::LastCache,
     metric::MetricManager,
+    retention::RetentionPolicy,
     types::Sample,
     Result,
 };
@@ -77,6 +78,9 @@ pub struct MetricEngine {
     /// Newest sample per series, mirrored by the write path so instant queries
     /// avoid scanning the data table (roadmap Phase 3).
     pub(crate) last_cache: Arc<LastCache>,
+    /// Per-metric read-time retention windows (roadmap Phase 4). Empty by
+    /// default; set with [`MetricEngine::with_retention`].
+    pub(crate) retention: Arc<RetentionPolicy>,
 }
 
 impl MetricEngine {
@@ -179,6 +183,7 @@ impl MetricEngine {
             indexdb: Some(indexdb),
             index_mode,
             last_cache: Arc::new(LastCache::with_default_capacity()),
+            retention: Arc::new(RetentionPolicy::new()),
         };
         // Warm up caches so known metrics and series won't be re-persisted.
         engine.metric.load().await?;
@@ -239,6 +244,21 @@ impl MetricEngine {
     /// The per-series latest-value cache.
     pub fn last_cache(&self) -> &LastCache {
         &self.last_cache
+    }
+
+    /// Attaches a per-metric retention policy and returns the engine.
+    ///
+    /// Queries for a configured metric only expose samples inside its retention
+    /// window (see [`RetentionPolicy`]). Consuming `self` keeps the borrow
+    /// checker happy without a lock on the hot query path.
+    pub fn with_retention(mut self, policy: RetentionPolicy) -> Self {
+        self.retention = Arc::new(policy);
+        self
+    }
+
+    /// The active per-metric retention policy.
+    pub fn retention(&self) -> &RetentionPolicy {
+        &self.retention
     }
 
     /// Trigger compaction of all tables.

@@ -65,6 +65,11 @@ pub struct MetricEngineConfig {
     /// the legacy tables and the mergeset index, so this can be changed
     /// without a backfill.
     pub index_mode: IndexModeConfig,
+    /// Per-metric read-time retention (roadmap Phase 4): a metric listed here
+    /// only exposes samples inside its window, even when it shares a segment
+    /// with a longer-lived metric. Physical reclamation stays with the global
+    /// segment TTL.
+    pub retention: RetentionConfig,
 }
 
 impl Default for MetricEngineConfig {
@@ -74,7 +79,31 @@ impl Default for MetricEngineConfig {
             threads: ThreadConfig::default(),
             storage: StorageConfig::default(),
             index_mode: IndexModeConfig::default(),
+            retention: RetentionConfig::default(),
         }
+    }
+}
+
+/// Per-metric retention windows, keyed by metric name.
+///
+/// ```toml
+/// [metric_engine.retention.per_metric]
+/// http_requests = "30d"
+/// node_cpu_seconds = "90d"
+/// ```
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    pub per_metric: std::collections::BTreeMap<String, ReadableDuration>,
+}
+
+impl From<&RetentionConfig> for metric_engine::RetentionPolicy {
+    fn from(config: &RetentionConfig) -> Self {
+        let entries = config
+            .per_metric
+            .iter()
+            .map(|(name, window)| (name.as_bytes().to_vec(), window.0.as_millis() as i64));
+        metric_engine::RetentionPolicy::from_ms(entries)
     }
 }
 
@@ -210,4 +239,38 @@ impl Default for TimeoutOptions {
 #[inline]
 fn default_max_retries() -> usize {
     3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `[metric_engine.retention.per_metric]` table parses into a
+    /// `RetentionPolicy` keyed by metric name with millisecond windows.
+    #[test]
+    fn retention_config_parses_into_policy() {
+        let body = r#"
+            [metric_engine.retention.per_metric]
+            http_requests = "1h"
+            node_cpu_seconds = "2d"
+        "#;
+        let config: Config = toml::from_str(body).unwrap();
+        let policy: metric_engine::RetentionPolicy = (&config.metric_engine.retention).into();
+
+        assert_eq!(policy.len(), 2);
+        assert_eq!(policy.retention_ms(b"http_requests"), Some(3_600_000));
+        assert_eq!(
+            policy.retention_ms(b"node_cpu_seconds"),
+            Some(2 * 86_400_000)
+        );
+        // A metric not in the table has no retention window.
+        assert_eq!(policy.retention_ms(b"other"), None);
+
+        // The clamp uses the configured window: at now=10h, a 1h metric only
+        // exposes samples from the last hour.
+        let now = 10 * 3_600_000i64;
+        let (start, end) = policy.clamp(b"http_requests", 0, now, now);
+        assert_eq!(start, now - 3_600_000);
+        assert_eq!(end, now);
+    }
 }

@@ -33,7 +33,7 @@ use std::{
 };
 
 use anyhow::Context;
-use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, UInt64Array};
+use arrow::array::{Array, Float64Array, Int64Array, UInt64Array};
 use columnar_storage::storage::ScanRequest;
 use datafusion::{
     logical_expr::{col, lit, Expr},
@@ -49,6 +49,12 @@ use crate::{
     types::{build_series_key, decode_series_key, Label},
     MetricEngine, Result,
 };
+
+/// The current wall-clock time in milliseconds, used as the reference for
+/// per-metric retention windows.
+fn now_ms() -> i64 {
+    common::now()
+}
 
 /// The label matcher types Prometheus remote read and PromQL use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +140,14 @@ const IN_LIST_LIMIT: usize = 1_000;
 impl MetricEngine {
     pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SeriesSamples>> {
         let metric_id = crate::hash(&req.metric_name);
+        // Per-metric retention raises the lower bound of the range to the
+        // retention floor before any index or data work, so aged-out samples
+        // are invisible without a separate scan.
+        let (start_ms, end_ms) =
+            self.retention
+                .clamp(&req.metric_name, req.start_ms, req.end_ms, now_ms());
         // Step 1: resolve matchers to series id -> labels.
-        let series = self.resolve_series(req).await?;
+        let series = self.resolve_series(req, start_ms, end_ms).await?;
 
         // Step 2: scan data. A `limit` narrows the candidate set to a stable
         // subset (sorted by series id) so the same query returns the same
@@ -146,7 +158,7 @@ impl MetricEngine {
             return Ok(Vec::new());
         }
         let samples_by_tsid = self
-            .scan_samples(metric_id, &candidates, req.start_ms, req.end_ms)
+            .scan_samples(metric_id, &candidates, start_ms, end_ms)
             .await?;
 
         // Step 3: assemble results, ordered by canonical series key for
@@ -202,6 +214,8 @@ impl MetricEngine {
     async fn resolve_series(
         &self,
         req: &SearchRequest,
+        start_ms: i64,
+        end_ms: i64,
     ) -> Result<HashMap<u64, (Vec<u8>, Vec<Label>)>> {
         let metric_id = crate::hash(&req.metric_name);
         let mut series: HashMap<u64, (Vec<u8>, Vec<Label>)> = HashMap::new();
@@ -213,8 +227,8 @@ impl MetricEngine {
             let found = indexdb.search(
                 &req.metric_name,
                 &tag_matchers(&req.matchers),
-                req.start_ms,
-                req.end_ms,
+                start_ms,
+                end_ms,
             )?;
             for (tsid, (name, tags)) in found {
                 let labels = tags
@@ -232,8 +246,8 @@ impl MetricEngine {
             // union cannot add anything and is skipped. The check is cheap
             // (cached metric-day set), while the legacy resolve is either a
             // full series-key pass for regex or an index-table scan for eq.
-            let covered = use_new
-                && self.legacy_covered(&req.metric_name, &series_keys, req.start_ms, req.end_ms);
+            let covered =
+                use_new && self.legacy_covered(&req.metric_name, &series_keys, start_ms, end_ms);
             if !covered {
                 let candidates = self
                     .resolve_legacy(metric_id, &req.matchers, series_keys.as_ref())
@@ -263,21 +277,25 @@ impl MetricEngine {
     /// after restart) is resolved with a range scan and promoted back into the
     /// cache.
     pub async fn last_values(&self, req: &SearchRequest) -> Result<Vec<SeriesLatest>> {
-        let series = self.limit_series(self.resolve_series(req).await?, req.limit);
+        let (start_ms, end_ms) =
+            self.retention
+                .clamp(&req.metric_name, req.start_ms, req.end_ms, now_ms());
+        let series =
+            self.limit_series(self.resolve_series(req, start_ms, end_ms).await?, req.limit);
         if series.is_empty() {
             return Ok(Vec::new());
         }
-        let end_ms = if req.end_ms > req.start_ms {
-            req.end_ms
+        let end_ms = if end_ms > start_ms {
+            end_ms
         } else {
-            req.start_ms + 1
+            start_ms + 1
         };
 
         let mut latest: HashMap<u64, crate::last_cache::LastValue> = HashMap::new();
         let mut missing: HashSet<u64> = HashSet::new();
         for &tsid in series.keys() {
             match self.last_cache.get(tsid) {
-                Some(value) if value.timestamp >= req.start_ms && value.timestamp < end_ms => {
+                Some(value) if value.timestamp >= start_ms && value.timestamp < end_ms => {
                     latest.insert(tsid, value);
                 }
                 _ => {
@@ -289,7 +307,7 @@ impl MetricEngine {
         if !missing.is_empty() {
             let metric_id = crate::hash(&req.metric_name);
             let scanned = self
-                .scan_samples(metric_id, &missing, req.start_ms, end_ms)
+                .scan_samples(metric_id, &missing, start_ms, end_ms)
                 .await?;
             for (tsid, points) in scanned {
                 let Some(last) = points.into_iter().max_by_key(|p| p.timestamp) else {
@@ -1193,6 +1211,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(last.len(), 2);
+    }
+
+    /// Per-metric retention (roadmap Phase 4): a metric with a retention window
+    /// only exposes samples inside `[now - retention, now]` at query time, so
+    /// samples older than the window are invisible while recent ones survive —
+    /// even when they share a segment with a longer-lived metric.
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_per_metric_retention_hides_aged_samples() {
+        let root = temp_dir::TempDir::new().unwrap();
+        // 10-minute retention for m1, none for m2. Timestamps are relative to
+        // real wall-clock so `now_ms()` inside the query matches the data.
+        let now = common::now();
+        let hour_ms = 3_600_000i64;
+        let recent = now; // inside the window
+                          // 30 min old: outside the 10-min window, but well
+                          // inside the 2h segment and current day partition, so
+                          // both samples are stored identically and only the
+                          // read-time clamp differs.
+        let aged = now - 30 * 60 * 1000;
+        let policy = crate::RetentionPolicy::from_ms([(b"m1".to_vec(), 10 * 60 * 1000)]);
+        let engine = open_engine_with_mode(&root, IndexMode::DualRead)
+            .await
+            .with_retention(policy);
+
+        // m1 has one aged sample (code=500) and one recent sample (code=200);
+        // m2 has only recent samples and no retention configured.
+        engine
+            .write(vec![
+                make_sample("m1", "500", "api", aged, 1.0),
+                make_sample("m1", "200", "api", recent, 2.0),
+                make_sample("m2", "200", "db", recent, 42.0),
+            ])
+            .await
+            .unwrap();
+        engine.indexdb().unwrap().flush().unwrap();
+
+        // m1: the aged code=500 sample is gone, the recent code=200 survives.
+        let m1 = engine
+            .search(&search_req("m1", vec![], 0, i64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m1[0].samples.len(), 1);
+        assert_eq!(m1[0].samples[0].timestamp, recent);
+        assert_eq!(m1[0].samples[0].value, 2.0);
+        // The aged sample is not hiding behind a matcher either.
+        let aged_hit = engine
+            .search(&search_req(
+                "m1",
+                vec![matcher("code", "500", MatcherType::Eq)],
+                0,
+                i64::MAX,
+            ))
+            .await
+            .unwrap();
+        assert!(aged_hit.is_empty(), "aged sample must be invisible");
+
+        // m2: no retention configured, so its recent sample is unaffected.
+        let m2 = engine
+            .search(&search_req("m2", vec![], 0, i64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].samples[0].timestamp, recent);
+
+        // last_values honours the same window: m1's most recent sample is the
+        // surviving code=200 one; the aged code=500 is never returned.
+        let last = engine
+            .last_values(&search_req("m1", vec![], 0, i64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].timestamp, recent);
+        assert_eq!(last[0].value, 2.0);
+
+        // A window that reaches back past the aged sample (1h retention) keeps
+        // both, proving the read-time clamp — not the stored data — is what hid
+        // the aged sample under the 10-minute policy. Written into a fresh
+        // engine so the two samples are guaranteed present.
+        let wide_root = temp_dir::TempDir::new().unwrap();
+        let wide = open_engine_with_mode(&wide_root, IndexMode::DualRead)
+            .await
+            .with_retention(crate::RetentionPolicy::from_ms([(b"m1".to_vec(), hour_ms)]));
+        wide.write(vec![
+            make_sample("m1", "500", "api", aged, 1.0),
+            make_sample("m1", "200", "api", recent, 2.0),
+        ])
+        .await
+        .unwrap();
+        let m1_wide = wide
+            .search(&search_req("m1", vec![], 0, i64::MAX))
+            .await
+            .unwrap();
+        let total: usize = m1_wide.iter().map(|s| s.samples.len()).sum();
+        assert_eq!(total, 2, "wider window keeps both series' samples");
     }
 
     /// The mergeset index and the legacy inverted index must resolve the same

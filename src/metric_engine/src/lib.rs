@@ -24,6 +24,7 @@ pub mod indexdb;
 pub mod last_cache;
 pub mod metric;
 pub mod query;
+pub mod retention;
 pub mod types;
 
 pub use engine::{MetricEngine, MetricEngineRef};
@@ -33,6 +34,7 @@ pub use query::{
     downsample, Aggregation, LabelMatcher, MatcherType, SamplePoint, SearchRequest, SeriesLatest,
     SeriesSamples,
 };
+pub use retention::RetentionPolicy;
 pub use types::{hash, Label, Sample};
 
 // Re-export error types.

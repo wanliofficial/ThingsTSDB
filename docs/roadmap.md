@@ -233,8 +233,18 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   上界为 `i64::MAX`，此前使 `month_of_millis`（`(year-1970)*12`）溢出并 panic，
   也会打开数百个空的未来月分区；区间完全落在磁盘跨度外时坍缩为空区间、不打开任何
   月分区。回归测试覆盖 search/last_values 的 i64::MAX/未来/越界场景。
+- 已完成（部分，2026-11-10）：每指标 TTL（读时裁剪）。`metric_engine::RetentionPolicy`
+  保存 metric→retention 映射（`Arc<HashMap>` + copy-on-write，读无锁），
+  `search`/`last_values`/`search_downsampled` 在解析索引前把区间下界抬到
+  `now - retention`，因此过期样本对查询不可见——即使它与长保留期的指标共享同一
+  segment。物理回收仍交给全局 segment TTL（按 segment 整体丢弃，保持 O(1)，不因
+  查询重写共享 segment）。server 配置 `[metric_engine.retention.per_metric]`
+  （如 `http_requests = "30d"`），经 `MetricEngine::with_retention` 传入。
+  单测覆盖空策略、抬下界、区间坍缩、未配置指标、非正保留期、copy-on-write、
+  时钟回拨 underflow；集成测试证明过期样本在 search/last_values 中不可见、近期样本
+  存活、未配置指标不受影响、更宽窗口可见两段。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层、本地块缓存。
-- 每指标 TTL、备份恢复、分片/副本与再平衡。
+- 备份恢复、分片/副本与再平衡。
 - TSBS IoT 场景基准、满载查询抖动测试、故障注入（kill -9、磁盘满、时钟回拨）。
 
 ## 七、兼容与迁移
