@@ -240,7 +240,21 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   同一次运行内还断言每条降采样查询与 raw `downsample` 逐点一致，因此 diff 同时指出
   是哪个读取路径变了。另有元测试保证黄金集覆盖全部匹配器与全部聚合、无重名，新形状
   不能悄悄漏测。`make test`（CI 的 unit-test job）已包含该集成测试。
-- 验收：黄金查询集进 CI；仪表盘类查询 p99 < 50 ms；全量 ad-hoc 明确为秒级 SLO。
+- 已完成（2026-11-11）：仪表盘查询延迟验收（p99 < 50 ms）。新增
+  `benchmarks --bin metric_rollup_bench`：200 序列 × 一天 10 s 采样（172.8 万样本）写入
+  后，比对 `search_downsampled`（读 1m/1h rollup）与 `search` + `downsample`（全量
+  raw）在同一查询形状下的延迟。结果（release，本机）：
+  - 仪表盘形状（`limit=5`、一天、1m step、7200 点）：rollup p50 10.0 ms / p99 11.3 ms，
+    raw p50 29.2 ms / p99 35.8 ms；
+  - 1h max（`limit=5`）：rollup p99 5.6 ms，raw p99 33.8 ms；
+  - 宽面板全 200 序列（一天、1h step、4320 点）：rollup p50 5.7 ms / p99 6.4 ms，
+    raw p50 481 ms / p99 603 ms（85×）；
+  - 宽面板 1m step（25.9 万输出点）rollup p99 169 ms：受限于必须物化的点数本身，
+    与读取路径无关（raw 同形状 p99 549 ms）。
+  即仪表盘类查询 p99 远低于 50 ms 目标，rollup 把宽时间范围的扫描成本从「样本数」
+  降到「桶数」。
+- 验收：黄金查询集进 CI（已完成）；仪表盘类查询 p99 < 50 ms（已完成，见上）；
+  全量 ad-hoc 明确为秒级 SLO。
 
 ### Phase 4：运维与生态（持续）
 

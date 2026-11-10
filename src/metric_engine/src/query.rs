@@ -411,8 +411,13 @@ impl MetricEngine {
 
         let step_start = align_up(start_ms, step_ms);
         let coverage = table.coverage();
-        let interval = table.interval_ms();
-        let mut fine: HashMap<u64, Vec<(i64, Rollup)>> = HashMap::new();
+        // Coarse buckets per series, built in one pass: a coarse bucket is
+        // usually the same as a fine one (1m steps) or exactly a divisor of it
+        // (5m / 1h steps), so this avoids materializing the fine buckets of a
+        // whole day and folding them back. Buckets are collected unsorted and
+        // merged once at the end: a `BTreeMap` here cost more than the scan of
+        // a day of minute buckets.
+        let mut coarse: HashMap<u64, Vec<(i64, Rollup)>> = HashMap::new();
 
         // Leading partial bucket: raw samples in [start, step_start).
         let lead_end = end_ms.min(step_start);
@@ -420,15 +425,7 @@ impl MetricEngine {
             let raw = self
                 .scan_samples(metric_id, &candidates, start_ms, lead_end)
                 .await?;
-            for (tsid, points) in raw {
-                let entry = fine.entry(tsid).or_default();
-                entry.extend(points.into_iter().map(|point| {
-                    (
-                        align_down(point.timestamp, interval),
-                        Rollup::sample(point.timestamp, point.value),
-                    )
-                }));
-            }
+            fold_raw(raw, &mut coarse, step_ms);
         }
 
         // Published buckets.
@@ -437,9 +434,7 @@ impl MetricEngine {
             let published = table
                 .read(metric_id, &candidates, step_start, published_end)
                 .await?;
-            for (tsid, buckets) in published {
-                fine.entry(tsid).or_default().extend(buckets);
-            }
+            fold_rollups(published, &mut coarse, step_ms);
         }
 
         // Unpublished tail: raw data, which is authoritative for everything the
@@ -449,41 +444,15 @@ impl MetricEngine {
             let raw = self
                 .scan_samples(metric_id, &candidates, tail_start, end_ms)
                 .await?;
-            for (tsid, points) in raw {
-                let entry = fine.entry(tsid).or_default();
-                entry.extend(points.into_iter().map(|point| {
-                    (
-                        align_down(point.timestamp, interval),
-                        Rollup::sample(point.timestamp, point.value),
-                    )
-                }));
-            }
+            fold_raw(raw, &mut coarse, step_ms);
         }
 
-        // Fold fine buckets into the requested step and render the aggregate.
-        let mut matched: Vec<(Vec<u8>, SeriesSamples)> = fine
+        // Merge the buckets of each series and render the requested aggregate.
+        let mut matched: Vec<(Vec<u8>, SeriesSamples)> = coarse
             .into_iter()
-            .filter_map(|(tsid, mut buckets)| {
+            .filter_map(|(tsid, buckets)| {
                 let (name, labels) = series.get(&tsid)?;
-                let mut coarse: BTreeMap<i64, Rollup> = BTreeMap::new();
-                // Folding in bucket order keeps the floating-point sums
-                // reproducible regardless of hash-map iteration order.
-                buckets.sort_by_key(|(bucket, _)| *bucket);
-                for (bucket, rollup) in buckets {
-                    coarse
-                        .entry(align_down(bucket, step_ms))
-                        .or_default()
-                        .merge(&rollup);
-                }
-                let samples = coarse
-                    .into_iter()
-                    .filter_map(|(bucket, rollup)| {
-                        (rollup.count > 0).then_some(SamplePoint {
-                            timestamp: bucket,
-                            value: rollup.value(agg),
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                let samples = merge_buckets(buckets, agg);
                 if samples.is_empty() {
                     return None;
                 }
@@ -737,6 +706,76 @@ pub fn downsample(samples: &[SamplePoint], step_ms: i64, agg: Aggregation) -> Ve
             value,
         });
     }
+    out
+}
+
+/// Folds raw samples into the coarse buckets of `step_ms`.
+///
+/// The raw scan deduplicated by `__seq__`, so every point is a distinct sample
+/// and folding straight into the coarse bucket is exactly what
+/// [`downsample`] would compute.
+fn fold_raw(
+    raw: HashMap<u64, Vec<SamplePoint>>,
+    out: &mut HashMap<u64, Vec<(i64, Rollup)>>,
+    step_ms: i64,
+) {
+    for (tsid, points) in raw {
+        let buckets = out.entry(tsid).or_default();
+        buckets.reserve(points.len());
+        for point in points {
+            buckets.push((
+                align_down(point.timestamp, step_ms),
+                Rollup::sample(point.timestamp, point.value),
+            ));
+        }
+    }
+}
+
+/// Folds published fine rollups into the coarse buckets of `step_ms`.
+fn fold_rollups(
+    published: HashMap<u64, Vec<(i64, Rollup)>>,
+    out: &mut HashMap<u64, Vec<(i64, Rollup)>>,
+    step_ms: i64,
+) {
+    for (tsid, buckets) in published {
+        let coarse = out.entry(tsid).or_default();
+        coarse.reserve(buckets.len());
+        for (bucket, rollup) in buckets {
+            coarse.push((align_down(bucket, step_ms), rollup));
+        }
+    }
+}
+
+/// Sorts the buckets of one series, merges the ones sharing a start, and
+/// renders `agg`.
+///
+/// Sorting before merging makes the floating-point sums reproducible regardless
+/// of hash-map iteration order, so the same query always returns the same bits.
+fn merge_buckets(mut buckets: Vec<(i64, Rollup)>, agg: Aggregation) -> Vec<SamplePoint> {
+    // A stable sort keeps the within-bucket order (scan order, then table
+    // order), which makes the floating-point sums reproducible.
+    buckets.sort_by_key(|(bucket, _)| *bucket);
+    let mut out: Vec<SamplePoint> = Vec::with_capacity(buckets.len());
+    let mut iter = buckets.into_iter();
+    let Some((mut bucket, mut merged)) = iter.next() else {
+        return out;
+    };
+    for (next_bucket, rollup) in iter {
+        if next_bucket == bucket {
+            merged.merge(&rollup);
+            continue;
+        }
+        out.push(SamplePoint {
+            timestamp: bucket,
+            value: merged.value(agg),
+        });
+        bucket = next_bucket;
+        merged = rollup;
+    }
+    out.push(SamplePoint {
+        timestamp: bucket,
+        value: merged.value(agg),
+    });
     out
 }
 
