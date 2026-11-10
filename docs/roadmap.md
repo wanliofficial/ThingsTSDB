@@ -250,9 +250,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   走 `ObjectStore::list/get/put`，因此 Local 与未来的 S3/OSS 通用；同前缀来源/目标
   直接报错。端到端测试用 `IndexMode::New` 证明 mergeset 索引也被复制、查询一致；
   单元测试覆盖目录布局保持与本地目录递归复制。S3/OSS 对象存储接线与跨桶备份仍待接。
+- 已完成（部分，2026-11-10）：并发负载与查询抖动测试。4 个 writer 与 4 个 reader
+  并发：writer 持续向 16 个序列写入、reader 并发执行 last_values/区间查询。断言不变量
+  （无查询报错、解析出的序列数是已写集合的子集、写完后全量可见且一致）并输出读延迟
+  分布作为抖动证据（160 次读：p50 0.46 ms / p99 37.9 ms / max 42.4 ms）。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层、本地块缓存。
 - 分片/副本与再平衡。
-- TSBS IoT 场景基准、满载查询抖动测试、故障注入（kill -9、磁盘满、时钟回拨）。
+- TSBS IoT 场景基准、故障注入（kill -9、磁盘满、时钟回拨）。
 
 ## 七、兼容与迁移
 

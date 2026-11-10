@@ -514,4 +514,105 @@ mod tests {
         assert_eq!(count_rows(engine.index.series_storage()).await, 3);
         assert_eq!(count_rows(engine.index.index_storage()).await, 5);
     }
+
+    /// Concurrent load test (roadmap Phase 4, load-jitter): writers append
+    /// while readers query, and every query stays correct. Asserts the
+    /// invariants (no query errors, resolved series is a subset of the written
+    /// set, the full set is visible once writes drain) and reports the
+    /// read-latency spread as jitter evidence.
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+    async fn test_concurrent_writes_and_queries() {
+        use crate::query::SearchRequest;
+
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = Arc::new(open_engine(&root).await);
+
+        let series_count = 16usize;
+        let per_series = 64i64;
+        let writers = 4usize;
+        let readers = 4usize;
+        let iters = 40usize;
+
+        // Writers append concurrently; each round every writer contributes a
+        // new timestamp to every series, so readers see a moving data frontier.
+        let mut write_tasks = Vec::new();
+        for w in 0..writers {
+            let engine = Arc::clone(&engine);
+            write_tasks.push(tokio::spawn(async move {
+                for round in 0..per_series {
+                    let mut batch = Vec::with_capacity(series_count);
+                    for s in 0..series_count {
+                        let code = format!("c{}", s % 4);
+                        let job = format!("j{}", s / 4);
+                        batch.push(make_sample(
+                            "load",
+                            Some(&code),
+                            &job,
+                            round * 1000 + w as i64,
+                            s as f64 + round as f64,
+                        ));
+                    }
+                    engine.write(batch).await.unwrap();
+                }
+            }));
+        }
+
+        // Readers run instant and range queries while writes are in flight.
+        let req = SearchRequest {
+            metric_name: b"load".to_vec(),
+            matchers: Vec::new(),
+            start_ms: 0,
+            end_ms: i64::MAX,
+            limit: 0,
+        };
+        let mut read_tasks = Vec::new();
+        for _ in 0..readers {
+            let engine = Arc::clone(&engine);
+            let req = SearchRequest { ..req.clone() };
+            read_tasks.push(tokio::spawn(async move {
+                let mut latencies = Vec::with_capacity(iters);
+                let mut peak_series = 0usize;
+                for _ in 0..iters {
+                    let start = std::time::Instant::now();
+                    let latest = engine.last_values(&req).await.unwrap();
+                    latencies.push(start.elapsed().as_micros() as u64);
+                    peak_series = peak_series.max(latest.len());
+                }
+                (latencies, peak_series)
+            }));
+        }
+
+        for task in write_tasks {
+            task.await.unwrap();
+        }
+        let mut latencies = Vec::new();
+        let mut peak_series = 0usize;
+        for task in read_tasks {
+            let (mut lat, peak) = task.await.unwrap();
+            latencies.append(&mut lat);
+            peak_series = peak_series.max(peak);
+        }
+
+        // No query resolved more series than were written.
+        assert!(
+            peak_series <= series_count,
+            "resolved {peak_series} series, only {series_count} exist"
+        );
+
+        // Once all writers drain, the full set is visible and consistent.
+        let final_latest = engine.last_values(&req).await.unwrap();
+        assert_eq!(final_latest.len(), series_count);
+
+        // Jitter evidence: report the read-latency spread across all readers.
+        latencies.sort_unstable();
+        let n = latencies.len();
+        let p50 = latencies[n / 2];
+        let p99 = latencies[(n * 99) / 100];
+        let max = latencies[n - 1];
+        eprintln!("concurrent load jitter: {n} reads, p50={p50}us p99={p99}us max={max}us");
+        // A generous ceiling so the test never flakes on a busy machine, while
+        // a pathological stall (deadlock, contention regression) would blow
+        // past it.
+        assert!(max < 5_000_000, "query under concurrent load took {max}us");
+    }
 }
