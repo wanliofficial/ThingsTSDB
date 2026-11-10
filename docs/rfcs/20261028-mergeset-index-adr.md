@@ -1080,6 +1080,58 @@ Two Phase 3 read shapes build on the same resolver:
   write-amplification targets, the 10M capacity run and the write-throughput
   comparison are closed.
 
+### 12.5.5 Deployed query-path bounds and the cold-path floor (2026-11-10)
+
+The `DualRead` engine answers a dashboard query through three steps: resolve the
+matching series ids from the index, reconstruct their labels, then scan and
+materialize their samples. Three changes bound the two steps that scale with the
+matched-series count:
+
+- **`SearchRequest::limit`** (0 = unlimited): after matching, only this many
+  series' samples are scanned. A panel renders a bounded number of series; the
+  rest is the dominant cost of a wide query. Ids are sorted before truncation so
+  results are deterministic. `search`, `last_values` and `search_downsampled`
+  all honour it, and the server exposes `?limit=`.
+- **`IN_LIST_LIMIT` → 1000**: pushing the candidate set as a DataFusion `IN`
+  list costs ~19 B/row of predicate plus per-row evaluation. At 200k series a
+  two-tag filter matching 154k series took 1.4 s pushed down vs 44 ms scanning
+  in place; above the bound the scan stays wide and batches are filtered here.
+- **`query_bounds` clamp**: an open lower bound maps to the first on-disk
+  partition's first day (not the epoch, whose day set is the whole series space),
+  and the range is clamped into the on-disk partition span. This also fixes a
+  crash: the HTTP API's default open upper bound (`i64::MAX`) overflowed
+  `month_of_millis` and panicked every open-ended query.
+
+At 200k series (`metric_query_bench`, window `= ts`): name-only 1.8 s p50 /
+3.9 s p99 (index 0.7 ms), eq instance 42 ms / 44 ms, re instance 36 ms / 46 ms,
+eq job (wide) 45 ms / 56 ms with `limit=1000` vs 1.6 s without.
+
+**Cold-path floor.** The in-memory 64-bit bitset intersection
+(`SeriesIdSet::intersect_bitmap`, pooled buffers) speeds up two large dense sets,
+and `from_ids` skips the sort when the decoded posting IDs are already sorted
+(posting rows are written sorted). Neither moves the cold first-touch latency,
+because it is not the intersection but the *read and decode* of the per-day and
+per-metric-group posting sets that dominates. `index_query_bench` at 1M series
+splits the cold cost as a ~60 ms floor for the day+group set (2 × 8 MiB of
+fixed-width postings read from the parts and decoded) regardless of shape, plus
+the filter-specific posting read and name reconstruction:
+
+| Shape | Cold total | of which day_set |
+|---|---|---|
+| eq instance | 116.8 ms | 61.5 ms |
+| eq job+code | 224.5 ms | 59.2 ms |
+| prefix instance | 859.8 ms | 61.8 ms |
+| regex code | 166.2 ms | 58.4 ms |
+
+The floor scales ~linearly with series count (~1.4 s at 10M, matching the
+capacity run). It is I/O- and decode-bound on fixed-width 64-bit IDs, so the
+only way under 5 ms is a persisted compact posting representation. Because the
+xxhash TSIDs are random over the u64 space (no runs), even a roaring bitmap
+stores them as an array container — no win — so the representation requires
+dense per-metric IDs, i.e. a TSID encoding change. That remains the one open
+cold-query acceptance item (§12.5.1); every warm target is met and the cold cost
+is now separately measured and documented.
+
 ## 13. Observability
 
 Expose counters and gauges from the first milestone:
