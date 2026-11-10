@@ -142,25 +142,39 @@ impl IndexDbManager {
     /// so a range that starts at the epoch drags the first day's set into every
     /// query. Day 0 holds no samples, and the per-day rows only exist under
     /// partitions that were actually written.
+    /// Clamps a query range to the span of partitions that exist on disk and to
+    /// at least one day.
+    ///
+    /// Two reasons:
+    ///
+    /// - The per-day pruning intersects with the union of every day in the
+    ///   range, so a range that starts at the epoch drags the first day's set
+    ///   into every query. An open lower bound (`<= 0`) maps to the first
+    ///   partition's first day; day 0 holds no samples.
+    /// - The HTTP API defaults an open upper bound to `i64::MAX`, which would
+    ///   overflow `month_of_millis` and open hundreds of empty future months.
+    ///   Clamping to the last partition's end keeps the range inside disk.
     fn query_bounds(&self, start_ms: i64, end_ms: i64) -> (i64, i64) {
         const DAY_MS: i64 = 86_400_000;
-        let start = if start_ms > 0 {
-            start_ms
-        } else {
-            let first_month = *self
-                .months
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .next()
-                .unwrap_or(&0);
-            timeutil::month_first_day(first_month) as i64 * DAY_MS
-        };
-        let end = if end_ms > start {
-            end_ms
-        } else {
-            start + DAY_MS
-        };
+        let months = self.months.lock().unwrap_or_else(|e| e.into_inner());
+        let first = *months.iter().next().unwrap_or(&0);
+        let last = *months.iter().next_back().unwrap_or(&first);
+        let disk_start = timeutil::month_first_day(first) as i64 * DAY_MS;
+        // First millisecond past the newest partition; a partition index is at
+        // most u16::MAX, so this cannot overflow.
+        let disk_end = timeutil::month_first_day(last + 1) as i64 * DAY_MS;
+        // Clamp the requested range into the on-disk span. This maps an open
+        // lower bound (`<= 0`) to the first partition's first day and an open
+        // upper bound (the HTTP API sends `i64::MAX`) to just past the last
+        // partition, so `month_of_millis` never overflows and no empty future
+        // month is opened.
+        let start = start_ms.clamp(disk_start, disk_end);
+        let mut end = end_ms.clamp(disk_start, disk_end);
+        // A request entirely outside the disk span collapses to an empty range
+        // (start == end), so the caller opens no month partition.
+        if end <= start {
+            end = start;
+        }
         (start, end)
     }
 
@@ -352,6 +366,12 @@ impl IndexDbManager {
         // the epoch, or the first day's set (often the whole series space for
         // a dense metric) is scanned and unioned into every query.
         let (start_ms, end_ms) = self.query_bounds(start_ms, end_ms);
+        // An empty (out-of-disk-span) range matches nothing; skip the month
+        // scan entirely rather than computing `month_of_millis(end_ms - 1)`,
+        // which would underflow when `end_ms` is 0.
+        if end_ms <= start_ms {
+            return Ok(HashMap::new());
+        }
         let first_month = timeutil::month_of_millis(start_ms);
         let last_month = timeutil::month_of_millis(end_ms - 1);
         let mut plan_matchers = Vec::with_capacity(matchers.len() + 1);
@@ -405,6 +425,12 @@ impl IndexDbManager {
     /// index can be skipped for a metric during migration.
     pub fn group_series_ids(&self, group: &[u8], start_ms: i64, end_ms: i64) -> Result<Vec<u64>> {
         let (start_ms, end_ms) = self.query_bounds(start_ms, end_ms);
+        // An empty (out-of-disk-span) range matches nothing; skip the month
+        // scan entirely rather than computing `month_of_millis(end_ms - 1)`,
+        // which would underflow when `end_ms` is 0.
+        if end_ms <= start_ms {
+            return Ok(Vec::new());
+        }
         let first_month = timeutil::month_of_millis(start_ms);
         let last_month = timeutil::month_of_millis(end_ms - 1);
         let plan = QueryPlan::from_matchers(&[TagMatcher::Equal {

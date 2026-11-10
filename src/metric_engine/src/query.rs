@@ -1155,6 +1155,46 @@ mod tests {
         assert_eq!(engine.index_stats().unwrap().legacy_union_skips(), 0);
     }
 
+    /// The HTTP API defaults an open upper bound to `i64::MAX`; the index must
+    /// clamp the range to the on-disk partitions instead of overflowing
+    /// `month_of_millis` or opening hundreds of empty future months. A bounded
+    /// range over the written data still resolves.
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_search_clamps_open_and_future_bounds() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine_with_mode(&root, IndexMode::DualRead).await;
+        prepare_data(&engine).await;
+        engine.indexdb().unwrap().flush().unwrap();
+
+        // `i64::MAX` end (the server default) and a future start must not panic
+        // and must return the same series as the explicit data range.
+        let open = engine
+            .search(&search_req("m1", vec![], 0, i64::MAX))
+            .await
+            .unwrap();
+        let explicit = engine
+            .search(&search_req("m1", vec![], 0, 100))
+            .await
+            .unwrap();
+        assert_eq!(open.len(), explicit.len());
+        assert_eq!(open.len(), 2);
+
+        // A range entirely in the future (past every partition) matches
+        // nothing.
+        let future = engine
+            .search(&search_req("m1", vec![], 100_000_000_000, 100_000_100_000))
+            .await
+            .unwrap();
+        assert!(future.is_empty());
+
+        // `last_values` shares the same resolver and must not overflow either.
+        let last = engine
+            .last_values(&search_req("m1", vec![], 0, i64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(last.len(), 2);
+    }
+
     /// The mergeset index and the legacy inverted index must resolve the same
     /// series for every matcher type, across the time range and label
     /// reconstruction. This is the migration gate in ADR-0001 §12.5.

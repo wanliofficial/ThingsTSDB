@@ -16,6 +16,7 @@
 // under the License.
 
 mod config;
+mod metrics;
 
 use std::{
     fs,
@@ -23,6 +24,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use actix_web::{
@@ -46,7 +48,10 @@ use remote_write::{pooled_parser::PooledParser, pooled_types::WriteRequest as Re
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, ObjectStorageConfig};
+use crate::{
+    config::{Config, ObjectStorageConfig},
+    metrics::{QueryKind, ServerMetrics},
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about)]
@@ -251,10 +256,27 @@ async fn query_json(
 ) -> impl Responder {
     let request = match parse_search_request(&params) {
         Ok(request) => request,
-        Err(message) => return HttpResponse::BadRequest().body(message),
+        Err(message) => {
+            data.metrics.record_rejected(QueryKind::RANGE);
+            return HttpResponse::BadRequest().body(message);
+        }
     };
+    let started = Instant::now();
     match data.engine.search(&request).await {
         Ok(series) => {
+            let samples = series.iter().map(|s| s.samples.len() as u64).sum::<u64>();
+            data.metrics.observe(
+                QueryKind::RANGE,
+                started.elapsed(),
+                series.len() as u64,
+                samples,
+                &format!(
+                    "range query metric={} matchers={} series={}",
+                    String::from_utf8_lossy(&request.metric_name),
+                    request.matchers.len(),
+                    series.len()
+                ),
+            );
             let series_json: Vec<serde_json::Value> = series
                 .iter()
                 .map(|s| {
@@ -272,7 +294,10 @@ async fn query_json(
                 .collect();
             HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
         }
-        Err(e) => HttpResponse::InternalServerError().body(format!("query failed: {e}")),
+        Err(e) => {
+            data.metrics.record_failed(QueryKind::RANGE);
+            HttpResponse::InternalServerError().body(format!("query failed: {e}"))
+        }
     }
 }
 
@@ -286,10 +311,26 @@ async fn last_json(
 ) -> impl Responder {
     let request = match parse_search_request(&params) {
         Ok(request) => request,
-        Err(message) => return HttpResponse::BadRequest().body(message),
+        Err(message) => {
+            data.metrics.record_rejected(QueryKind::LAST);
+            return HttpResponse::BadRequest().body(message);
+        }
     };
+    let started = Instant::now();
     match data.engine.last_values(&request).await {
         Ok(series) => {
+            data.metrics.observe(
+                QueryKind::LAST,
+                started.elapsed(),
+                series.len() as u64,
+                series.len() as u64,
+                &format!(
+                    "last query metric={} matchers={} series={}",
+                    String::from_utf8_lossy(&request.metric_name),
+                    request.matchers.len(),
+                    series.len()
+                ),
+            );
             let series_json: Vec<serde_json::Value> = series
                 .iter()
                 .map(|s| {
@@ -306,7 +347,10 @@ async fn last_json(
                 .collect();
             HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
         }
-        Err(e) => HttpResponse::InternalServerError().body(format!("last query failed: {e}")),
+        Err(e) => {
+            data.metrics.record_failed(QueryKind::LAST);
+            HttpResponse::InternalServerError().body(format!("last query failed: {e}"))
+        }
     }
 }
 
@@ -322,11 +366,17 @@ async fn query_range_json(
 ) -> impl Responder {
     let request = match parse_search_request(&params) {
         Ok(request) => request,
-        Err(message) => return HttpResponse::BadRequest().body(message),
+        Err(message) => {
+            data.metrics.record_rejected(QueryKind::RANGE_STEP);
+            return HttpResponse::BadRequest().body(message);
+        }
     };
     let step: i64 = match params.get("step").map(|v| v.parse()).transpose() {
         Ok(Some(step)) if step > 0 => step,
-        _ => return HttpResponse::BadRequest().body("step must be a positive integer (ms)"),
+        _ => {
+            data.metrics.record_rejected(QueryKind::RANGE_STEP);
+            return HttpResponse::BadRequest().body("step must be a positive integer (ms)");
+        }
     };
     let agg = match params.get("agg").map(String::as_str).unwrap_or("avg") {
         "avg" => Aggregation::Avg,
@@ -335,10 +385,27 @@ async fn query_range_json(
         "sum" => Aggregation::Sum,
         "count" => Aggregation::Count,
         "last" => Aggregation::Last,
-        other => return HttpResponse::BadRequest().body(format!("unknown aggregation {other:?}")),
+        other => {
+            data.metrics.record_rejected(QueryKind::RANGE_STEP);
+            return HttpResponse::BadRequest().body(format!("unknown aggregation {other:?}"));
+        }
     };
+    let started = Instant::now();
     match data.engine.search_downsampled(&request, step, agg).await {
         Ok(series) => {
+            let samples = series.iter().map(|s| s.samples.len() as u64).sum::<u64>();
+            data.metrics.observe(
+                QueryKind::RANGE_STEP,
+                started.elapsed(),
+                series.len() as u64,
+                samples,
+                &format!(
+                    "range_step query metric={} step={}ms series={}",
+                    String::from_utf8_lossy(&request.metric_name),
+                    step,
+                    series.len()
+                ),
+            );
             let series_json: Vec<serde_json::Value> = series
                 .iter()
                 .map(|s| {
@@ -356,8 +423,36 @@ async fn query_range_json(
                 .collect();
             HttpResponse::Ok().json(serde_json::json!({ "series": series_json }))
         }
-        Err(e) => HttpResponse::InternalServerError().body(format!("range query failed: {e}")),
+        Err(e) => {
+            data.metrics.record_failed(QueryKind::RANGE_STEP);
+            HttpResponse::InternalServerError().body(format!("range query failed: {e}"))
+        }
     }
+}
+
+/// Query observability: counters, a latency histogram and quantiles for the
+/// query endpoints, plus the slow-query log. Returns Prometheus text exposition
+/// (roadmap Phase 4, observability).
+#[get("/api/v1/stats")]
+async fn stats_json(data: web::Data<AppState>) -> impl Responder {
+    let mut body = String::from("# HoraeDB query metrics\n");
+    for kind in 0..QueryKind::COUNT {
+        if let Some(q) = data.metrics.latency_quantiles(kind) {
+            body.push_str(&format!(
+                "# kind={} count={} avg_us={} p50_us={} p99_us={}\n",
+                QueryKind::name(kind),
+                q.count,
+                q.avg_us,
+                q.p50_us,
+                q.p99_us
+            ));
+        }
+    }
+    body.push_str("\n");
+    body.push_str(&data.metrics.render_prometheus());
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(body)
 }
 
 /// Parses `metric`, `start`, `end` and an exact-match `filter` list such as
@@ -443,6 +538,7 @@ fn convert_request(request: &RemoteWriteRequest) -> Vec<Sample> {
 struct AppState {
     engine: MetricEngineRef,
     keep_writing: Arc<AtomicBool>,
+    metrics: ServerMetrics,
 }
 
 pub fn main() {
@@ -512,6 +608,7 @@ pub fn main() {
         let app_state = Data::new(AppState {
             engine,
             keep_writing,
+            metrics: ServerMetrics::default(),
         });
         info!(port, "Start HoraeDB http server...");
         HttpServer::new(move || {
@@ -528,6 +625,7 @@ pub fn main() {
                 .service(query_json)
                 .service(last_json)
                 .service(query_range_json)
+                .service(stats_json)
         })
         .workers(4)
         .bind(("127.0.0.1", port))
