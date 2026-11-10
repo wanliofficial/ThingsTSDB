@@ -141,7 +141,23 @@ impl SeriesIdSet {
     }
 
     /// Returns `self ∩ other`. Both inputs must be sorted and deduplicated.
+    ///
+    /// The merge walk costs `O(|a| + |b|)`, but a point filter against a large
+    /// day set only has a handful of IDs. When one side is at least 16x
+    /// smaller, probe it against the other with a binary search per ID
+    /// (`O(|small| log |big|)`), which is what makes an exact-tag query cheap
+    /// even when the per-day set holds millions of series.
     pub fn intersect(a: &SeriesIdSet, b: &SeriesIdSet) -> SeriesIdSet {
+        let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        if small.len().saturating_mul(16) < big.len() {
+            let ids = small
+                .ids()
+                .iter()
+                .copied()
+                .filter(|id| big.contains(*id))
+                .collect();
+            return SeriesIdSet { ids };
+        }
         let mut out = Vec::with_capacity(a.len().min(b.len()));
         let (mut i, mut j) = (0, 0);
         let (a, b) = (a.ids(), b.ids());
@@ -211,6 +227,17 @@ mod tests {
         let b = SeriesIdSet::from_ids([3, 4, 5, 6]);
         assert_eq!(SeriesIdSet::intersect(&a, &b).ids(), &[3, 4]);
         assert_eq!(SeriesIdSet::union(&a, &b).ids(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_intersect_probes_the_much_smaller_side() {
+        let small = SeriesIdSet::from_ids([3, 7, 1_000]);
+        let big = SeriesIdSet::from_ids(0..10_000u64);
+        assert_eq!(SeriesIdSet::intersect(&small, &big).ids(), &[3, 7, 1_000]);
+        // The probe is symmetric.
+        assert_eq!(SeriesIdSet::intersect(&big, &small).ids(), &[3, 7, 1_000]);
+        let missing = SeriesIdSet::from_ids([10_000, 20_000]);
+        assert!(SeriesIdSet::intersect(&big, &missing).is_empty());
     }
 
     #[test]

@@ -914,7 +914,7 @@ Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
   per-filter sets are all cached, and `IndexDb::cache()` exposes hits/misses/
   retained IDs. Flushes and merges keep the logical result unchanged, so only
   writes invalidate.
-- Tests: 191 `storage_kernel` lib tests + the `index_wal_kill9` integration
+- Tests: 192 `storage_kernel` lib tests + the `index_wal_kill9` integration
   test, and 14 `metric_engine` tests, including the migration gate: identical
   data served in `Legacy` and `New` mode must return identical results for
   empty, Eq, Neq, Re, Nre, intersected and out-of-range queries. Cache tests
@@ -929,29 +929,32 @@ one part, WAL fsync disabled):
 |---|---|---|
 | on-disk index size | 51.8 B/series | < 200 B/series ✅ |
 | write amplification | 1.46x | < 5x ✅ |
-| write throughput | ~14.4k series/s, 230k rows/s | — |
-| Eq exact p50/p99 | 0.50 / 3.3 ms | < 5 ms ✅ (warm) |
-| Eq two tags p50/p99 | 4.1 / 8.4 ms | < 5 ms ❌ |
-| Regex (prefix) p50/p99 | 1.5 / 5.1 ms | < 5 ms (borderline) |
-| Regex (general) p50/p99 | 1.8 / 5.8 ms | < 5 ms (borderline) |
+| write throughput | ~18.3k series/s, 293k rows/s | — |
+| Eq exact p50/p99 | 0.57 / 1.8 ms | < 5 ms ✅ |
+| Eq two tags p50/p99 | 3.4 / 4.8 ms | < 5 ms ✅ |
+| Regex (prefix) p50/p99 | 0.67 / 1.45 ms | < 5 ms ✅ |
+| Regex (general) p50/p99 | 2.3 / 3.1 ms | < 5 ms ✅ |
 | cache hits / misses | 2593 / 7 (781k retained IDs) | — |
 
 The cache removes the per-query materialization and sort of the metric-group,
 per-day and posting sets, which was the dominant cost: the same run drops from
-21.2/27.9 ms to 0.50/3.3 ms (Eq exact), 41.8/52.1 to 4.1/8.4 ms (Eq two tags)
-and 31.4/38.9 to 1.8/5.8 ms (general regex). The `max` of the Eq shape (22 ms)
-is the first, cold query; p99 mixes the four cold resolutions into 200 warm
-samples per shape, and the benchmark repeats four dashboard-style queries, so
-the 2593/7 ratio is the steady state of repeated panels, not a cold workload.
+21.2/27.9 ms to 0.57/1.8 ms (Eq exact), 41.8/52.1 to 3.4/4.8 ms (Eq two tags)
+and 31.4/38.9 to 2.3/3.1 ms (general regex). `SeriesIdSet::intersect` also
+switches to a binary-search probe when one side is at least 16x smaller than
+the other, so a point filter does not walk a 200k-ID day set (p99 of the prefix
+shape falls from 5.1 to 1.45 ms from that change alone). The `max` of each
+shape (20-100 ms) is the first, cold query; p99 mixes the four cold resolutions
+into 200 warm samples per shape, and the benchmark repeats four dashboard-style
+queries, so the 2593/7 ratio is the steady state of repeated panels, not a cold
+workload.
 
-What remains is the linear intersection of the cached day set (200k IDs here)
-with the metric-group and posting sets, and cloning the winner: a point query
-still walks the day set, and a broad two-tag query walks a 154k-ID posting.
-Closing p99 < 5 ms at 10M-series scale needs a dense/compressed bitmap
-representation (roaring day sets, or a per-metric bitmap), because the posting
-IDs are 64-bit hashes and the cost is proportional to the set sizes rather than
-to the result size; a binary-search probe would only help the point shapes and
-would not fix the broad ones. That work is deferred to Phase 3.
+The remaining per-query cost is the intersection of two large cached sets (the
+metric group and the day set, both 200k IDs here) and the union of the result,
+which is proportional to the set sizes. At the same 200k/800 workload all four
+shapes now meet the < 5 ms p99 target, but the 10M-series goal still needs a
+dense/compressed bitmap representation (roaring day sets, or a per-metric
+bitmap), because the posting IDs are 64-bit hashes and a linear merge over 10M
+IDs is ~100 ms. The capacity run and the bitmap representation stay in Phase 3.
 
 - Remaining for the acceptance targets: the bitmap set representation above, the
   10M-series capacity run and a write-throughput comparison against the legacy
