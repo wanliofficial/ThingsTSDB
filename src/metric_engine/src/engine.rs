@@ -41,6 +41,7 @@ use crate::{
     last_cache::LastCache,
     metric::MetricManager,
     retention::RetentionPolicy,
+    rollup::RollupManager,
     types::Sample,
     Result,
 };
@@ -82,6 +83,9 @@ pub struct MetricEngine {
     /// Per-metric read-time retention windows (roadmap Phase 4). Empty by
     /// default; set with [`MetricEngine::with_retention`].
     pub(crate) retention: Arc<RetentionPolicy>,
+    /// Write-time 1m/1h rollup tables (roadmap Phase 3). Downsampled queries
+    /// read them once their step is a multiple of a resolution.
+    pub(crate) rollups: RollupManager,
     /// The engine root prefix, retained so [`MetricEngine::backup`] can copy
     /// the whole tree.
     pub(crate) root_path: String,
@@ -168,17 +172,28 @@ impl MetricEngine {
             open_table_storage(
                 format!("{root_path}/data"),
                 segment_duration,
-                store,
+                store.clone(),
                 crate::data::schema(),
                 3,
-                storage_opts,
-                runtimes,
+                storage_opts.clone(),
+                runtimes.clone(),
             )
             .await?,
         );
 
         let metric = Arc::new(MetricManager::new(metric_storage));
         let index = Arc::new(IndexManager::new(series_storage, index_storage));
+        // Write-time rollups read the raw data table to rebuild a bucket a
+        // late write invalidated, so they share the same storage handle.
+        let rollups = RollupManager::open(
+            root_path,
+            store.clone(),
+            Arc::clone(&data_storage),
+            segment_duration,
+            storage_opts,
+            runtimes,
+        )
+        .await?;
         let data = Arc::new(SampleManager::new(data_storage));
         let indexdb = Arc::new(
             IndexDbManager::open(root_path, Default::default())
@@ -192,6 +207,7 @@ impl MetricEngine {
             index_mode,
             last_cache: Arc::new(LastCache::with_default_capacity()),
             retention: Arc::new(RetentionPolicy::new()),
+            rollups,
             root_path: root_path.to_string(),
             store: backup_store,
         };
@@ -231,7 +247,12 @@ impl MetricEngine {
             .collect();
         let result = self.data.persist(samples).await;
         if result.is_ok() {
+            // The rollups mirror the durable data, so a bucket's aggregate is
+            // never ahead of what a raw scan would return.
+            self.rollups.record(&mirrored);
             last.update(&mirrored);
+            // Publish closed buckets periodically so the buffers stay bounded.
+            self.rollups.maybe_flush(common::now()).await;
         }
         result
     }
@@ -271,6 +292,11 @@ impl MetricEngine {
         &self.retention
     }
 
+    /// The write-time 1m/1h rollup tables.
+    pub fn rollups(&self) -> &RollupManager {
+        &self.rollups
+    }
+
     /// Trigger compaction of all tables.
     pub async fn compact(&self) -> Result<()> {
         let storages = [
@@ -278,6 +304,8 @@ impl MetricEngine {
             (self.index.series_storage(), "series"),
             (self.index.index_storage(), "index"),
             (self.data.storage(), "data"),
+            (self.rollups.minute().storage(), "rollup-1m"),
+            (self.rollups.hour().storage(), "rollup-1h"),
         ];
         for (storage, name) in storages {
             if let Err(e) = storage.compact(CompactRequest::default()).await {
@@ -296,11 +324,16 @@ impl MetricEngine {
     /// on-disk state is a consistent snapshot for
     /// [`MetricEngine::backup`].
     pub async fn flush_all(&self) -> Result<()> {
+        // Publish the buckets that closed before now, so the flush below also
+        // makes them durable.
+        self.rollups.flush_closed(common::now()).await?;
         let storages = [
             (self.metric.storage(), "metrics"),
             (self.index.series_storage(), "series"),
             (self.index.index_storage(), "index"),
             (self.data.storage(), "data"),
+            (self.rollups.minute().storage(), "rollup-1m"),
+            (self.rollups.hour().storage(), "rollup-1h"),
         ];
         for (storage, name) in storages {
             storage
@@ -614,5 +647,256 @@ mod tests {
         // a pathological stall (deadlock, contention regression) would blow
         // past it.
         assert!(max < 5_000_000, "query under concurrent load took {max}us");
+    }
+
+    // --- write-time rollups (roadmap Phase 3) -----------------------------
+
+    use crate::query::{downsample, Aggregation, SearchRequest, SeriesSamples};
+
+    /// A multiple of both an hour and a minute, so every rollup bucket in the
+    /// tests is aligned.
+    const BASE: i64 = 1_699_999_200_000;
+
+    fn query(name: &str, start: i64, end: i64) -> SearchRequest {
+        SearchRequest {
+            metric_name: name.as_bytes().to_vec(),
+            matchers: Vec::new(),
+            start_ms: start,
+            end_ms: end,
+            limit: 0,
+        }
+    }
+
+    /// Ten minutes of two series, sampled every 10 s and 15 s.
+    async fn write_history(engine: &MetricEngine) {
+        let mut samples = Vec::new();
+        for i in 0..60i64 {
+            samples.push(make_sample(
+                "cpu",
+                Some("200"),
+                "api",
+                BASE + i * 10_000,
+                (i as f64 * 7.0) % 13.0 - 3.0,
+            ));
+        }
+        for i in 0..40i64 {
+            samples.push(make_sample(
+                "cpu",
+                Some("404"),
+                "api",
+                BASE + i * 15_000,
+                100.0 - i as f64,
+            ));
+        }
+        engine.write(samples).await.unwrap();
+    }
+
+    /// The reference answer: raw samples reduced by [`downsample`].
+    async fn raw_downsampled(
+        engine: &MetricEngine,
+        req: &SearchRequest,
+        step_ms: i64,
+        agg: Aggregation,
+    ) -> Vec<SeriesSamples> {
+        let mut series = engine.search(req).await.unwrap();
+        for series in &mut series {
+            series.samples = downsample(&series.samples, step_ms, agg);
+        }
+        series
+    }
+
+    fn assert_same_series(got: &[SeriesSamples], want: &[SeriesSamples], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: series count");
+        for (got, want) in got.iter().zip(want) {
+            assert_eq!(got.metric_name, want.metric_name, "{what}: name");
+            assert_eq!(got.labels.len(), want.labels.len(), "{what}: labels");
+            assert_eq!(
+                got.samples.len(),
+                want.samples.len(),
+                "{what}: point count of {:?}",
+                String::from_utf8_lossy(&got.metric_name)
+            );
+            for (got, want) in got.samples.iter().zip(&want.samples) {
+                assert_eq!(got.timestamp, want.timestamp, "{what}: timestamp");
+                assert!(
+                    (got.value - want.value).abs() <= 1e-9 * want.value.abs().max(1.0),
+                    "{what}: value {} vs {}",
+                    got.value,
+                    want.value
+                );
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_rollup_matches_raw_downsample() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine(&root).await;
+        write_history(&engine).await;
+        // Publishing is what moves buckets from memory into the table.
+        engine.flush_all().await.unwrap();
+
+        let aggs = [
+            Aggregation::Avg,
+            Aggregation::Min,
+            Aggregation::Max,
+            Aggregation::Sum,
+            Aggregation::Count,
+            Aggregation::Last,
+        ];
+        // 1m reads the minute table, 5m and 1h exercise re-aggregation (5m
+        // folds minute buckets, 1h folds hour buckets).
+        for step in [60_000i64, 300_000, 3_600_000] {
+            let table = engine.rollups().for_step(step).expect("step is covered");
+            assert!(
+                table.coverage() > BASE,
+                "step {step} should have published buckets"
+            );
+            // An aligned range and one that starts mid-bucket, so the leading
+            // partial bucket is served from raw data.
+            for (start, end) in [
+                (BASE, BASE + 600_000),
+                (BASE + 30_000, BASE + 600_000),
+                (BASE + 12_345, BASE + 480_000),
+            ] {
+                let req = query("cpu", start, end);
+                for agg in aggs {
+                    let want = raw_downsampled(&engine, &req, step, agg).await;
+                    let got = engine.search_downsampled(&req, step, agg).await.unwrap();
+                    assert_same_series(
+                        &got,
+                        &want,
+                        &format!("step {step} agg {agg:?} range {start}..{end}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_rollup_matches_raw_after_open_and_late_writes() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine(&root).await;
+        write_history(&engine).await;
+        engine.flush_all().await.unwrap();
+
+        // A sample newer than everything published: it lands in an open bucket
+        // and must be served from raw data.
+        engine
+            .write(vec![make_sample(
+                "cpu",
+                Some("200"),
+                "api",
+                BASE + 9 * 60_000 + 30_000,
+                1_000.0,
+            )])
+            .await
+            .unwrap();
+        let req = query("cpu", BASE - 60_000, BASE + 600_000);
+        for step in [60_000i64, 300_000] {
+            let want = raw_downsampled(&engine, &req, step, Aggregation::Avg).await;
+            let got = engine
+                .search_downsampled(&req, step, Aggregation::Avg)
+                .await
+                .unwrap();
+            assert_same_series(&got, &want, &format!("open tail, step {step}"));
+        }
+
+        // A rewrite of an already published sample marks its bucket dirty.
+        engine
+            .write(vec![make_sample(
+                "cpu",
+                Some("200"),
+                "api",
+                BASE + 5_000,
+                500.0,
+            )])
+            .await
+            .unwrap();
+        let minute = engine.rollups().minute();
+        assert!(
+            minute.coverage() <= BASE,
+            "a late write must lower coverage to the dirty bucket"
+        );
+        let want = raw_downsampled(&engine, &req, 60_000, Aggregation::Max).await;
+        let got = engine
+            .search_downsampled(&req, 60_000, Aggregation::Max)
+            .await
+            .unwrap();
+        assert_same_series(&got, &want, "dirty bucket falls back to raw data");
+
+        // The next flush rebuilds the dirty bucket from raw data.
+        engine.flush_all().await.unwrap();
+        assert!(engine.rollups().minute().coverage() > BASE + 60_000);
+        for agg in [Aggregation::Max, Aggregation::Sum, Aggregation::Count] {
+            let want = raw_downsampled(&engine, &req, 60_000, agg).await;
+            let got = engine.search_downsampled(&req, 60_000, agg).await.unwrap();
+            assert_same_series(&got, &want, &format!("rebuilt bucket, agg {agg:?}"));
+        }
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_rollup_serves_open_bucket_from_raw_data() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine(&root).await;
+        write_history(&engine).await;
+        engine.flush_all().await.unwrap();
+
+        // A sample in the current minute: its bucket is still open, so the
+        // query must reach it through raw data rather than the table.
+        let now = common::now();
+        engine
+            .write(vec![make_sample(
+                "cpu",
+                Some("200"),
+                "api",
+                now - 5_000,
+                1_234.0,
+            )])
+            .await
+            .unwrap();
+        let minute = engine.rollups().minute();
+        assert!(
+            minute.coverage() <= now - 5_000,
+            "the current minute must stay unpublished"
+        );
+
+        let req = query("cpu", BASE, now + 60_000);
+        for agg in [Aggregation::Avg, Aggregation::Max, Aggregation::Last] {
+            let want = raw_downsampled(&engine, &req, 60_000, agg).await;
+            let got = engine.search_downsampled(&req, 60_000, agg).await.unwrap();
+            assert_same_series(&got, &want, &format!("open bucket, agg {agg:?}"));
+        }
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_rollup_falls_back_for_unaligned_step_and_survives_restart() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine(&root).await;
+        write_history(&engine).await;
+        engine.flush_all().await.unwrap();
+
+        // 90 s is not a multiple of a maintained resolution: raw downsample.
+        let req = query("cpu", BASE, BASE + 600_000);
+        assert!(engine.rollups().for_step(90_000).is_none());
+        let want = raw_downsampled(&engine, &req, 90_000, Aggregation::Avg).await;
+        let got = engine
+            .search_downsampled(&req, 90_000, Aggregation::Avg)
+            .await
+            .unwrap();
+        assert_same_series(&got, &want, "unaligned step");
+
+        // Reopening loads the persisted watermark, so the table is still
+        // trusted and answers the same as raw data.
+        drop(engine);
+        let engine = open_engine(&root).await;
+        assert!(engine.rollups().minute().coverage() > BASE);
+        for step in [60_000i64, 3_600_000] {
+            for agg in [Aggregation::Avg, Aggregation::Min, Aggregation::Last] {
+                let want = raw_downsampled(&engine, &req, step, agg).await;
+                let got = engine.search_downsampled(&req, step, agg).await.unwrap();
+                assert_same_series(&got, &want, &format!("restart step {step} agg {agg:?}"));
+            }
+        }
     }
 }

@@ -26,6 +26,7 @@ pub mod last_cache;
 pub mod metric;
 pub mod query;
 pub mod retention;
+pub mod rollup;
 pub mod types;
 
 pub use backup::BackupStats;

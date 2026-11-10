@@ -220,6 +220,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `search_downsampled(req, step_ms, agg)`（epoch 对齐分桶，avg/min/max/sum/count/last），
   即存储型 rollup 的读取形态；server 暴露 `/api/v1/last` 与
   `/api/v1/query_range?step=&agg=`。剩余：写入时维护的 1m/1h rollup 表与自动选择。
+- 已完成（2026-11-11）：写入时维护的 1m/1h rollup 表与自动选择。`metric_engine::rollup`
+  在 `write` 成功路径把样本折进分钟/小时桶（`count/sum/min/max/first/last`，`first/last`
+  带时间戳以便粗粒度重聚合），只发布已关闭桶（`bucket_end + interval <= now`）；水位
+  `{root}/rollup_state/{1m,1h}` 分割时间，`< wm` 读表、`>= wm` 读原始数据，先写表后推进
+  水位，flush 失败回插桶并保持水位不变。迟到写入把该桶标 dirty 并在下次 flush 按原始
+  数据重算重发，重算前 `coverage()` 降到 dirty 桶起点，查询因此回退原始扫描而不信任
+  旧聚合。`search_downsampled` 按 step 自动选表（1h / 1m / 回退 raw），区间在桶边界处
+  切成「前导部分桶 raw + 已发布表 + 尾部 raw」，避免历史桶里的区间外样本污染结果。
+  三种集成测试以 raw `downsample` 为基准逐点比对：6 种聚合 × 3 种 step（含 1h 重聚合）
+  × 3 种区间（含非对齐起点）、乱序/迟到写入与 dirty 重建、90 s 回退与重启后仍一致。
+  剩余 Phase 3 验收项：黄金查询集进 CI、仪表盘 p99 < 50 ms。
 - 验收：黄金查询集进 CI；仪表盘类查询 p99 < 50 ms；全量 ad-hoc 明确为秒级 SLO。
 
 ### Phase 4：运维与生态（持续）

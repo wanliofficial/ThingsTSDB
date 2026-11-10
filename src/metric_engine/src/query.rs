@@ -28,7 +28,7 @@
 //! range, not to the total data volume.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -46,6 +46,7 @@ use crate::{
     data, index,
     indexdb::IndexMode,
     metric::full_range,
+    rollup::{align_down, align_up, Rollup, RollupTable},
     types::{build_series_key, decode_series_key, Label},
     MetricEngine, Result,
 };
@@ -135,7 +136,7 @@ pub enum Aggregation {
 /// two-tag filter that matched 154k series took 1.4 s with the pushdown and
 /// 44 ms without it. Small candidate sets still benefit, because the scan can
 /// then skip rows of other series and the filter is cheap to evaluate.
-const IN_LIST_LIMIT: usize = 1_000;
+pub(crate) const IN_LIST_LIMIT: usize = 1_000;
 
 impl MetricEngine {
     pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SeriesSamples>> {
@@ -358,11 +359,143 @@ impl MetricEngine {
         if step_ms <= 0 {
             return Err(anyhow::anyhow!("step_ms must be positive, got {step_ms}").into());
         }
+        // A step that a maintained resolution divides reads pre-aggregated
+        // rows; the tail the table has not published yet still comes from raw
+        // data.
+        let (start_ms, end_ms) =
+            self.retention
+                .clamp(&req.metric_name, req.start_ms, req.end_ms, now_ms());
+        if end_ms > start_ms {
+            if let Some(table) = self.rollups.for_step(step_ms) {
+                if table.coverage() > start_ms {
+                    return self
+                        .search_downsampled_rollup(req, step_ms, agg, table, start_ms, end_ms)
+                        .await;
+                }
+            }
+        }
         let mut series = self.search(req).await?;
         for series in &mut series {
             series.samples = downsample(&series.samples, step_ms, agg);
         }
         Ok(series)
+    }
+
+    /// [`MetricEngine::search_downsampled`] over a published rollup table.
+    ///
+    /// The query range is split at bucket boundaries:
+    ///
+    /// - the leading partial `step` bucket is read from raw data, because its
+    ///   rollup bucket starts before the range and may hold earlier samples;
+    /// - `[align_up(start, step), coverage)` reads the table;
+    /// - `[max(align_up(start, step), coverage), end)` reads raw data, which
+    ///   holds every buffered sample (the in-memory rollup buffer is only a
+    ///   staging area and is not complete after a restart).
+    #[allow(clippy::too_many_arguments)]
+    async fn search_downsampled_rollup(
+        &self,
+        req: &SearchRequest,
+        step_ms: i64,
+        agg: Aggregation,
+        table: &RollupTable,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<SeriesSamples>> {
+        let metric_id = crate::hash(&req.metric_name);
+        let series =
+            self.limit_series(self.resolve_series(req, start_ms, end_ms).await?, req.limit);
+        let candidates: HashSet<u64> = series.keys().copied().collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let step_start = align_up(start_ms, step_ms);
+        let coverage = table.coverage();
+        let interval = table.interval_ms();
+        let mut fine: HashMap<u64, Vec<(i64, Rollup)>> = HashMap::new();
+
+        // Leading partial bucket: raw samples in [start, step_start).
+        let lead_end = end_ms.min(step_start);
+        if start_ms < lead_end {
+            let raw = self
+                .scan_samples(metric_id, &candidates, start_ms, lead_end)
+                .await?;
+            for (tsid, points) in raw {
+                let entry = fine.entry(tsid).or_default();
+                entry.extend(points.into_iter().map(|point| {
+                    (
+                        align_down(point.timestamp, interval),
+                        Rollup::sample(point.timestamp, point.value),
+                    )
+                }));
+            }
+        }
+
+        // Published buckets.
+        let published_end = end_ms.min(coverage);
+        if step_start < published_end {
+            let published = table
+                .read(metric_id, &candidates, step_start, published_end)
+                .await?;
+            for (tsid, buckets) in published {
+                fine.entry(tsid).or_default().extend(buckets);
+            }
+        }
+
+        // Unpublished tail: raw data, which is authoritative for everything the
+        // table has not published yet.
+        let tail_start = step_start.max(coverage).max(start_ms);
+        if tail_start < end_ms {
+            let raw = self
+                .scan_samples(metric_id, &candidates, tail_start, end_ms)
+                .await?;
+            for (tsid, points) in raw {
+                let entry = fine.entry(tsid).or_default();
+                entry.extend(points.into_iter().map(|point| {
+                    (
+                        align_down(point.timestamp, interval),
+                        Rollup::sample(point.timestamp, point.value),
+                    )
+                }));
+            }
+        }
+
+        // Fold fine buckets into the requested step and render the aggregate.
+        let mut matched: Vec<(Vec<u8>, SeriesSamples)> = fine
+            .into_iter()
+            .filter_map(|(tsid, buckets)| {
+                let (name, labels) = series.get(&tsid)?;
+                let mut coarse: BTreeMap<i64, Rollup> = BTreeMap::new();
+                for (bucket, rollup) in buckets {
+                    coarse
+                        .entry(align_down(bucket, step_ms))
+                        .or_default()
+                        .merge(&rollup);
+                }
+                let samples = coarse
+                    .into_iter()
+                    .filter_map(|(bucket, rollup)| {
+                        (rollup.count > 0).then_some(SamplePoint {
+                            timestamp: bucket,
+                            value: rollup.value(agg),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if samples.is_empty() {
+                    return None;
+                }
+                Some((
+                    build_series_key(name, labels),
+                    SeriesSamples {
+                        metric_name: name.clone(),
+                        labels: labels.clone(),
+                        samples,
+                    },
+                ))
+            })
+            .collect();
+        matched.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(matched.into_iter().map(|(_, series)| series).collect())
     }
 
     /// Whether the new index already holds every legacy series of the metric
