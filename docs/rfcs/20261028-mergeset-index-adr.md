@@ -927,7 +927,7 @@ Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
   path fsynced once per series and capped ingestion at the fsync rate; the
   batch keeps the durability promise while amortizing the sync.
 - Tests: 195 `storage_kernel` lib tests + the `index_wal_kill9` integration
-  test, and 14 `metric_engine` tests, including the migration gate: identical
+  test, and 15 `metric_engine` tests, including the migration gate: identical
   data served in `Legacy` and `New` mode must return identical results for
   empty, Eq, Neq, Re, Nre, intersected and out-of-range queries. Cache tests
   cover lookup hits/misses, generation invalidation, budget eviction, key
@@ -1012,6 +1012,29 @@ series add no index work. The old one-frame-per-series path fsynced once per
 series and capped ingestion at the fsync rate, which is why
 `IndexDb::write_series_batch` and the per-month grouping in `IndexDbManager`
 exist.
+
+### 12.5.3 Engine query path (`metric_query_bench`)
+
+The index benchmark bypasses `MetricEngine::search`. The deployed `DualRead`
+path adds label reconstruction, the legacy union and the data scan. At 200k
+series with one sample each:
+
+| Shape | matched | p50 | p99 | of which index |
+|---|---|---|---|---|
+| name only | 200k | 1.81 s | 3.56 s | 504 ms |
+| eq job | 180k | 1.88 s | 2.08 s | 0.4 ms |
+| eq job+code | 154k | 1.32 s | 1.40 s | 3 ms |
+| eq instance | 1 | 12.5 ms | 59 ms | 1.5 ms |
+| re instance | 1.1k | 296 ms | 438 ms | 139 ms |
+
+The legacy per-metric series-key map is now cached (the full series-table scan
+per query dominated the narrow shapes) and is invalidated when new series are
+persisted. Narrow dashboard selectors are inside the 50 ms budget; broad
+selectors are dominated by materializing labels and samples for 100k+ series,
+and regex selectors by the legacy union (decoding and matching all 200k series
+keys) plus the ns3 name range scan. Phase 3 follow-ups: an id -> name cache in
+`IndexDb`, and a per-metric legacy-coverage mark so `DualRead` can skip the
+union when the mergeset index already holds every legacy series.
 
 - Remaining: the persisted bitmap representation for cold p99 at 10M series
   (Phase 3). Query parity, the config switch, the caches, the index-size and

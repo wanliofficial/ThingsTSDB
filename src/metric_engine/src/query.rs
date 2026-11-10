@@ -27,7 +27,10 @@
 //! The cost is proportional to the matched series and the requested time
 //! range, not to the total data volume.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, UInt64Array};
@@ -126,7 +129,7 @@ impl MetricEngine {
         if use_legacy {
             let series_keys = self.fetch_series_keys(metric_id).await?;
             let candidates = self
-                .resolve_legacy(metric_id, &req.matchers, &series_keys)
+                .resolve_legacy(metric_id, &req.matchers, series_keys.as_ref())
                 .await?;
             for tsid in candidates {
                 if series.contains_key(&tsid) {
@@ -244,42 +247,9 @@ impl MetricEngine {
         collect_tsids(stream, index::TSID_COLUMN, self.index.index_storage()).await
     }
 
-    /// Series id -> series key of one metric.
-    async fn fetch_series_keys(&self, metric_id: u64) -> Result<HashMap<u64, Vec<u8>>> {
-        let storage = self.index.series_storage();
-        let mut stream = storage
-            .scan(ScanRequest {
-                range: full_range(),
-                predicate: vec![
-                    col(index::METRIC_ID_COLUMN).eq(lit(ScalarValue::UInt64(Some(metric_id))))
-                ],
-                projections: None,
-            })
-            .await?;
-
-        let mut result = HashMap::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.context("scan series table")?;
-            let schema = storage.schema();
-            let tsid_idx = schema.index_of(index::TSID_COLUMN).context("find column")?;
-            let key_idx = schema
-                .index_of(index::SERIES_KEY_COLUMN)
-                .context("find column")?;
-            let tsids = batch
-                .column(tsid_idx)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("tsid column must be UInt64Array");
-            let keys = batch
-                .column(key_idx)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("series_key column must be BinaryArray");
-            for i in 0..batch.num_rows() {
-                result.insert(tsids.value(i), keys.value(i).to_vec());
-            }
-        }
-        Ok(result)
+    /// Series id -> series key of one metric, cached until new series arrive.
+    async fn fetch_series_keys(&self, metric_id: u64) -> Result<Arc<HashMap<u64, Vec<u8>>>> {
+        self.index.series_keys(metric_id).await
     }
 
     /// Scan samples of the candidate series within the time range.
@@ -657,6 +627,34 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].samples.len(), 1);
         assert_eq!(results[0].samples[0].timestamp, 20);
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_series_key_cache_sees_new_series() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine(&root).await;
+        engine
+            .write(vec![make_sample("m1", "200", "api", 10, 1.0)])
+            .await
+            .unwrap();
+        // Warm the per-metric series-key cache used by the legacy half of
+        // DualRead.
+        let first = engine
+            .search(&search_req("m1", vec![], 0, 100))
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        engine
+            .write(vec![make_sample("m1", "404", "api", 10, 2.0)])
+            .await
+            .unwrap();
+        // A new series must invalidate the cache, or it would stay invisible
+        // on the legacy path.
+        let second = engine
+            .search(&search_req("m1", vec![], 0, 100))
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
     }
 
     /// The mergeset index and the legacy inverted index must resolve the same

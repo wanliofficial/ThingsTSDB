@@ -34,7 +34,7 @@
 //! compaction.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -45,6 +45,10 @@ use arrow::{
 };
 use columnar_storage::storage::{ColumnarStorageRef, ScanRequest, WriteRequest};
 use common::now;
+use datafusion::{
+    logical_expr::{col, lit},
+    scalar::ScalarValue,
+};
 use futures::StreamExt;
 use tracing::debug;
 
@@ -86,6 +90,10 @@ pub struct IndexManager {
     /// Series ids that have been persisted in the storage, used to avoid
     /// writing duplicated index rows for every write request.
     known_series: Mutex<HashSet<u64>>,
+    /// `metric_id -> (tsid -> series_key)` for the legacy query path. A
+    /// dashboard re-runs the same selector, and rescanning the whole series
+    /// table per query made the legacy half of `DualRead` the dominant cost.
+    series_keys: Mutex<HashMap<u64, Arc<HashMap<u64, Vec<u8>>>>>,
 }
 
 impl IndexManager {
@@ -94,6 +102,7 @@ impl IndexManager {
             series_storage,
             index_storage,
             known_series: Mutex::new(HashSet::new()),
+            series_keys: Mutex::new(HashMap::new()),
         }
     }
 
@@ -103,6 +112,54 @@ impl IndexManager {
 
     pub(crate) fn index_storage(&self) -> &ColumnarStorageRef {
         &self.index_storage
+    }
+
+    /// Series keys of one metric, cached until a new series is persisted.
+    pub(crate) async fn series_keys(&self, metric_id: u64) -> Result<Arc<HashMap<u64, Vec<u8>>>> {
+        if let Some(keys) = self.series_keys.lock().unwrap().get(&metric_id).cloned() {
+            return Ok(keys);
+        }
+        let keys = Arc::new(self.load_series_keys(metric_id).await?);
+        self.series_keys
+            .lock()
+            .unwrap()
+            .insert(metric_id, Arc::clone(&keys));
+        Ok(keys)
+    }
+
+    async fn load_series_keys(&self, metric_id: u64) -> Result<HashMap<u64, Vec<u8>>> {
+        let mut stream =
+            self.series_storage
+                .scan(ScanRequest {
+                    range: full_range(),
+                    predicate: vec![
+                        col(METRIC_ID_COLUMN).eq(lit(ScalarValue::UInt64(Some(metric_id))))
+                    ],
+                    projections: None,
+                })
+                .await?;
+
+        let mut result = HashMap::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.context("scan series table")?;
+            let schema = self.series_storage.schema();
+            let tsid_idx = schema.index_of(TSID_COLUMN).context("find column")?;
+            let key_idx = schema.index_of(SERIES_KEY_COLUMN).context("find column")?;
+            let tsids = batch
+                .column(tsid_idx)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("tsid column must be UInt64Array");
+            let keys = batch
+                .column(key_idx)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("series_key column must be BinaryArray");
+            for i in 0..batch.num_rows() {
+                result.insert(tsids.value(i), keys.value(i).to_vec());
+            }
+        }
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -204,6 +261,8 @@ impl IndexManager {
                     enable_check: false,
                 })
                 .await?;
+            // New series rows arrived: any cached per-metric map is stale.
+            self.series_keys.lock().unwrap().clear();
         }
 
         {
