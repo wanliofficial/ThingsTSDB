@@ -32,6 +32,7 @@ use columnar_storage::{
     storage::{ColumnarStorageRef, CompactRequest, ObjectBasedStorage, StorageRuntimes},
     types::ObjectStoreRef,
 };
+use object_store::ObjectStore;
 
 use crate::{
     data::SampleManager,
@@ -81,6 +82,11 @@ pub struct MetricEngine {
     /// Per-metric read-time retention windows (roadmap Phase 4). Empty by
     /// default; set with [`MetricEngine::with_retention`].
     pub(crate) retention: Arc<RetentionPolicy>,
+    /// The engine root prefix, retained so [`MetricEngine::backup`] can copy
+    /// the whole tree.
+    pub(crate) root_path: String,
+    /// The object store backing the four columnar tables.
+    pub(crate) store: ObjectStoreRef,
 }
 
 impl MetricEngine {
@@ -120,6 +126,8 @@ impl MetricEngine {
         let mut metadata_opts = storage_opts.clone();
         metadata_opts.scheduler.ttl = None;
         metadata_opts.format = columnar_storage::config::DataFileFormat::Parquet;
+        // Retain a handle for backup/restore after the tables take ownership.
+        let backup_store = store.clone();
         let metric_storage: ColumnarStorageRef = Arc::new(
             open_table_storage(
                 format!("{root_path}/metrics"),
@@ -184,6 +192,8 @@ impl MetricEngine {
             index_mode,
             last_cache: Arc::new(LastCache::with_default_capacity()),
             retention: Arc::new(RetentionPolicy::new()),
+            root_path: root_path.to_string(),
+            store: backup_store,
         };
         // Warm up caches so known metrics and series won't be re-persisted.
         engine.metric.load().await?;
@@ -277,6 +287,64 @@ impl MetricEngine {
             }
         }
         Ok(())
+    }
+
+    /// Flushes every table and the mergeset index to a durable point.
+    ///
+    /// After this returns, every buffered sample is an SST committed by the
+    /// manifest and every pending index row is in an indexdb part, so the
+    /// on-disk state is a consistent snapshot for
+    /// [`MetricEngine::backup`].
+    pub async fn flush_all(&self) -> Result<()> {
+        let storages = [
+            (self.metric.storage(), "metrics"),
+            (self.index.series_storage(), "series"),
+            (self.index.index_storage(), "index"),
+            (self.data.storage(), "data"),
+        ];
+        for (storage, name) in storages {
+            storage
+                .flush()
+                .await
+                .map_err(|e| anyhow::anyhow!("flush {name} table: {e}"))?;
+        }
+        if let Some(indexdb) = &self.indexdb {
+            indexdb
+                .flush()
+                .map_err(|e| anyhow::anyhow!("flush indexdb: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Copies the durable engine state to `dest_root` under the same object
+    /// store (roadmap Phase 4 backup).
+    ///
+    /// The engine is flushed first, then every object under the root — the
+    /// columnar tables, the mergeset index and (for the local store) the WAL —
+    /// is copied to `dest_root`, preserving the relative layout. A fresh
+    /// `MetricEngine` opened at `dest_root` answers the same queries. Run this
+    /// against a quiescent engine; the copy is not atomic with concurrent
+    /// writes or compaction.
+    pub async fn backup(&self, dest_root: &str) -> Result<crate::backup::BackupStats> {
+        self.flush_all().await?;
+        crate::backup::copy_prefix(
+            self.store.as_ref(),
+            &self.root_path,
+            self.store.as_ref(),
+            dest_root,
+        )
+        .await
+    }
+
+    /// Restores engine state from `src_root` into `dest_root` (roadmap Phase 4
+    /// backup). A `MetricEngine` opened at `dest_root` afterwards sees the
+    /// backed-up data.
+    pub async fn restore_from(
+        store: &dyn ObjectStore,
+        src_root: &str,
+        dest_root: &str,
+    ) -> Result<crate::backup::BackupStats> {
+        crate::backup::copy_prefix(store, src_root, store, dest_root).await
     }
 }
 

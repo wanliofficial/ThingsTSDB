@@ -17,6 +17,7 @@
 
 //! Metric Engine entry point.
 
+pub mod backup;
 pub mod data;
 pub mod engine;
 pub mod index;
@@ -27,6 +28,7 @@ pub mod query;
 pub mod retention;
 pub mod types;
 
+pub use backup::BackupStats;
 pub use engine::{MetricEngine, MetricEngineRef};
 pub use indexdb::{IndexDbManager, IndexMode, IndexQueryStats};
 pub use last_cache::{LastCache, LastValue};

@@ -75,6 +75,13 @@ pub trait ColumnarStorage {
 
     async fn compact(&self, req: CompactRequest) -> Result<()>;
 
+    /// Flushes buffered writes into data files and commits them to the
+    /// manifest. Used by [`crate::storage::ObjectBasedStorage::flush`] and by
+    /// engine-level backup to reach a durable point.
+    async fn flush(&self) -> Result<()> {
+        Err(anyhow::anyhow!("flush is not supported by this storage").into())
+    }
+
     /// Rewrites every Parquet SST to TSF and swaps them in the manifest
     /// (ADR-0002 §10 step 4). A no-op when the table is already all-TSF.
     ///
@@ -372,6 +379,10 @@ impl ColumnarStorage for ObjectBasedStorage {
     async fn compact(&self, _req: CompactRequest) -> Result<()> {
         self.flush_state.flush().await?;
         self.compact_scheduler.trigger_compaction()
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.flush_state.flush().await
     }
 
     async fn rewrite_legacy_files(&self) -> Result<crate::tsf::RewriteReport> {

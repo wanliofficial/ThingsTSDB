@@ -1308,6 +1308,70 @@ mod tests {
         assert_eq!(total, 2, "wider window keeps both series' samples");
     }
 
+    /// Roadmap Phase 4 backup: flushing and copying the engine root to a new
+    /// prefix, then opening a fresh engine there, yields the same query
+    /// results. Uses `IndexMode::New` so the mergeset index (not the legacy
+    /// tables) must also have been copied for the query to resolve.
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_backup_and_restore_round_trip() {
+        let src_root = temp_dir::TempDir::new().unwrap();
+        let dest_root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine_with_mode(&src_root, IndexMode::New).await;
+        prepare_data(&engine).await;
+        engine.flush_all().await.unwrap();
+
+        let before = engine
+            .search(&search_req("m1", vec![], 0, 100))
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 2);
+        let before_samples: Vec<_> = before.iter().map(|s| s.samples.clone()).collect();
+
+        let stats = engine
+            .backup(&dest_root.path().to_string_lossy())
+            .await
+            .unwrap();
+        assert!(stats.objects > 0, "backup copied nothing");
+        assert!(stats.bytes > 0, "backup copied no bytes");
+
+        // A fresh engine at the destination, in New mode so only the copied
+        // mergeset index can resolve the series.
+        let restored = open_engine_with_mode(&dest_root, IndexMode::New).await;
+        let after = restored
+            .search(&search_req("m1", vec![], 0, 100))
+            .await
+            .unwrap();
+        assert_eq!(after.len(), before.len());
+        let after_samples: Vec<_> = after.iter().map(|s| s.samples.clone()).collect();
+        assert_eq!(after_samples, before_samples);
+
+        // A matcher query also works against the restored index.
+        let by_code = restored
+            .search(&search_req(
+                "m1",
+                vec![matcher("code", "404", MatcherType::Eq)],
+                0,
+                100,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(by_code.len(), 1);
+        assert_eq!(by_code[0].samples[0].value, 10.0);
+    }
+
+    /// Restoring into a prefix overwrites nothing that was not backed up: a
+    /// second copy into the same destination fails loudly rather than silently
+    /// mixing two engines (same source and destination is rejected).
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_backup_rejects_same_source_and_destination() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine(&root).await;
+        prepare_data(&engine).await;
+        let path = root.path().to_string_lossy().to_string();
+        let err = engine.backup(&path).await.unwrap_err();
+        assert!(err.to_string().contains("same prefix"), "{err}");
+    }
+
     /// The mergeset index and the legacy inverted index must resolve the same
     /// series for every matcher type, across the time range and label
     /// reconstruction. This is the migration gate in ADR-0001 §12.5.

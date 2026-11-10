@@ -243,8 +243,15 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   单测覆盖空策略、抬下界、区间坍缩、未配置指标、非正保留期、copy-on-write、
   时钟回拨 underflow；集成测试证明过期样本在 search/last_values 中不可见、近期样本
   存活、未配置指标不受影响、更宽窗口可见两段。
+- 已完成（部分，2026-11-10）：备份恢复。`MetricEngine::flush_all` 把四个列存表
+  （metrics/series/index/data）与 mergeset 索引刷到持久点，`backup(dest)` 再把引擎根
+  前缀下所有对象（列存表 + mergeset 索引 + 本地 WAL）复制到目标前缀；`restore_from`
+  反向复制后在新前缀打开引擎即得到同样的查询结果。`metric_engine::backup::copy_prefix`
+  走 `ObjectStore::list/get/put`，因此 Local 与未来的 S3/OSS 通用；同前缀来源/目标
+  直接报错。端到端测试用 `IndexMode::New` 证明 mergeset 索引也被复制、查询一致；
+  单元测试覆盖目录布局保持与本地目录递归复制。S3/OSS 对象存储接线与跨桶备份仍待接。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层、本地块缓存。
-- 备份恢复、分片/副本与再平衡。
+- 分片/副本与再平衡。
 - TSBS IoT 场景基准、满载查询抖动测试、故障注入（kill -9、磁盘满、时钟回拨）。
 
 ## 七、兼容与迁移
