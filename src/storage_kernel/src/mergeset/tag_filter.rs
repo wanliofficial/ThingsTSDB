@@ -332,6 +332,67 @@ fn filter_cache_key(filter: &PositiveFilter) -> Vec<u8> {
     key
 }
 
+/// Appends `bytes` with a 32-bit length prefix.
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Encodes a negative matcher for the result-cache key.
+fn push_matcher(out: &mut Vec<u8>, matcher: &TagMatcher) {
+    match matcher {
+        TagMatcher::Equal { key, value } => {
+            out.push(b'=');
+            push_bytes(out, key);
+            push_bytes(out, value);
+        }
+        TagMatcher::NotEqual { key, value } => {
+            out.push(b'!');
+            push_bytes(out, key);
+            push_bytes(out, value);
+        }
+        TagMatcher::Re { key, regex } => {
+            out.push(b'r');
+            push_bytes(out, key);
+            push_bytes(out, regex);
+        }
+        TagMatcher::Nre { key, regex } => {
+            out.push(b'n');
+            push_bytes(out, key);
+            push_bytes(out, regex);
+        }
+    }
+}
+
+/// Encodes the cache key of a whole query: the plan plus the day range.
+///
+/// The result depends on the metric group, every positive and negative
+/// matcher (in plan order, which is deterministic) and the days pushed down.
+fn result_cache_key(plan: &QueryPlan, days: &[u64]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + days.len() * 8);
+    key.push(b'q');
+    match &plan.metric_group {
+        None => key.push(b'0'),
+        Some(group) => {
+            key.push(b'1');
+            push_bytes(&mut key, group);
+        }
+    }
+    key.extend_from_slice(&(plan.positives.len() as u32).to_be_bytes());
+    for filter in &plan.positives {
+        key.extend_from_slice(&filter_cache_key(filter));
+    }
+    key.extend_from_slice(&(plan.negatives.len() as u32).to_be_bytes());
+    for matcher in &plan.negatives {
+        push_matcher(&mut key, matcher);
+    }
+    key.extend_from_slice(&(days.len() as u32).to_be_bytes());
+    for day in days {
+        key.extend_from_slice(&day.to_be_bytes());
+    }
+    key
+}
+
 /// The namespace row lookups the resolver needs (ADR-0001 §4).
 ///
 /// Implemented over a live mergeset [`Table`](crate::mergeset::table::Table) in
@@ -486,7 +547,36 @@ impl<'a, S: RowSource + ?Sized> IndexResolver<'a, S> {
     }
 
     /// Resolves the plan to the set of matching series IDs.
+    ///
+    /// With a cache attached the whole answer is memoized too, so a repeated
+    /// dashboard query does not re-intersect the per-filter sets. A result
+    /// larger than half the budget is not stored: it would evict the filter
+    /// sets it was built from on the next insert.
     pub fn resolve(&self, plan: &QueryPlan, days: &[u64]) -> Result<SeriesIdSet, String> {
+        Ok((*self.resolve_arc(plan, days)?).clone())
+    }
+
+    /// Like [`IndexResolver::resolve`], but a cached result is handed back as
+    /// an `Arc` so a large result set (millions of IDs) is not copied per
+    /// query.
+    pub fn resolve_arc(&self, plan: &QueryPlan, days: &[u64]) -> Result<Arc<SeriesIdSet>, String> {
+        let Some((cache, version)) = self.cache else {
+            return Ok(Arc::new(self.resolve_plan(plan, days)?));
+        };
+        let key = result_cache_key(plan, days);
+        if let Some(set) = cache.get(&key, version) {
+            return Ok(set);
+        }
+        let result = Arc::new(self.resolve_plan(plan, days)?);
+        // A result larger than half the budget is not stored: it would evict
+        // the filter sets it was built from on the next insert.
+        if result.len() <= cache.budget_ids / 2 {
+            cache.put(key, version, Arc::clone(&result));
+        }
+        Ok(result)
+    }
+
+    fn resolve_plan(&self, plan: &QueryPlan, days: &[u64]) -> Result<SeriesIdSet, String> {
         let mut candidate: Option<SeriesIdSet> = None;
         // The metric group narrows every namespace: ns1 postings are global,
         // so without it a filter would return series of other metrics.
@@ -978,6 +1068,22 @@ mod tests {
     }
 
     #[test]
+    fn test_resolver_arc_hit_shares_the_set() {
+        let rows = rows();
+        let cache = FilterCache::new(1024);
+        let plan = QueryPlan::from_matchers(&[name("http_requests"), eq("job", "api")]);
+        let first = IndexResolver::new(&rows)
+            .with_cache(&cache)
+            .resolve_arc(&plan, &[20000])
+            .unwrap();
+        let second = IndexResolver::new(&rows)
+            .with_cache(&cache)
+            .resolve_arc(&plan, &[20000])
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn test_filter_cache_key_is_collision_free() {
         let split = PositiveFilter {
             key: b"a".to_vec(),
@@ -1057,14 +1163,27 @@ mod tests {
             .resolve(&plan, &[20000])
             .unwrap();
         assert_eq!(first.ids(), &[1, 2]);
-        let misses = cache.misses();
-        let first = IndexResolver::new(&rows)
+        let (misses, hits) = (cache.misses(), cache.hits());
+        // One result-key miss plus the metric group, `job=api` and the day.
+        assert_eq!((misses, hits), (4, 0));
+        // The second identical query hits the memoized result: no filter set
+        // is touched again.
+        let second = IndexResolver::new(&rows)
             .with_cache(&cache)
             .resolve(&plan, &[20000])
             .unwrap();
-        assert_eq!(first.ids(), &[1, 2]);
-        // Metric group, `job=api` and day 20000 all came from the cache.
+        assert_eq!(second.ids(), &[1, 2]);
         assert_eq!(cache.misses(), misses);
-        assert_eq!(cache.hits(), 3);
+        assert_eq!(cache.hits(), hits + 1);
+        // A different day range is a different result, but the metric-group
+        // and `job=api` sets are reused.
+        let third = IndexResolver::new(&rows)
+            .with_cache(&cache)
+            .resolve(&plan, &[20001])
+            .unwrap();
+        assert!(third.is_empty());
+        // A result-key + day miss, but the metric-group and `job=api` hits.
+        assert_eq!(cache.misses(), misses + 2);
+        assert_eq!(cache.hits(), hits + 1 + 2);
     }
 }

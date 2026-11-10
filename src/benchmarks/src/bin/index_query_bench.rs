@@ -30,9 +30,12 @@
 //! kill -9 integration test covers the durable ordering).
 //!
 //! Usage: `cargo run --release -p benchmarks --bin index_query_bench -- \
-//! [series] [queries]`
+//! [series] [queries] [cache_ids]`
 //!
-//! Defaults: 200,000 series, 2,000 queries (500 per matcher shape).
+//! Defaults: 200,000 series, 2,000 queries (500 per matcher shape) and the
+//! default cache budget. The run also reports the cold latency of each shape
+//! after invalidating the cache, so the warm p99 is not mistaken for the cost
+//! of a first query.
 
 use std::{
     path::Path,
@@ -50,6 +53,10 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let series: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(200_000);
     let queries: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(2_000);
+    let cache_ids: usize = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(storage_kernel::mergeset::tag_filter::DEFAULT_CACHE_IDS);
     let per_shape = (queries / 4).max(1);
 
     let dir = std::env::temp_dir().join(format!(
@@ -65,6 +72,7 @@ fn main() {
 
     let config = IndexDbConfig {
         spawn_workers: false,
+        cache_ids,
         manager: ManagerConfig {
             wal_sync_on_write: false,
             flush_interval: Duration::from_secs(3_600),
@@ -78,8 +86,9 @@ fn main() {
         db.partition()
     );
 
-    // Write phase: flush every 20k series so the query path sees several parts.
-    let batch = 20_000;
+    // Flush every 20k series (or 1% of a large run) so the query path sees
+    // several parts without hundreds of tiny flushes or a giant pending buffer.
+    let batch = (series / 100).clamp(20_000, 100_000);
     let started = Instant::now();
     let mut rows = 0usize;
     let mut written = 0usize;
@@ -159,12 +168,12 @@ fn main() {
         ),
     ];
 
-    for (label, plan) in shapes {
+    for (label, plan) in &shapes {
         let mut latencies = Vec::with_capacity(per_shape);
         let mut matched = 0usize;
         for _ in 0..per_shape {
             let started = Instant::now();
-            let ids = db.search_series_ids(&plan, &[day]).expect("search");
+            let ids = db.search_series_ids_arc(plan, &[day]).expect("search");
             latencies.push(started.elapsed().as_micros() as u64);
             matched += ids.len();
         }
@@ -182,11 +191,25 @@ fn main() {
 
     let cache = db.cache();
     println!(
-        "cache: hits={} misses={} retained_ids={}",
+        "cache: hits={} misses={} retained_ids={} budget_ids={}",
         cache.hits(),
         cache.misses(),
-        cache.retained_ids()
+        cache.retained_ids(),
+        cache_ids
     );
+
+    // Cold cost: drop the cache, then time one query per shape. This is the
+    // first query after a write, i.e. the price of materializing the sets.
+    for (label, plan) in &shapes {
+        cache.invalidate();
+        let started = Instant::now();
+        let ids = db.search_series_ids_arc(plan, &[day]).expect("search");
+        println!(
+            "cold  {label:16} {:>7} us  matched={}",
+            started.elapsed().as_micros(),
+            ids.len()
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -44,7 +44,7 @@ use crate::mergeset::{
     part_manager::{ManagerConfig, MergeStats, PartManager},
     series_id_set::SeriesIdSet,
     table::Table,
-    tag_filter::{FilterCache, IndexResolver, QueryPlan, RowSource},
+    tag_filter::{FilterCache, IndexResolver, QueryPlan, RowSource, DEFAULT_CACHE_IDS},
     timeutil,
     wal::WalWriter,
 };
@@ -56,6 +56,10 @@ pub struct IndexDbConfig {
     pub manager: ManagerConfig,
     /// Start the background flush and merge loops on open.
     pub spawn_workers: bool,
+    /// Budget of the posting-set cache, counted in retained series IDs
+    /// (8 bytes each). Latency-sensitive deployments with millions of series
+    /// in a month partition raise this.
+    pub cache_ids: usize,
 }
 
 impl Default for IndexDbConfig {
@@ -63,6 +67,7 @@ impl Default for IndexDbConfig {
         Self {
             manager: ManagerConfig::default(),
             spawn_workers: true,
+            cache_ids: DEFAULT_CACHE_IDS,
         }
     }
 }
@@ -119,7 +124,7 @@ impl IndexDb {
             partition,
             table,
             manager,
-            cache: FilterCache::default(),
+            cache: FilterCache::new(config.cache_ids),
         })
     }
 
@@ -160,32 +165,33 @@ impl IndexDb {
         tags: &[(&[u8], &[u8])],
         days: &[u64],
     ) -> Result<usize, String> {
-        let mut items = Vec::new();
-        let tsid = Tsid::build(group, tags).with_series_id(series_id);
-        let name = canonical_name(group, tags);
-        items.push(metric_name_row(&name, &tsid));
-        items.push(series_id_row(series_id, &tsid));
-        items.push(series_id_name_row(series_id, &name));
-        // Group row: `tagKey=""`, `tagValue=group`.
-        items.push(indexdb::tag_posting_row(b"", group, &[series_id]));
-        for (key, value) in tags {
-            let composite = indexdb::composite_key(group, key);
-            items.push(indexdb::tag_posting_row(key, value, &[series_id]));
-            items.push(indexdb::tag_posting_row(&composite, value, &[series_id]));
-        }
-        for &day in days {
-            items.push(date_metric_name_row(day, &name, &tsid));
-            items.extend(date_series_rows(day, &[series_id]));
-            items.push(date_tag_posting_row(day, b"", group, &[series_id]));
-            for (key, value) in tags {
-                items.push(date_tag_posting_row(day, key, value, &[series_id]));
+        self.write_series_batch(&[(series_id, group, tags, days)])
+    }
+
+    /// Registers many series in few WAL frames.
+    ///
+    /// The WAL fsyncs every frame, so one frame per series caps ingestion at
+    /// the fsync rate. This builds the rows for a chunk of series (bounded by
+    /// [`MAX_SERIES_PER_FRAME`] so a frame stays a few MiB) and appends them
+    /// together. Single-series callers keep [`IndexDb::write_series`].
+    pub fn write_series_batch(
+        &self,
+        series: &[(u64, &[u8], &[(&[u8], &[u8])], &[u64])],
+    ) -> Result<usize, String> {
+        let mut count = 0;
+        for chunk in series.chunks(MAX_SERIES_PER_FRAME) {
+            let mut items = Vec::with_capacity(chunk.len() * 16);
+            for &(series_id, group, tags, days) in chunk {
+                push_series_rows(&mut items, series_id, group, tags, days);
             }
+            count += items.len();
+            self.manager.write_index_items(items)?;
         }
-        let count = items.len();
-        self.manager.write_index_items(items)?;
-        // The rows are searchable right away (pending buffer included), so the
-        // resolved sets of the previous generation are now incomplete.
-        self.cache.invalidate();
+        if count > 0 {
+            // The rows are searchable right away (pending buffer included), so
+            // the resolved sets of the previous generation are now incomplete.
+            self.cache.invalidate();
+        }
         Ok(count)
     }
 
@@ -207,10 +213,20 @@ impl IndexDb {
     /// `days` restricts the per-day index; an empty slice means "no time
     /// constraint" and skips the ns5 intersection.
     pub fn search_series_ids(&self, plan: &QueryPlan, days: &[u64]) -> Result<SeriesIdSet, String> {
+        Ok((*self.search_series_ids_arc(plan, days)?).clone())
+    }
+
+    /// Like [`IndexDb::search_series_ids`] but returns the cached set by `Arc`,
+    /// so a repeated query with millions of matches does not copy it.
+    pub fn search_series_ids_arc(
+        &self,
+        plan: &QueryPlan,
+        days: &[u64],
+    ) -> Result<Arc<SeriesIdSet>, String> {
         let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
         IndexResolver::new(&TableRows(&table))
             .with_cache(&self.cache)
-            .resolve(plan, days)
+            .resolve_arc(plan, days)
     }
 
     /// Alias matching the ADR's `indexdb.search_tsids` name.
@@ -305,6 +321,40 @@ impl RowSource for TableRows<'_> {
 
     fn search_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         self.0.search_range(start, end)
+    }
+}
+
+/// Series bundled into one index WAL frame: 4096 series x 16 rows is about
+/// 2.5 MiB of rows, small enough to replay without a large allocation.
+const MAX_SERIES_PER_FRAME: usize = 4_096;
+
+/// Appends every namespace row of one series.
+fn push_series_rows(
+    items: &mut Vec<Vec<u8>>,
+    series_id: u64,
+    group: &[u8],
+    tags: &[(&[u8], &[u8])],
+    days: &[u64],
+) {
+    let tsid = Tsid::build(group, tags).with_series_id(series_id);
+    let name = canonical_name(group, tags);
+    items.push(metric_name_row(&name, &tsid));
+    items.push(series_id_row(series_id, &tsid));
+    items.push(series_id_name_row(series_id, &name));
+    // Group row: `tagKey=""`, `tagValue=group`.
+    items.push(indexdb::tag_posting_row(b"", group, &[series_id]));
+    for (key, value) in tags {
+        let composite = indexdb::composite_key(group, key);
+        items.push(indexdb::tag_posting_row(key, value, &[series_id]));
+        items.push(indexdb::tag_posting_row(&composite, value, &[series_id]));
+    }
+    for &day in days {
+        items.push(date_metric_name_row(day, &name, &tsid));
+        items.extend(date_series_rows(day, &[series_id]));
+        items.push(date_tag_posting_row(day, b"", group, &[series_id]));
+        for (key, value) in tags {
+            items.push(date_tag_posting_row(day, key, value, &[series_id]));
+        }
     }
 }
 
@@ -602,6 +652,69 @@ mod tests {
         assert_eq!(all.len(), 20);
         // ns2 rows stay one per series.
         let _ = series_id_row;
+    }
+
+    #[test]
+    fn test_write_series_batch_registers_every_series() {
+        let (_root, db) = db();
+        let batch: [(u64, &[u8], &[(&[u8], &[u8])], &[u64]); 3] = [
+            (1, b"m", &[(b"job", b"api"), (b"code", b"200")], &[10]),
+            (2, b"m", &[(b"job", b"api"), (b"code", b"500")], &[10]),
+            (3, b"m", &[(b"job", b"web"), (b"code", b"200")], &[10]),
+        ];
+        // 3 metadata rows + 1 group + 2 tags x 2 namespaces + 5 day rows.
+        assert_eq!(db.write_series_batch(&batch).unwrap(), 3 * 13);
+        db.flush().unwrap();
+        assert_eq!(
+            db.search_series_ids(&plan(&[eq("job", "api")]), &[10])
+                .unwrap()
+                .ids(),
+            &[1, 2]
+        );
+        assert_eq!(
+            db.search_series_ids(&plan(&[eq("code", "200")]), &[10])
+                .unwrap()
+                .ids(),
+            &[1, 3]
+        );
+    }
+
+    #[test]
+    fn test_write_series_batch_spans_frames() {
+        let (_root, db) = db();
+        // More than MAX_SERIES_PER_FRAME, so the batch crosses two WAL frames.
+        let count = MAX_SERIES_PER_FRAME + 4;
+        let names: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("host-{i}").into_bytes())
+            .collect();
+        let tags: Vec<Vec<(&[u8], &[u8])>> = names
+            .iter()
+            .map(|name| vec![(b"instance".as_slice(), name.as_slice())])
+            .collect();
+        let days = [10u64];
+        let batch: Vec<(u64, &[u8], &[(&[u8], &[u8])], &[u64])> = (0..count)
+            .map(|i| {
+                (
+                    i as u64 + 1,
+                    b"m".as_slice(),
+                    tags[i].as_slice(),
+                    days.as_slice(),
+                )
+            })
+            .collect();
+        // 3 metadata rows + 1 group + 1 tag (global + composite) + 4 day rows.
+        assert_eq!(db.write_series_batch(&batch).unwrap(), count * 10);
+        db.flush().unwrap();
+        assert_eq!(
+            db.search_series_ids(&plan(&[eq("instance", "host-4099")]), &days)
+                .unwrap()
+                .ids(),
+            &[4_100]
+        );
+        assert_eq!(
+            db.search_series_ids(&plan(&[]), &days).unwrap().len(),
+            count
+        );
     }
 
     #[test]

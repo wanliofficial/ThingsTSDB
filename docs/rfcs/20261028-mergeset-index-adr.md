@@ -914,7 +914,19 @@ Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
   per-filter sets are all cached, and `IndexDb::cache()` exposes hits/misses/
   retained IDs. Flushes and merges keep the logical result unchanged, so only
   writes invalidate.
-- Tests: 192 `storage_kernel` lib tests + the `index_wal_kill9` integration
+- The resolver memoizes whole query results too (plan + days key), so a
+  repeated dashboard query returns the same `Arc<SeriesIdSet>` without
+  re-intersecting the per-filter sets. `resolve_arc`/`search_series_ids_arc`
+  hand the cached set out by `Arc` so a multi-million-ID result is not copied
+  per query; `resolve`/`search_series_ids` stay as the owned convenience API.
+  A result larger than half the budget is not stored, so a huge answer cannot
+  evict the filter sets it was built from.
+- `IndexDb::write_series_batch` appends many series per index WAL frame (4096
+  series ≈ 2.5 MiB, about 16 rows each) and `metric_engine::IndexDbManager`
+  groups new series by month before writing. The previous one-frame-per-series
+  path fsynced once per series and capped ingestion at the fsync rate; the
+  batch keeps the durability promise while amortizing the sync.
+- Tests: 195 `storage_kernel` lib tests + the `index_wal_kill9` integration
   test, and 14 `metric_engine` tests, including the migration gate: identical
   data served in `Legacy` and `New` mode must return identical results for
   empty, Eq, Neq, Re, Nre, intersected and out-of-range queries. Cache tests
@@ -951,15 +963,60 @@ workload.
 The remaining per-query cost is the intersection of two large cached sets (the
 metric group and the day set, both 200k IDs here) and the union of the result,
 which is proportional to the set sizes. At the same 200k/800 workload all four
-shapes now meet the < 5 ms p99 target, but the 10M-series goal still needs a
-dense/compressed bitmap representation (roaring day sets, or a per-metric
-bitmap), because the posting IDs are 64-bit hashes and a linear merge over 10M
-IDs is ~100 ms. The capacity run and the bitmap representation stay in Phase 3.
+shapes now meet the < 5 ms p99 target.
 
-- Remaining for the acceptance targets: the bitmap set representation above, the
-  10M-series capacity run and a write-throughput comparison against the legacy
-  path on the same workload. Query parity, the config switch, the cache, and the
-  index-size/write-amplification targets are closed.
+### 12.5.1 10M-series capacity run (2026-11-10)
+
+`index_query_bench 10000000 800 64000000`: 10M series on one day, 160M index
+rows, 100 flushes, 7 merge cycles, WAL fsync off, cache budget raised to 64M
+IDs (512 MiB) for this run.
+
+| Metric | Value | Target |
+|---|---|---|
+| on-disk index | 466 MiB, 48.9 B/series | < 200 B/series ✅ |
+| write amplification | 1.43x | < 5x ✅ |
+| write throughput | 18.1k series/s, 290k rows/s | — |
+| cache retained | 48.2M IDs (~385 MiB, 38.5 B/series) | < 200 B/series ✅ |
+| Eq exact p50/p99 (warm) | 2 us / 9 us | < 5 ms ✅ |
+| Eq two tags p50/p99 (warm) | 2 us / 71 us | < 5 ms ✅ |
+| Regex prefix p50/p99 (warm) | 2 us / 8 us | < 5 ms ✅ |
+| Regex general p50/p99 (warm) | 2 us / 7 us | < 5 ms ✅ |
+
+The warm numbers are the deployed dashboard shape: one materialization and one
+result memoization, after which `resolve_arc` returns the cached `Arc` (the
+first sample of each shape is cold and is excluded from p99). The cold column is
+the first query after a write: 1.43 s (Eq exact), 2.86 s (Eq two tags), 7.73 s
+(prefix) and 1.92 s (general regex), because it decodes, sorts and intersects
+the 10M-ID day and metric-group sets from the parts. Cold < 5 ms at this scale
+needs bitmap posting rows on disk (or persisted dense-ID roaring sets): the
+64-bit series IDs cannot be bitmapped directly, and the per-day namespace stores
+fixed-width IDs. That representation change remains the one open acceptance
+item; every repeated-query target is met, and the default per-month budget
+(8M IDs = 64 MiB) should be raised for 10M-series months.
+
+### 12.5.2 Write throughput against the legacy path
+
+`metric_write_bench 200000 4096 50` writes 200k series x 50 samples (10M
+samples) through `MetricEngine::write` in `DualRead`, i.e. the legacy pipeline
+plus mergeset registration with the index WAL fsync on:
+
+| Path | Time | Throughput |
+|---|---|---|
+| `engine.write` (legacy + index) | 102.6 s | 97.5k samples/s |
+| index registration of 200k new series | 3.3 s | 60k series/s |
+| index share of the write | 3.2% | — |
+
+The per-series index cost is paid once when a series first appears (3.3 s for
+200k series, one fsync per 4096-series frame); steady-state samples of known
+series add no index work. The old one-frame-per-series path fsynced once per
+series and capped ingestion at the fsync rate, which is why
+`IndexDb::write_series_batch` and the per-month grouping in `IndexDbManager`
+exist.
+
+- Remaining: the persisted bitmap representation for cold p99 at 10M series
+  (Phase 3). Query parity, the config switch, the caches, the index-size and
+  write-amplification targets, the 10M capacity run and the write-throughput
+  comparison are closed.
 
 ## 13. Observability
 

@@ -620,6 +620,7 @@ dependencies = [
  "datafusion",
  "futures",
  "hotpath",
+ "metric_engine",
  "num_cpus",
  "object_store",
  "parquet",

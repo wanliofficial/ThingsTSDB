@@ -206,32 +206,70 @@ impl IndexDbManager {
             return Ok(());
         }
 
-        let mut written = 0usize;
+        // Group the writes by month so each month appends one batched WAL
+        // frame per few thousand series instead of one fsync per series.
+        struct MonthWrite {
+            series_id: u64,
+            group: Vec<u8>,
+            tags: Vec<(Vec<u8>, Vec<u8>)>,
+            days: Vec<u64>,
+        }
+        let mut by_month: HashMap<u16, Vec<MonthWrite>> = HashMap::new();
         for entry in by_series.values_mut() {
             entry.days.sort_unstable();
             entry.days.dedup();
-            let mut by_month: HashMap<u16, Vec<u64>> = HashMap::new();
+            let mut days_by_month: HashMap<u16, Vec<u64>> = HashMap::new();
             for &day in &entry.days {
-                by_month
+                days_by_month
                     .entry(timeutil::month_of_day(day))
                     .or_default()
                     .push(day);
             }
-            for (month, days) in by_month {
+            for (month, days) in days_by_month {
                 let days = self.filter_unregistered(entry.series_id, days);
                 if days.is_empty() {
                     continue;
                 }
-                let db = self.db(month)?;
-                let tags: Vec<(&[u8], &[u8])> = entry
-                    .tags
-                    .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                    .collect();
-                db.write_series(entry.series_id, &entry.group, &tags, &days)
-                    .map_err(|e| anyhow::anyhow!("write indexdb month {month}: {e}"))?;
-                self.mark_registered(entry.series_id, &days);
-                written += days.len();
+                by_month.entry(month).or_default().push(MonthWrite {
+                    series_id: entry.series_id,
+                    group: entry.group.clone(),
+                    tags: entry.tags.clone(),
+                    days,
+                });
+            }
+        }
+
+        let mut written = 0usize;
+        for (month, writes) in by_month {
+            let db = self.db(month)?;
+            // Borrow the owned tag vectors once and hand the batch a slice of
+            // borrowed tuples (the batch API stays allocation-free).
+            let tag_refs: Vec<Vec<(&[u8], &[u8])>> = writes
+                .iter()
+                .map(|w| {
+                    w.tags
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect()
+                })
+                .collect();
+            let batch: Vec<(u64, &[u8], &[(&[u8], &[u8])], &[u64])> = writes
+                .iter()
+                .zip(tag_refs.iter())
+                .map(|(w, tags)| {
+                    (
+                        w.series_id,
+                        w.group.as_slice(),
+                        tags.as_slice(),
+                        w.days.as_slice(),
+                    )
+                })
+                .collect();
+            db.write_series_batch(&batch)
+                .map_err(|e| anyhow::anyhow!("write indexdb month {month}: {e}"))?;
+            for w in &writes {
+                self.mark_registered(w.series_id, &w.days);
+                written += w.days.len();
             }
         }
         if written > 0 {
@@ -298,7 +336,7 @@ impl IndexDbManager {
             }
             let db = self.db(month)?;
             let ids = db
-                .search_series_ids(&plan, &days)
+                .search_series_ids_arc(&plan, &days)
                 .map_err(|e| anyhow::anyhow!("search indexdb month {month}: {e}"))?;
             if ids.is_empty() {
                 continue;
