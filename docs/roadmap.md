@@ -146,7 +146,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   默认双读，`try_open_with_index_mode` 可切换；query 双读合并，支持 `=`/`!=`/`=~`/`!~`；
   server 配置 `metric_engine.index_mode` 并接通 RE/NRE matcher。一致性测试：同一批
   数据在 Legacy 与 New 下对空/eq/neq/re/nre/交集/越界查询结果完全一致。196 项
-  storage_kernel 测试 + kill9 集成测试、15 项 metric_engine 测试通过。flush 时按 row key
+  storage_kernel 测试 + kill9 集成测试、17 项 metric_engine 测试通过。flush 时按 row key
   折叠 posting 行（`MAX_POSTING_IDS_PER_ROW=1024` 分片，保证单行小于 64 KiB block），
   regex 每 matcher 只编译一次；新增 `index_query_bench`：20 万序列 / 320 万行实测索引
   51.8 B/序列（目标 <200）、写放大 1.46×（目标 <5×）、写入 ~1.83 万序列/s。
@@ -206,9 +206,12 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
   12.0 ms / p99 25 ms，宽选择器（18 万序列）p50 1.4–1.9 s、正则选择器 207 ms。
   另加 `IndexDb` 的 series name 缓存（ID 不可变、不失效，上限 26.2 万条约 20 MiB），
-  正则选择器 p99 从 438 ms 降至 341 ms、索引占比从 139 ms 降至 36 ms。剩余成本
-  是宽选择的标签/样本物化与 legacy 联合（逐序列解码 + 正则）；下一步为每 metric
-  legacy 覆盖标记。
+  正则选择器 p99 从 438 ms 降至 341 ms、索引占比从 139 ms 降至 36 ms。另加每
+  metric 的 legacy 覆盖标记（`group_series_ids` + `legacy_union_skips` 统计）：
+  当新索引已覆盖该 metric 在查询日范围内的全部 legacy 序列时，`DualRead` 跳过
+  legacy 联合；保守判定（迁移前数据或范围内无数据的序列使检查失败）保证旧数据
+  仍可见。正则选择器进一步降至 p50 76 ms / p99 179 ms（索引占比 35 ms 为 posting
+  扫描本身）。剩余成本是宽选择的标签/样本物化与冷查询位图表示。
 - 验收：黄金查询集进 CI；仪表盘类查询 p99 < 50 ms；全量 ad-hoc 明确为秒级 SLO。
 
 ### Phase 4：运维与生态（持续）

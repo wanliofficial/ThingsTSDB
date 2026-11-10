@@ -50,6 +50,13 @@ use crate::{
     MetricEngine, Result,
 };
 
+/// Regex matchers force the legacy path to decode every series key.
+fn needs_key_scan(matchers: &[LabelMatcher]) -> bool {
+    matchers
+        .iter()
+        .any(|m| matches!(m.matcher_type, MatcherType::Re | MatcherType::Nre))
+}
+
 /// The label matcher types Prometheus remote read and PromQL use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatcherType {
@@ -128,18 +135,29 @@ impl MetricEngine {
 
         if use_legacy {
             let series_keys = self.fetch_series_keys(metric_id).await?;
-            let candidates = self
-                .resolve_legacy(metric_id, &req.matchers, series_keys.as_ref())
-                .await?;
-            for tsid in candidates {
-                if series.contains_key(&tsid) {
-                    continue;
+            // Regex matchers make the legacy union decode every series key of
+            // the metric. During migration the new index eventually holds every
+            // legacy series; once it covers the queried range for this metric,
+            // the union cannot add anything and is skipped.
+            let covered = use_new
+                && needs_key_scan(&req.matchers)
+                && self.legacy_covered(&req.metric_name, &series_keys, req.start_ms, req.end_ms);
+            if !covered {
+                let candidates = self
+                    .resolve_legacy(metric_id, &req.matchers, series_keys.as_ref())
+                    .await?;
+                for tsid in candidates {
+                    if series.contains_key(&tsid) {
+                        continue;
+                    }
+                    let Some(key) = series_keys.get(&tsid) else {
+                        continue;
+                    };
+                    let (name, labels) = decode_series_key(key).context("decode series key")?;
+                    series.insert(tsid, (name, labels));
                 }
-                let Some(key) = series_keys.get(&tsid) else {
-                    continue;
-                };
-                let (name, labels) = decode_series_key(key).context("decode series key")?;
-                series.insert(tsid, (name, labels));
+            } else if let Some(indexdb) = self.indexdb.as_ref() {
+                indexdb.stats().record_legacy_union_skip();
             }
         }
 
@@ -172,6 +190,35 @@ impl MetricEngine {
             .collect();
         matched.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(matched.into_iter().map(|(_, series)| series).collect())
+    }
+
+    /// Whether the new index already holds every legacy series of the metric
+    /// for the queried range, so the legacy union cannot add a series.
+    ///
+    /// A series that carries data in the range was registered for its days by
+    /// the write path, so membership in the group's day set is the coverage
+    /// test. Legacy-only series (data written before the index was enabled, or
+    /// series without data in the range) make the check fail and keep the
+    /// union, which is conservative rather than wrong.
+    fn legacy_covered(
+        &self,
+        metric_name: &[u8],
+        legacy: &HashMap<u64, Vec<u8>>,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> bool {
+        if legacy.is_empty() {
+            return true;
+        }
+        let Some(indexdb) = self.indexdb.as_ref() else {
+            return false;
+        };
+        let Ok(ids) = indexdb.group_series_ids(metric_name, start_ms, end_ms) else {
+            return false;
+        };
+        !ids.is_empty()
+            && legacy.len() <= ids.len()
+            && legacy.keys().all(|id| ids.binary_search(id).is_ok())
     }
 
     /// Resolves matchers through the legacy inverted index. Regex matchers are
@@ -655,6 +702,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.len(), 2);
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_legacy_union_skipped_for_covered_metric() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine_with_mode(&root, IndexMode::DualRead).await;
+        prepare_data(&engine).await;
+        engine.indexdb().unwrap().flush().unwrap();
+
+        let req = search_req("m1", vec![matcher("job", "a.*", MatcherType::Re)], 0, 100);
+        let first = engine.search(&req).await.unwrap();
+        assert_eq!(first.len(), 2);
+        // The new index holds every legacy series of m1 on the queried days,
+        // so the regex union is skipped instead of decoding every key.
+        assert_eq!(engine.index_stats().unwrap().legacy_union_skips(), 1);
+
+        let second = engine.search(&req).await.unwrap();
+        assert_eq!(render(&first), render(&second));
+        assert_eq!(engine.index_stats().unwrap().legacy_union_skips(), 2);
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_legacy_coverage_requires_indexed_days() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine_with_mode(&root, IndexMode::DualRead).await;
+        prepare_data(&engine).await;
+        engine.indexdb().unwrap().flush().unwrap();
+
+        let keys = engine.index.series_keys(crate::hash(b"m1")).await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(engine.legacy_covered(b"m1", &keys, 0, 100));
+        // A range with no registered day rows is not covered, so a
+        // pre-migration legacy series would still be found through the union.
+        let far = 100_000_000_000;
+        assert!(!engine.legacy_covered(b"m1", &keys, far, far + 100));
+        let results = engine
+            .search(&search_req(
+                "m1",
+                vec![matcher("job", "a.*", MatcherType::Re)],
+                far,
+                far + 100,
+            ))
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+        assert_eq!(engine.index_stats().unwrap().legacy_union_skips(), 0);
     }
 
     /// The mergeset index and the legacy inverted index must resolve the same

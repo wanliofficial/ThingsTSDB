@@ -927,7 +927,7 @@ Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
   path fsynced once per series and capped ingestion at the fsync rate; the
   batch keeps the durability promise while amortizing the sync.
 - Tests: 196 `storage_kernel` lib tests + the `index_wal_kill9` integration
-  test, and 15 `metric_engine` tests, including the migration gate: identical
+  test, and 17 `metric_engine` tests, including the migration gate: identical
   data served in `Legacy` and `New` mode must return identical results for
   empty, Eq, Neq, Re, Nre, intersected and out-of-range queries. Cache tests
   cover lookup hits/misses, generation invalidation, budget eviction, key
@@ -1021,11 +1021,11 @@ series with one sample each:
 
 | Shape | matched | p50 | p99 | of which index |
 |---|---|---|---|---|
-| name only | 200k | 1.89 s | 3.62 s | 763 ms |
-| eq job | 180k | 1.70 s | 1.99 s | 0.4 ms |
-| eq job+code | 154k | 1.36 s | 1.39 s | 3 ms |
-| eq instance | 1 | 12.0 ms | 25 ms | 0.5 ms |
-| re instance | 1.1k | 207 ms | 341 ms | 36 ms |
+| name only | 200k | 1.74 s | 4.58 s | 727 ms |
+| eq job | 180k | 1.58 s | 1.93 s | 0.3 ms |
+| eq job+code | 154k | 1.45 s | 1.57 s | 3 ms |
+| eq instance | 1 | 11.2 ms | 19 ms | 0.5 ms |
+| re instance | 1.1k | 76 ms | 179 ms | 35 ms |
 
 Two caches carry this path. `IndexManager` memoizes the per-metric
 `tsid -> series key` map for the legacy union and clears it when new series are
@@ -1036,12 +1036,24 @@ name`, which is immutable for an ID and therefore never invalidated (bounded at
 reconstruction and cut the regex selector from 438 ms to 341 ms p99 and its
 index share from 139 ms to 36 ms.
 
+A third optimization removes the legacy union once the migration has caught
+up. `IndexDbManager::group_series_ids` returns the metric's day set, and
+`DualRead` skips the legacy resolve for regex matchers when that set contains
+every legacy series of the metric on the queried days. The test is
+conservative: legacy-only series (data written before the index was enabled, or
+series without data in the range) make it fail and keep the union, so
+pre-migration data stays visible. It is visible in
+`IndexQueryStats::legacy_union_skips`, which lets operators watch migration
+progress. On the covered 200k-series workload the regex selector drops from
+207 ms to 76 ms p50 and from 341 ms to 179 ms p99, and the remaining index
+share is the regex posting scan itself rather than a second full pass over
+series keys.
+
 Narrow dashboard selectors are inside the 50 ms budget; broad selectors are
 dominated by materializing labels and samples for 100k+ series, and regex
-selectors by the legacy union (decoding and matching all 200k series keys) plus
-the remaining ns3 row decoding. Phase 3 follow-ups: a per-metric
-legacy-coverage mark so `DualRead` can skip the union when the mergeset index
-already holds every legacy series, and sample/label materialization.
+selectors by the posting scan over the series range plus materialization.
+Phase 3 follow-ups: sample/label materialization and the persisted bitmap
+representation for cold queries.
 
 - Remaining: the persisted bitmap representation for cold p99 at 10M series
   (Phase 3). Query parity, the config switch, the caches, the index-size and

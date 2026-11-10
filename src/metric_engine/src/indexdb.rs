@@ -68,6 +68,7 @@ pub struct IndexQueryStats {
     matched_series: AtomicU64,
     index_micros: AtomicU64,
     writes: AtomicU64,
+    legacy_union_skips: AtomicU64,
 }
 
 impl IndexQueryStats {
@@ -85,6 +86,16 @@ impl IndexQueryStats {
 
     pub fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Queries whose legacy union was skipped because the new index already
+    /// covered every legacy series (migration progress signal).
+    pub fn legacy_union_skips(&self) -> u64 {
+        self.legacy_union_skips.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_legacy_union_skip(&self) {
+        self.legacy_union_skips.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -357,6 +368,44 @@ impl IndexDbManager {
             .index_micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(out)
+    }
+
+    /// Every series id of `group` that has a day row in `[start_ms, end_ms)`.
+    ///
+    /// This is the metric-group set the new index would return for an empty
+    /// matcher list. `DualRead` uses it to decide whether the legacy inverted
+    /// index can be skipped for a metric during migration.
+    pub fn group_series_ids(&self, group: &[u8], start_ms: i64, end_ms: i64) -> Result<Vec<u64>> {
+        let end_ms = if end_ms > start_ms {
+            end_ms
+        } else {
+            start_ms + 1
+        };
+        let first_month = timeutil::month_of_millis(start_ms);
+        let last_month = timeutil::month_of_millis(end_ms - 1);
+        let plan = QueryPlan::from_matchers(&[TagMatcher::Equal {
+            key: b"__name__".to_vec(),
+            value: group.to_vec(),
+        }]);
+        let candidates: Vec<u16> = {
+            let months = self.months.lock().unwrap_or_else(|e| e.into_inner());
+            months.range(first_month..=last_month).copied().collect()
+        };
+        let mut ids = Vec::new();
+        for month in candidates {
+            let days = timeutil::month_days_in_range(month, start_ms, end_ms);
+            if days.is_empty() {
+                continue;
+            }
+            let db = self.db(month)?;
+            let set = db
+                .search_series_ids_arc(&plan, &days)
+                .map_err(|e| anyhow::anyhow!("search indexdb month {month}: {e}"))?;
+            ids.extend_from_slice(set.ids());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Resolves a query to the matching series IDs only, without labels.
