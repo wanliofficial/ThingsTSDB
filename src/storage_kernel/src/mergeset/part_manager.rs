@@ -39,6 +39,7 @@ use std::{
 };
 
 use crate::mergeset::{
+    block_cache::SharedBlockCache,
     merge_policy::{select_parts_to_merge, MergeCandidate, Selection},
     part::{Part, PartWriter},
     table::Table,
@@ -229,6 +230,10 @@ pub struct PartManager {
     partition_id: u64,
     /// Optional row collapser applied to the sorted flush output.
     row_merger: Option<RowMerger>,
+    /// Shared cache of decoded index blocks (ADR-0001 §4.2). Every part the
+    /// manager opens attaches it, so repeated seeks into a hot part skip the
+    /// pread and zstd decompress.
+    block_cache: Option<SharedBlockCache>,
 }
 
 impl PartManager {
@@ -245,6 +250,23 @@ impl PartManager {
             wal_dir: None,
             partition_id: 0,
             row_merger: None,
+            block_cache: None,
+        }
+    }
+
+    /// Installs a shared index-block cache (ADR-0001 §4.2). Parts opened after
+    /// this call — on recovery and after every flush/merge — decode their index
+    /// blocks through it.
+    pub fn with_block_cache(mut self, cache: SharedBlockCache) -> Self {
+        self.block_cache = Some(cache);
+        self
+    }
+
+    /// Attaches the manager's cache, if any, to a part it is about to publish.
+    fn attach_cache(&self, part: Part) -> Part {
+        match &self.block_cache {
+            Some(cache) => part.with_block_cache(Arc::clone(cache)),
+            None => part,
         }
     }
 
@@ -391,7 +413,7 @@ impl PartManager {
             let path = self.dir.join(&name);
             match Part::open(&path) {
                 Ok(part) => {
-                    self.register_part(part);
+                    self.register_part(self.attach_cache(part));
                     recovered += 1;
                 }
                 Err(_) => {
@@ -487,7 +509,7 @@ impl PartManager {
         };
         let count = pending.len();
         let part_bytes = part.size;
-        self.register_part(part);
+        self.register_part(self.attach_cache(part));
         self.stats.record_flush(part_bytes);
         // Persist the part list so recovery finds the flushed part. Written
         // atomically (temp + rename + dir fsync) so a crash never leaves a torn
@@ -551,7 +573,7 @@ impl PartManager {
         // source directories are only deleted once the output is registered.
         {
             let mut file_parts = self.file_parts.lock().unwrap_or_else(|e| e.into_inner());
-            file_parts.push(merged);
+            file_parts.push(self.attach_cache(merged));
         }
         for part in &claimed {
             let path = part.path();

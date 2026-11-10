@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     mergeset::{
+        block_cache::{CachedBlock, SharedBlockCache},
         block_header::BlockHeader,
         inmemory_block::{InmemoryBlock, MarshalType, StorageBlock, MAX_INMEMORY_BLOCK_SIZE},
         metaindex_row::MetaindexRow,
@@ -104,6 +105,11 @@ pub struct Part {
     pub item_count: u64,
     /// Total bytes of the five files that make up the part.
     pub size: u64,
+    /// Optional shared cache of decoded index blocks (ADR-0001 §4.2). A part
+    /// opened through a manager inherits the manager's cache, so a query that
+    /// revisits a part skips the decompress; a standalone `Part::open` has
+    /// none and always reads from disk.
+    block_cache: Option<SharedBlockCache>,
 }
 
 impl Clone for Part {
@@ -128,6 +134,7 @@ impl Clone for Part {
             lens_size: self.lens_size,
             item_count: self.item_count,
             size: self.size,
+            block_cache: self.block_cache.clone(),
         }
     }
 }
@@ -214,6 +221,7 @@ impl Part {
             lens_size,
             item_count: 0,
             size: 0,
+            block_cache: None,
         };
 
         // Validate the header chain against the data files and the metadata
@@ -265,6 +273,14 @@ impl Part {
             size,
             ..part
         })
+    }
+
+    /// Returns a copy of this part that decodes its index blocks through
+    /// `cache` (ADR-0001 §4.2). The manager installs its own cache so every
+    /// part it opens shares one byte budget.
+    pub(crate) fn with_block_cache(mut self, cache: SharedBlockCache) -> Self {
+        self.block_cache = Some(cache);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -328,6 +344,20 @@ impl Part {
             .metaindex
             .get(row_idx)
             .ok_or_else(|| format!("metaindex row {row_idx} out of range"))?;
+        // A hot part is revisited on every seek; the shared cache turns the
+        // repeat into a map lookup instead of a pread plus zstd decompress.
+        // Keys include the part path so two parts never alias one entry.
+        let cache_key = self
+            .block_cache
+            .as_ref()
+            .map(|_| format!("{}/{row_idx}", self.path.display()));
+        if let (Some(cache), Some(key)) = (&self.block_cache, &cache_key) {
+            if let Some(cached) = cache.get(key) {
+                if let Some(headers) = decode_cached_headers(&cached.headers, row) {
+                    return Ok((Arc::new(headers), row_idx));
+                }
+            }
+        }
         let compressed = Self::read_file(
             &self.index,
             row.index_block_offset,
@@ -347,6 +377,25 @@ impl Part {
                 "index block {row_idx} has {} trailing bytes",
                 src.len()
             ));
+        }
+        if let (Some(cache), Some(key)) = (&self.block_cache, &cache_key) {
+            // The cache stores each header in its on-disk encoding, so a hit
+            // pays one cheap unmarshal and no zstd work.
+            let encoded = headers
+                .iter()
+                .map(|h| {
+                    let mut buf = Vec::with_capacity(h.encoded_len());
+                    h.marshal(&mut buf);
+                    buf
+                })
+                .collect();
+            cache.put(
+                key.clone(),
+                CachedBlock {
+                    part_path: key.clone(),
+                    headers: encoded,
+                },
+            );
         }
         Ok((Arc::new(headers), row_idx))
     }
@@ -693,6 +742,29 @@ impl PartWriter {
     }
 }
 
+/// Decodes a cached index block back into headers, rejecting an entry whose
+/// header count disagrees with the metaindex (a stale entry is dropped and the
+/// caller falls through to a fresh read).
+fn decode_cached_headers(encoded: &[Vec<u8>], row: &MetaindexRow) -> Option<Vec<BlockHeader>> {
+    if encoded.len() != row.block_headers_count as usize {
+        return None;
+    }
+    let mut headers = Vec::with_capacity(encoded.len());
+    for bytes in encoded {
+        let mut src = bytes.as_slice();
+        let header = BlockHeader::unmarshal(&mut src).ok()?;
+        if !src.is_empty() {
+            return None;
+        }
+        headers.push(header);
+    }
+    Some(headers)
+}
+
+fn header_bytes(block: &CachedBlock) -> usize {
+    block.headers.iter().map(|h| h.len()).sum()
+}
+
 /// Groups block headers into compressed index blocks and derives the
 /// metaindex. Header order is preserved.
 fn build_index(
@@ -913,6 +985,41 @@ mod tests {
             .collect();
         items.sort();
         items
+    }
+
+    #[test]
+    fn test_block_cache_returns_identical_seek_results() {
+        use crate::mergeset::block_cache::BlockCache;
+
+        let dir = TempDir::new();
+        let input = items(1_000);
+        let part = write_part(&dir, "0000000000000001", &input);
+
+        // A part with no cache is the reference: every seek reads and
+        // decompresses from disk.
+        let cold_seek = part.search_range(&input[500], &input[520]).unwrap();
+
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let cached = part.clone().with_block_cache(cache.clone());
+        // The first pass fills the cache; the second must answer from it and
+        // still produce byte-identical results.
+        let first = cached.search_range(&input[500], &input[520]).unwrap();
+        assert!(!cache.is_empty(), "index blocks were cached on the seek");
+        let second = cached.search_range(&input[500], &input[520]).unwrap();
+        assert_eq!(first, cold_seek);
+        assert_eq!(second, cold_seek);
+
+        // A bounded cache must still answer correctly after eviction.
+        let tiny = Arc::new(BlockCache::new(1));
+        let evicting = part.clone().with_block_cache(tiny);
+        assert_eq!(
+            evicting.search_range(&input[500], &input[520]).unwrap(),
+            cold_seek
+        );
+        assert_eq!(
+            evicting.search_range(&input[0], &input[30]).unwrap(),
+            part.search_range(&input[0], &input[30]).unwrap()
+        );
     }
 
     #[test]

@@ -254,7 +254,15 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   并发：writer 持续向 16 个序列写入、reader 并发执行 last_values/区间查询。断言不变量
   （无查询报错、解析出的序列数是已写集合的子集、写完后全量可见且一致）并输出读延迟
   分布作为抖动证据（160 次读：p50 0.46 ms / p99 37.9 ms / max 42.4 ms）。
-- 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层、本地块缓存。
+- 已完成（部分，2026-11-10）：本地块缓存。`storage_kernel::mergeset::block_cache::BlockCache`
+  （按字节预算 + FIFO 淘汰）此前是死代码，现接入 mergeset 读取路径：`Part` 新增
+  `block_cache` 字段，`load_index_block` 命中缓存时直接反序列化缓存的 header，跳过
+  pread + zstd 解压；缓存键为 `{part_dir}/{row_idx}`，条目以紧凑的 on-disk 编码保存，
+  命中只需一次廉价 unmarshal。`PartManager::with_block_cache` 让 `recover_from_disk`、
+  `flush_once`、`merge_once` 发布的所有 part 共享同一预算；`IndexDbConfig.block_cache_bytes`
+  （默认 64 MiB，0 关闭）在 `IndexDb::open` 里装配。测试覆盖命中/未命中的查询结果
+  与无缓存路径逐字节一致、1 字节预算下淘汰后仍正确。
+- 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层。
 - 分片/副本与再平衡。
 - TSBS IoT 场景基准、故障注入（kill -9、磁盘满、时钟回拨）。
 

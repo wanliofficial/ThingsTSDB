@@ -35,6 +35,7 @@ use std::{
 };
 
 use crate::mergeset::{
+    block_cache::BlockCache,
     indexdb::{
         self, canonical_name, date_metric_name_row, date_series_prefix, date_series_rows,
         date_tag_posting_row, decode_canonical_name, decode_date_series_row,
@@ -60,6 +61,9 @@ pub struct IndexDbConfig {
     /// (8 bytes each). Latency-sensitive deployments with millions of series
     /// in a month partition raise this.
     pub cache_ids: usize,
+    /// Byte budget of the decoded index-block cache (ADR-0001 §4.2). `0`
+    /// disables the cache and makes every seek read and decompress from disk.
+    pub block_cache_bytes: usize,
 }
 
 impl Default for IndexDbConfig {
@@ -68,6 +72,7 @@ impl Default for IndexDbConfig {
             manager: ManagerConfig::default(),
             spawn_workers: true,
             cache_ids: DEFAULT_CACHE_IDS,
+            block_cache_bytes: DEFAULT_BLOCK_CACHE_BYTES,
         }
     }
 }
@@ -88,6 +93,12 @@ pub struct IndexDb {
 /// Names kept by [`IndexDb`] for label reconstruction. A canonical name is
 /// ~50-100 B, so the cap is ~20 MiB, well below the index budget at 10M series.
 const NAME_CACHE_ENTRIES: usize = 262_144;
+
+/// Default budget for decoded index blocks (ADR-0001 §4.2). One index block
+/// caps out at 64 KiB uncompressed, so 64 MiB holds ~1k hot blocks — enough to
+/// keep a month partition's frequently sought range resident without crowding
+/// the posting-set cache.
+const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 impl Drop for IndexDb {
     fn drop(&mut self) {
@@ -115,11 +126,13 @@ impl IndexDb {
             u64::from(partition),
             config.manager.wal_sync_on_write,
         )?;
-        let manager = Arc::new(
-            PartManager::new(Arc::clone(&table), &dir, config.manager)
-                .with_wal(wal, wal_dir, u64::from(partition))
-                .with_row_merger(Arc::new(indexdb::collapse_posting_items)),
-        );
+        let mut manager = PartManager::new(Arc::clone(&table), &dir, config.manager)
+            .with_wal(wal, wal_dir, u64::from(partition))
+            .with_row_merger(Arc::new(indexdb::collapse_posting_items));
+        if config.block_cache_bytes > 0 {
+            manager = manager.with_block_cache(Arc::new(BlockCache::new(config.block_cache_bytes)));
+        }
+        let manager = Arc::new(manager);
         manager.recover_from_disk()?;
         manager.replay_wal()?;
         if config.spawn_workers {

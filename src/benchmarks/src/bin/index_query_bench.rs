@@ -78,6 +78,7 @@ fn main() {
             flush_interval: Duration::from_secs(3_600),
             ..ManagerConfig::default()
         },
+        ..IndexDbConfig::default()
     };
     let db = IndexDb::open(&dir, partition, config).expect("open indexdb");
 
