@@ -41,7 +41,7 @@ use std::{
 
 use storage_kernel::mergeset::{
     indexdb::SeriesName,
-    indexdb_table::{IndexDb, IndexDbConfig},
+    indexdb_table::{IndexDb, IndexDbConfig, SeriesBatchRow},
     tag_filter::{QueryPlan, TagMatcher},
     timeutil,
 };
@@ -307,7 +307,7 @@ impl IndexDbManager {
                         .collect()
                 })
                 .collect();
-            let batch: Vec<(u64, &[u8], &[(&[u8], &[u8])], &[u64])> = writes
+            let batch: Vec<SeriesBatchRow<'_>> = writes
                 .iter()
                 .zip(tag_refs.iter())
                 .map(|(w, tags)| {

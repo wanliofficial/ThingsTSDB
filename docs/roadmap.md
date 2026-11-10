@@ -262,9 +262,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `flush_once`、`merge_once` 发布的所有 part 共享同一预算；`IndexDbConfig.block_cache_bytes`
   （默认 64 MiB，0 关闭）在 `IndexDb::open` 里装配。测试覆盖命中/未命中的查询结果
   与无缓存路径逐字节一致、1 字节预算下淘汰后仍正确。
+- 已完成（部分，2026-11-10）：故障注入。`columnar_storage::fault` 提供装饰器式
+  `FaultyStore`（`ObjectStore` 包装器，不依赖真实磁盘）：`Fault::operation(op, n)` 让
+  某操作的前 n 次（`u64::MAX` = 永远）失败，`Fault::location(needle)` 让路径含子串的
+  操作失败，命中次数记入 `FaultReport` 供断言；`SkewedClock` 复现时钟回拨，
+  `SlowPutStore` 加宽并发抖动窗口。集成测试（`tests/fault_injection.rs`）验证三条
+  不变量：数据文件 PUT 失败时 flush 的磁盘满错误传播到调用方、manifest 从不引用
+  未提交文件（读要么报错要么看到空表）、缓冲帧被 `reinsert` 回 WAL 待重试；
+  全部 PUT 失败时写入/刷盘报错而表保持一致；时钟回拨一小时或超前不丢行不 panic。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层。
 - 分片/副本与再平衡。
-- TSBS IoT 场景基准、故障注入（kill -9、磁盘满、时钟回拨）。
+- TSBS IoT 场景基准。
 
 ## 七、兼容与迁移
 

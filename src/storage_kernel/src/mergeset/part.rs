@@ -761,10 +761,6 @@ fn decode_cached_headers(encoded: &[Vec<u8>], row: &MetaindexRow) -> Option<Vec<
     Some(headers)
 }
 
-fn header_bytes(block: &CachedBlock) -> usize {
-    block.headers.iter().map(|h| h.len()).sum()
-}
-
 /// Groups block headers into compressed index blocks and derives the
 /// metaindex. Header order is preserved.
 fn build_index(

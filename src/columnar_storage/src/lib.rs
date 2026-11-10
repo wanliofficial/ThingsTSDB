@@ -20,6 +20,7 @@
 mod buffer;
 mod compaction;
 pub mod config;
+pub mod fault;
 mod macros;
 pub mod manifest;
 pub mod metrics;

@@ -100,6 +100,9 @@ const NAME_CACHE_ENTRIES: usize = 262_144;
 /// the posting-set cache.
 const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// One series row of a batch write: `(series_id, group, tags, days)`.
+pub type SeriesBatchRow<'a> = (u64, &'a [u8], &'a [(&'a [u8], &'a [u8])], &'a [u64]);
+
 impl Drop for IndexDb {
     fn drop(&mut self) {
         self.manager.stop();
@@ -196,10 +199,7 @@ impl IndexDb {
     /// the fsync rate. This builds the rows for a chunk of series (bounded by
     /// [`MAX_SERIES_PER_FRAME`] so a frame stays a few MiB) and appends them
     /// together. Single-series callers keep [`IndexDb::write_series`].
-    pub fn write_series_batch(
-        &self,
-        series: &[(u64, &[u8], &[(&[u8], &[u8])], &[u64])],
-    ) -> Result<usize, String> {
+    pub fn write_series_batch(&self, series: &[SeriesBatchRow<'_>]) -> Result<usize, String> {
         let mut count = 0;
         for chunk in series.chunks(MAX_SERIES_PER_FRAME) {
             let mut items = Vec::with_capacity(chunk.len() * 16);
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn test_write_series_batch_registers_every_series() {
         let (_root, db) = db();
-        let batch: [(u64, &[u8], &[(&[u8], &[u8])], &[u64]); 3] = [
+        let batch: [SeriesBatchRow<'_>; 3] = [
             (1, b"m", &[(b"job", b"api"), (b"code", b"200")], &[10]),
             (2, b"m", &[(b"job", b"api"), (b"code", b"500")], &[10]),
             (3, b"m", &[(b"job", b"web"), (b"code", b"200")], &[10]),
@@ -774,7 +774,7 @@ mod tests {
             .map(|name| vec![(b"instance".as_slice(), name.as_slice())])
             .collect();
         let days = [10u64];
-        let batch: Vec<(u64, &[u8], &[(&[u8], &[u8])], &[u64])> = (0..count)
+        let batch: Vec<SeriesBatchRow<'_>> = (0..count)
             .map(|i| {
                 (
                     i as u64 + 1,

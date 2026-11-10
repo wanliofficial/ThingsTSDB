@@ -84,6 +84,9 @@ pub fn index_schema() -> SchemaRef {
     ]))
 }
 
+/// `metric_id -> (tsid -> series_key)`, the legacy query-path cache.
+type SeriesKeyCache = HashMap<u64, Arc<HashMap<u64, Vec<u8>>>>;
+
 pub struct IndexManager {
     series_storage: ColumnarStorageRef,
     index_storage: ColumnarStorageRef,
@@ -93,7 +96,7 @@ pub struct IndexManager {
     /// `metric_id -> (tsid -> series_key)` for the legacy query path. A
     /// dashboard re-runs the same selector, and rescanning the whole series
     /// table per query made the legacy half of `DualRead` the dominant cost.
-    series_keys: Mutex<HashMap<u64, Arc<HashMap<u64, Vec<u8>>>>>,
+    series_keys: Mutex<SeriesKeyCache>,
 }
 
 impl IndexManager {
