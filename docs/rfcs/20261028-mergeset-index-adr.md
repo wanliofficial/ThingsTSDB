@@ -926,7 +926,7 @@ Done, in `storage_kernel::mergeset`, `metric_engine` and `src/server`:
   groups new series by month before writing. The previous one-frame-per-series
   path fsynced once per series and capped ingestion at the fsync rate; the
   batch keeps the durability promise while amortizing the sync.
-- Tests: 195 `storage_kernel` lib tests + the `index_wal_kill9` integration
+- Tests: 196 `storage_kernel` lib tests + the `index_wal_kill9` integration
   test, and 15 `metric_engine` tests, including the migration gate: identical
   data served in `Legacy` and `New` mode must return identical results for
   empty, Eq, Neq, Re, Nre, intersected and out-of-range queries. Cache tests
@@ -1021,20 +1021,27 @@ series with one sample each:
 
 | Shape | matched | p50 | p99 | of which index |
 |---|---|---|---|---|
-| name only | 200k | 1.81 s | 3.56 s | 504 ms |
-| eq job | 180k | 1.88 s | 2.08 s | 0.4 ms |
-| eq job+code | 154k | 1.32 s | 1.40 s | 3 ms |
-| eq instance | 1 | 12.5 ms | 59 ms | 1.5 ms |
-| re instance | 1.1k | 296 ms | 438 ms | 139 ms |
+| name only | 200k | 1.89 s | 3.62 s | 763 ms |
+| eq job | 180k | 1.70 s | 1.99 s | 0.4 ms |
+| eq job+code | 154k | 1.36 s | 1.39 s | 3 ms |
+| eq instance | 1 | 12.0 ms | 25 ms | 0.5 ms |
+| re instance | 1.1k | 207 ms | 341 ms | 36 ms |
 
-The legacy per-metric series-key map is now cached (the full series-table scan
-per query dominated the narrow shapes) and is invalidated when new series are
-persisted. Narrow dashboard selectors are inside the 50 ms budget; broad
-selectors are dominated by materializing labels and samples for 100k+ series,
-and regex selectors by the legacy union (decoding and matching all 200k series
-keys) plus the ns3 name range scan. Phase 3 follow-ups: an id -> name cache in
-`IndexDb`, and a per-metric legacy-coverage mark so `DualRead` can skip the
-union when the mergeset index already holds every legacy series.
+Two caches carry this path. `IndexManager` memoizes the per-metric
+`tsid -> series key` map for the legacy union and clears it when new series are
+persisted; before that, the full series-table scan per query made a single
+`instance=` match cost ~213 ms. `IndexDb` memoizes `series id -> canonical
+name`, which is immutable for an ID and therefore never invalidated (bounded at
+262k entries, ~20 MiB); it removes the repeated ns3 range scan during label
+reconstruction and cut the regex selector from 438 ms to 341 ms p99 and its
+index share from 139 ms to 36 ms.
+
+Narrow dashboard selectors are inside the 50 ms budget; broad selectors are
+dominated by materializing labels and samples for 100k+ series, and regex
+selectors by the legacy union (decoding and matching all 200k series keys) plus
+the remaining ns3 row decoding. Phase 3 follow-ups: a per-metric
+legacy-coverage mark so `DualRead` can skip the union when the mergeset index
+already holds every legacy series, and sample/label materialization.
 
 - Remaining: the persisted bitmap representation for cold p99 at 10M series
   (Phase 3). Query parity, the config switch, the caches, the index-size and

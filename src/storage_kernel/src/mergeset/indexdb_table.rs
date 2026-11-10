@@ -79,7 +79,15 @@ pub struct IndexDb {
     table: Arc<Mutex<Table>>,
     manager: Arc<PartManager>,
     cache: FilterCache,
+    /// `series id -> canonical name`, immutable for an ID, so it is never
+    /// invalidated. Bounded by [`NAME_CACHE_ENTRIES`]; a cold id falls back to
+    /// the ns3 scan.
+    names: Mutex<HashMap<u64, indexdb::SeriesName>>,
 }
+
+/// Names kept by [`IndexDb`] for label reconstruction. A canonical name is
+/// ~50-100 B, so the cap is ~20 MiB, well below the index budget at 10M series.
+const NAME_CACHE_ENTRIES: usize = 262_144;
 
 impl Drop for IndexDb {
     fn drop(&mut self) {
@@ -125,6 +133,7 @@ impl IndexDb {
             table,
             manager,
             cache: FilterCache::new(config.cache_ids),
+            names: Mutex::new(HashMap::new()),
         })
     }
 
@@ -242,34 +251,67 @@ impl IndexDb {
     /// one sequential pass over the namespace.
     pub fn series_names(&self, ids: &[u64]) -> Result<HashMap<u64, indexdb::SeriesName>, String> {
         const SEEK_LIMIT: usize = 64;
-        let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = HashMap::with_capacity(ids.len());
-        if ids.len() <= SEEK_LIMIT {
+        let mut missing = Vec::new();
+        {
+            let names = self.names.lock().unwrap_or_else(|e| e.into_inner());
             for &id in ids {
+                match names.get(&id) {
+                    Some(name) => {
+                        out.insert(id, name.clone());
+                    }
+                    None => missing.push(id),
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(out);
+        }
+
+        let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fetched: Vec<(u64, indexdb::SeriesName)> = Vec::with_capacity(missing.len());
+        if missing.len() <= SEEK_LIMIT {
+            for &id in &missing {
                 for row in table.search_prefix(&indexdb::series_id_prefix(id))? {
                     if let Some((found, name)) = decode_series_id_name_row(&row) {
                         if found == id {
-                            out.insert(id, decode_name(&name));
+                            fetched.push((id, decode_name(&name)));
                         }
                     }
                 }
             }
-            return Ok(out);
+        } else {
+            let mut want = missing;
+            want.sort_unstable();
+            want.dedup();
+            let start = [indexdb::ns::METRIC_NAME_BY_SERIES_ID];
+            let end = [indexdb::ns::METRIC_NAME_BY_SERIES_ID + 1];
+            for row in table.search_range(&start, &end)? {
+                let Some((id, name)) = decode_series_id_name_row(&row) else {
+                    continue;
+                };
+                if want.binary_search(&id).is_ok() {
+                    fetched.push((id, decode_name(&name)));
+                }
+            }
         }
-        let mut want: Vec<u64> = ids.to_vec();
-        want.sort_unstable();
-        want.dedup();
-        let start = [indexdb::ns::METRIC_NAME_BY_SERIES_ID];
-        let end = [indexdb::ns::METRIC_NAME_BY_SERIES_ID + 1];
-        for row in table.search_range(&start, &end)? {
-            let Some((id, name)) = decode_series_id_name_row(&row) else {
-                continue;
-            };
-            if want.binary_search(&id).is_ok() {
-                out.insert(id, decode_name(&name));
+        drop(table);
+
+        if !fetched.is_empty() {
+            let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, name) in fetched {
+                if names.len() < NAME_CACHE_ENTRIES {
+                    names.insert(id, name.clone());
+                }
+                out.insert(id, name);
             }
         }
         Ok(out)
+    }
+
+    /// Number of cached series names (tests and observability).
+    pub fn cached_names(&self) -> usize {
+        self.names.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Looks a series up by its identity (ns0), returning the encoded series
@@ -589,6 +631,33 @@ mod tests {
         // map.
         let many: Vec<u64> = (0..100).chain(std::iter::once(7)).collect();
         assert_eq!(db.series_names(&many).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_series_names_are_cached() {
+        let (_root, db) = db();
+        for id in 1..=3 {
+            db.write_series(id, b"m", &[(b"job", b"api")], &[10])
+                .unwrap();
+        }
+        assert_eq!(db.cached_names(), 0);
+        let first = db.series_names(&[1, 2, 3]).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(db.cached_names(), 3);
+
+        // A warm lookup returns the same map without touching the table.
+        let second = db.series_names(&[1, 2, 3]).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(db.cached_names(), 3);
+
+        // A mixed request only fetches the cold id.
+        let mixed = db.series_names(&[2, 4]).unwrap();
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(db.cached_names(), 3);
+
+        // The small-vs-large path agrees on cached ids.
+        let many: Vec<u64> = (0..100).collect();
+        assert_eq!(db.series_names(&many).unwrap(), first);
     }
 
     #[test]
