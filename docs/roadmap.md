@@ -230,7 +230,16 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   切成「前导部分桶 raw + 已发布表 + 尾部 raw」，避免历史桶里的区间外样本污染结果。
   三种集成测试以 raw `downsample` 为基准逐点比对：6 种聚合 × 3 种 step（含 1h 重聚合）
   × 3 种区间（含非对齐起点）、乱序/迟到写入与 dirty 重建、90 s 回退与重启后仍一致。
-  剩余 Phase 3 验收项：黄金查询集进 CI、仪表盘 p99 < 50 ms。
+  剩余 Phase 3 验收项：仪表盘 p99 < 50 ms。
+- 已完成（2026-11-11）：黄金查询集进 CI。`src/metric_engine/tests/golden_query_set.rs`
+  固定部署（3 个 metric、8 个序列、一天确定性样本）加载后回答 19 条查询：4 种匹配器
+  形状（`=`/`!=`/`=~`/`!~`）、仅 metric、双标签、limit 截断、亚分钟窗口、非对齐起点、
+  空区间，以及 6 种聚合的 1m 降采样与 5m/1h 重聚合、90 s 回退；答案与
+  `tests/golden/query_set.json` 比对（原始区间用「点数 + 顺序敏感校验和 + 首尾点」摘要，
+  降采样区间保留全部点），并用 `THINGS_TSDB_UPDATE_GOLDEN=1` 显式刷新、diff 可审阅。
+  同一次运行内还断言每条降采样查询与 raw `downsample` 逐点一致，因此 diff 同时指出
+  是哪个读取路径变了。另有元测试保证黄金集覆盖全部匹配器与全部聚合、无重名，新形状
+  不能悄悄漏测。`make test`（CI 的 unit-test job）已包含该集成测试。
 - 验收：黄金查询集进 CI；仪表盘类查询 p99 < 50 ms；全量 ad-hoc 明确为秒级 SLO。
 
 ### Phase 4：运维与生态（持续）

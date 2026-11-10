@@ -2491,6 +2491,8 @@ dependencies = [
  "object_store",
  "regex",
  "seahash",
+ "serde",
+ "serde_json",
  "storage_kernel",
  "temp-dir",
  "test-log",

@@ -463,9 +463,12 @@ impl MetricEngine {
         // Fold fine buckets into the requested step and render the aggregate.
         let mut matched: Vec<(Vec<u8>, SeriesSamples)> = fine
             .into_iter()
-            .filter_map(|(tsid, buckets)| {
+            .filter_map(|(tsid, mut buckets)| {
                 let (name, labels) = series.get(&tsid)?;
                 let mut coarse: BTreeMap<i64, Rollup> = BTreeMap::new();
+                // Folding in bucket order keeps the floating-point sums
+                // reproducible regardless of hash-map iteration order.
+                buckets.sort_by_key(|(bucket, _)| *bucket);
                 for (bucket, rollup) in buckets {
                     coarse
                         .entry(align_down(bucket, step_ms))
