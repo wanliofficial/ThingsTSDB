@@ -224,8 +224,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
 
 ### Phase 4：运维与生态（持续）
 
+- 已完成（部分，2026-11-10）：查询可观测性。`server::metrics::ServerMetrics`
+  用原子计数器 + 累积延迟直方图（Prometheus 桶模型）按查询类型（range/last/
+  range_step）统计 p50/p99 分位数、series/样本总数与 4xx/5xx；查询超过阈值
+  （默认 50 ms）输出结构化慢查询 `warn!` 日志。server 暴露 `/api/v1/stats`
+  （Prometheus 文本）。联调时发现并修复一个潜在崩溃：`IndexDbManager` 查询区间
+  现钳制到磁盘上存在的月分区跨度——HTTP API 默认开区间上界为 `i64::MAX`，
+  此前使 `month_of_millis`（`(year-1970)*12`）溢出并 panic，也会打开数百个空
+  的未来月分区；区间完全落在磁盘跨度外时坍缩为空区间、不打开任何月分区。
+  回归测试覆盖 search/last_values 的 i64::MAX/未来/越界场景。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层、本地块缓存。
-- 每指标 TTL、备份恢复、分片/副本与再平衡、慢查询日志、可观测指标。
+- 每指标 TTL、备份恢复、分片/副本与再平衡。
 - TSBS IoT 场景基准、满载查询抖动测试、故障注入（kill -9、磁盘满、时钟回拨）。
 
 ## 七、兼容与迁移
