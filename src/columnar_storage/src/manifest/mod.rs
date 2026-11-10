@@ -574,18 +574,27 @@ mod tests {
                 manifest.add_file(i as u64, meta).await.unwrap();
             }
 
-            // Wait for merge manifest to finish
-            sleep(Duration::from_secs(2)).await;
-
+            // Wait for the periodic merge to fold the deltas into the
+            // snapshot. Poll instead of sleeping a fixed time: the merge runs
+            // off a background task, and a loaded machine can push it past any
+            // single deadline.
             let mut mem_ssts = manifest.ssts.read().await.clone();
-            let snapshot = read_snapshot(&store, &snapshot_path).await.unwrap();
-            let mut ssts = snapshot.into_ssts();
-
             mem_ssts.sort_by_key(|a| a.id());
-            ssts.sort_by_key(|a| a.id());
-            assert_eq!(mem_ssts, ssts);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let (ssts, delta_paths) = loop {
+                let snapshot = read_snapshot(&store, &snapshot_path).await.unwrap();
+                let mut ssts = snapshot.into_ssts();
+                ssts.sort_by_key(|a| a.id());
+                let delta_paths = list_delta_paths(&store, &delta_dir).await.unwrap();
+                if (!ssts.is_empty() && delta_paths.is_empty())
+                    || std::time::Instant::now() > deadline
+                {
+                    break (ssts, delta_paths);
+                }
+                sleep(Duration::from_millis(100)).await;
+            };
 
-            let delta_paths = list_delta_paths(&store, &delta_dir).await.unwrap();
+            assert_eq!(mem_ssts, ssts);
             assert!(delta_paths.is_empty());
         })
     }

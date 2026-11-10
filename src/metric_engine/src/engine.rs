@@ -324,8 +324,10 @@ impl MetricEngine {
     /// on-disk state is a consistent snapshot for
     /// [`MetricEngine::backup`].
     pub async fn flush_all(&self) -> Result<()> {
-        // Publish the buckets that closed before now, so the flush below also
-        // makes them durable.
+        // Rebuild the buckets a late write invalidated, then publish the ones
+        // that closed before now, so the flush below also makes them durable.
+        // Both read/write the raw data table, so they stay off the write path.
+        self.rollups.flush_dirty().await?;
         self.rollups.flush_closed(common::now()).await?;
         let storages = [
             (self.metric.storage(), "metrics"),

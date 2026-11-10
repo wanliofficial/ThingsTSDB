@@ -1198,6 +1198,9 @@ mod tests {
             // Keep the count trigger out of the picture: only the segment that
             // just closed may select these files.
             config.scheduler.input_sst_min_num = 100;
+            // The test counts objects on disk, so the inputs have to go away as
+            // soon as the manifest no longer lists them.
+            config.scheduler.delete_grace = common::ReadableDuration::secs(0);
             // The loop could also fire on its own; a day-long interval makes
             // `compact()` the only source of tasks.
             config.scheduler.schedule_interval = common::ReadableDuration::days(1);

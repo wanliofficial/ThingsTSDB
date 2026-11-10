@@ -74,6 +74,9 @@ struct Inner {
     trigger_tx: Sender<()>,
     format: FileFormat,
     metrics: Arc<StorageMetrics>,
+    /// Grace period before the objects of a compacted-away file are deleted;
+    /// see [`crate::config::SchedulerConfig::delete_grace`].
+    delete_grace: std::time::Duration,
 }
 
 impl Executor {
@@ -90,6 +93,7 @@ impl Executor {
         trigger_tx: Sender<()>,
         format: FileFormat,
         metrics: Arc<StorageMetrics>,
+        delete_grace: std::time::Duration,
     ) -> Self {
         let inner = Inner {
             runtime,
@@ -104,6 +108,7 @@ impl Executor {
             trigger_tx,
             format,
             metrics,
+            delete_grace,
         };
         Self {
             inner: Arc::new(inner),
@@ -233,7 +238,19 @@ impl Executor {
             .iter()
             .map(|f| Path::from(self.inner.sst_path_gen.generate_for(f.id(), f.meta())))
             .collect::<Vec<_>>();
-        self.delete_paths(paths);
+        // Deleting immediately would break readers that resolved the file list
+        // just before the commit above: the manifest no longer lists these
+        // files, but a scan already holds them. Give those readers a grace
+        // period before the objects disappear.
+        let runtime = Arc::clone(&self.inner.runtime);
+        let store = Arc::clone(&self.inner.store);
+        let delete_grace = self.inner.delete_grace;
+        runtime.spawn(async move {
+            if !delete_grace.is_zero() {
+                tokio::time::sleep(delete_grace).await;
+            }
+            delete_paths(store.as_ref(), paths).await;
+        });
         Ok(())
     }
 
@@ -344,30 +361,34 @@ impl Executor {
             .context("get object meta")?;
         Ok((object_meta.size as u64, num_rows, min_sequence_of(task)))
     }
+}
 
-    fn delete_paths(&self, paths: Vec<Path>) {
-        let (_, results) = TokioScope::scope_and_block(|scope| {
-            for path in paths {
-                trace!(%path, "Delete sst file");
-                let path = path.clone();
-                scope.spawn(async move {
-                    self.inner
-                        .store
-                        .delete(&path)
-                        .await
-                        .with_context(|| format!("failed to delete file, path:{path}"))
-                });
+/// Deletes the objects of a finished compaction, logging instead of failing
+/// (the manifest already committed, and GC would finish the job).
+///
+/// A free function rather than a method so the delayed deletion in
+/// [`Executor::do_compaction`] and the tests share one path.
+async fn delete_paths(store: &dyn object_store::ObjectStore, paths: Vec<Path>) {
+    let (_, results) = TokioScope::scope_and_block(|scope| {
+        for path in paths {
+            trace!(%path, "Delete sst file");
+            let path = path.clone();
+            scope.spawn(async move {
+                store
+                    .delete(&path)
+                    .await
+                    .with_context(|| format!("failed to delete file, path:{path}"))
+            });
+        }
+    });
+    for res in results {
+        match res {
+            Err(e) => {
+                error!("Failed to join delete task, err:{e}")
             }
-        });
-        for res in results {
-            match res {
-                Err(e) => {
-                    error!("Failed to join delete task, err:{e}")
-                }
-                Ok(v) => {
-                    if let Err(e) = v {
-                        error!("Failed to delete sst, err:{e}")
-                    }
+            Ok(v) => {
+                if let Err(e) = v {
+                    error!("Failed to delete sst, err:{e}")
                 }
             }
         }
@@ -519,6 +540,7 @@ mod tests {
                 trigger_tx,
                 FileFormat::Tsf,
                 Arc::new(StorageMetrics::default()),
+                std::time::Duration::ZERO,
             );
 
             let task = Task {
@@ -558,6 +580,132 @@ mod tests {
                 .collect::<Vec<_>>();
             starts.sort_unstable();
             assert_eq!(starts, vec![t0, t1]);
+        });
+    }
+
+    /// A compaction commits its manifest entry before it removes the objects it
+    /// replaced, and a reader that resolved the file list just before that
+    /// commit still holds them. The removal is therefore delayed instead of
+    /// racing the reader (the TSBS IoT benchmark hit exactly this: a rollup
+    /// rebuild scanning a file compaction had just unlinked).
+    #[test_log::test(test)]
+    fn test_do_compaction_keeps_inputs_readable_before_the_grace_period() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let store: ObjectStoreRef = Arc::new(LocalFileSystem::new());
+        let runtime: RuntimeRef = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let schema = StorageSchema::try_new(sample_schema(), 3, UpdateMode::Overwrite).unwrap();
+        let path_gen = Arc::new(SstPathGenerator::new(
+            root.path().to_string_lossy().to_string(),
+        ));
+        let reader = Arc::new(ParquetReader::new(
+            store.clone(),
+            schema.clone(),
+            path_gen.clone(),
+        ));
+        let manifest: ManifestRef = Arc::new(
+            runtime
+                .block_on(async {
+                    Manifest::try_new(
+                        root.path().to_string_lossy().to_string(),
+                        store.clone(),
+                        runtime.clone(),
+                        ManifestConfig::default(),
+                    )
+                    .await
+                })
+                .unwrap(),
+        );
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(1);
+        let executor = Executor::new(
+            runtime.clone(),
+            store.clone(),
+            schema.clone(),
+            manifest.clone(),
+            path_gen.clone(),
+            Arc::clone(&reader),
+            WriterProperties::builder().build(),
+            1 << 30,
+            trigger_tx,
+            FileFormat::Parquet,
+            Arc::new(StorageMetrics::default()),
+            // A grace period long enough that the test's own reads happen
+            // first; the delayed deletion below is what proves the objects are
+            // still removable.
+            std::time::Duration::from_secs(3_600),
+        );
+
+        let t0 = 1_699_999_200_000;
+        runtime.block_on(async {
+            let mut inputs = Vec::new();
+            for (id_seq, ts) in [(100u64, t0), (200, t0 + 1_000), (300, t0 + 2_000)] {
+                let id = SstFile::allocate_id();
+                let path = object_store::path::Path::from(path_gen.generate(id));
+                let batch = schema
+                    .fill_builtin_columns_with_start_seq(batch(&[(1, 10, ts, 1.5)]), id_seq)
+                    .unwrap();
+                let mut writer = AsyncArrowWriter::try_new(
+                    ParquetObjectWriter::new(store.clone(), path.clone()),
+                    schema.arrow_schema.clone(),
+                    Some(WriterProperties::builder().build()),
+                )
+                .unwrap();
+                writer.write(&batch).await.unwrap();
+                writer.close().await.unwrap();
+                let size = store.head(&path).await.unwrap().size;
+
+                let file = SstFile::new(
+                    id,
+                    FileMeta {
+                        max_sequence: id_seq + 10,
+                        min_sequence: id_seq,
+                        num_rows: 1,
+                        size: size as u32,
+                        time_range: (ts..ts + 1).into(),
+                        format: FileFormat::Parquet,
+                    },
+                );
+                manifest.add_file(id, file.meta().clone()).await.unwrap();
+                file.mark_compaction();
+                inputs.push(file);
+            }
+
+            let task = Task {
+                inputs,
+                expireds: Vec::new(),
+            };
+            executor.do_compaction(&task).await.unwrap();
+
+            // The output is committed, and the inputs are still readable.
+            assert_eq!(manifest.all_ssts().await.len(), 1);
+            let plan = reader
+                .build_df_plan(manifest.all_ssts().await, None, Vec::new(), true)
+                .unwrap();
+            let stream = execute_stream(plan, Arc::new(TaskContext::default())).unwrap();
+            let rows = stream
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+            for file in &task.inputs {
+                let path =
+                    object_store::path::Path::from(path_gen.generate_for(file.id(), file.meta()));
+                store
+                    .head(&path)
+                    .await
+                    .expect("input must survive the grace period");
+            }
+
+            // `delete_paths` is the same function the delayed spawn
+            // calls; invoking it directly asserts the objects really are
+            // removable (GC would otherwise collect them).
+            let paths = task
+                .inputs
+                .iter()
+                .map(|f| object_store::path::Path::from(path_gen.generate_for(f.id(), f.meta())))
+                .collect::<Vec<_>>();
+            delete_paths(store.as_ref(), paths).await;
         });
     }
 }

@@ -448,7 +448,7 @@ async fn stats_json(data: web::Data<AppState>) -> impl Responder {
             ));
         }
     }
-    body.push_str("\n");
+    body.push('\n');
     body.push_str(&data.metrics.render_prometheus());
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")

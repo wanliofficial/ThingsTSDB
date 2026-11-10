@@ -231,6 +231,10 @@ type Key = (u64, u64, i64);
 /// write wins on a shared timestamp and the map stays sorted by time.
 type BucketSamples = BTreeMap<i64, (u64, f64)>;
 
+/// The candidate tsids and expected buckets of one metric, as collected for a
+/// dirty-bucket rebuild.
+type DirtyIndex = HashMap<u64, (HashSet<u64>, HashSet<(u64, i64)>)>;
+
 /// One resolution's open buckets plus the published table.
 pub struct RollupTable {
     interval_ms: i64,
@@ -310,24 +314,32 @@ impl RollupTable {
         self.watermark.load(Ordering::Relaxed)
     }
 
+    /// Recomposes the buckets a late write invalidated.
+    ///
+    /// Separate from [`RollupTable::flush_closed`] because it reads the raw
+    /// data table, which is far more expensive than publishing what is already
+    /// in memory: the write path only publishes, and this runs on flush and
+    /// compaction.
+    pub async fn flush_dirty(&self) -> Result<()> {
+        let dirty: Vec<Key> = self.dirty.lock().unwrap().iter().copied().collect();
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let rows = self.rebuild_dirty(&dirty).await?;
+        self.write_rows(rows).await?;
+        let mut guard = self.dirty.lock().unwrap();
+        for key in dirty {
+            guard.remove(&key);
+        }
+        Ok(())
+    }
+
     /// Publishes every bucket closed before `now - interval`.
     ///
     /// Buckets are written before they are dropped from memory, so a
     /// concurrent query sees each bucket in at least one place.
     pub async fn flush_closed(&self, now_ms: i64) -> Result<()> {
         let target = align_down(now_ms.saturating_sub(self.interval_ms), self.interval_ms);
-
-        // Rebuild the buckets a late write invalidated. Reading the raw data
-        // keeps the published aggregate identical to a raw scan.
-        let dirty: Vec<Key> = self.dirty.lock().unwrap().iter().copied().collect();
-        if !dirty.is_empty() {
-            let rows = self.rebuild_dirty(&dirty).await?;
-            self.write_rows(rows).await?;
-            let mut guard = self.dirty.lock().unwrap();
-            for key in dirty {
-                guard.remove(&key);
-            }
-        }
 
         if target <= self.watermark.load(Ordering::Relaxed) {
             return Ok(());
@@ -382,42 +394,62 @@ impl RollupTable {
         Ok(())
     }
 
-    /// Re-reads the raw samples of `keys` and recomputes their aggregates.
+    /// Re-reads the raw samples of the dirty buckets and recomputes their
+    /// aggregates.
+    ///
+    /// One scan per metric, not per bucket: a fleet-wide late write marks
+    /// thousands of buckets at once, and a scan each would read the same files
+    /// thousands of times.
     async fn rebuild_dirty(&self, keys: &[Key]) -> Result<Vec<Row>> {
-        let mut rows = Vec::with_capacity(keys.len());
+        // metric -> (candidate tsids, expected buckets)
+        let mut by_metric: DirtyIndex = HashMap::new();
         for &(metric_id, tsid, bucket) in keys {
-            let start = bucket;
-            let end = bucket + self.interval_ms;
-            let predicates = vec![
+            let (tsids, buckets) = by_metric.entry(metric_id).or_default();
+            tsids.insert(tsid);
+            buckets.insert((tsid, bucket));
+        }
+
+        let mut rows = Vec::with_capacity(keys.len());
+        for (metric_id, (tsids, expected)) in by_metric {
+            let start = expected
+                .iter()
+                .map(|(_, bucket)| *bucket)
+                .min()
+                .expect("a metric has at least one dirty bucket");
+            let end = expected
+                .iter()
+                .map(|(_, bucket)| *bucket + self.interval_ms)
+                .max()
+                .expect("a metric has at least one dirty bucket");
+            let mut predicates = vec![
                 col(data::METRIC_ID_COLUMN).eq(lit(ScalarValue::UInt64(Some(metric_id)))),
-                col(data::TSID_COLUMN).eq(lit(ScalarValue::UInt64(Some(tsid)))),
                 col(data::TIMESTAMP_COLUMN)
                     .gt_eq(lit(ScalarValue::Int64(Some(start))))
                     .and(col(data::TIMESTAMP_COLUMN).lt(lit(ScalarValue::Int64(Some(end))))),
             ];
+            if tsids.len() <= crate::query::IN_LIST_LIMIT {
+                let values = tsids
+                    .iter()
+                    .map(|tsid| Expr::Literal(ScalarValue::UInt64(Some(*tsid))))
+                    .collect::<Vec<_>>();
+                predicates.push(col(data::TSID_COLUMN).in_list(values, false));
+            }
+
+            let mut aggs: HashMap<(u64, i64), Rollup> = HashMap::new();
             let mut stream = self
-                .data
-                .scan(ScanRequest {
-                    range: crate::metric::full_range(),
-                    predicate: predicates,
-                    projections: None,
-                })
+                .scan_data_with_retry(predicates, "scan data table for rollup rebuild")
                 .await?;
             let schema = self.data.schema();
+            let tsid_idx = column_index(schema, data::TSID_COLUMN)?;
             let ts_idx = column_index(schema, data::TIMESTAMP_COLUMN)?;
             let value_idx = column_index(schema, data::VALUE_COLUMN)?;
-            let mut agg = Rollup {
-                count: 0,
-                sum: 0.0,
-                min: f64::INFINITY,
-                max: f64::NEG_INFINITY,
-                first_ts: 0,
-                first: 0.0,
-                last_ts: 0,
-                last: 0.0,
-            };
             while let Some(batch) = stream.next().await {
                 let batch = batch.context("scan data table for rollup rebuild")?;
+                let batch_tsids = batch
+                    .column(tsid_idx)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .context("tsid column must be UInt64Array")?;
                 let timestamps = batch
                     .column(ts_idx)
                     .as_any()
@@ -429,12 +461,23 @@ impl RollupTable {
                     .downcast_ref::<Float64Array>()
                     .context("value column must be Float64Array")?;
                 for i in 0..batch.num_rows() {
+                    let tsid = batch_tsids.value(i);
+                    let timestamp = timestamps.value(i);
+                    if !tsids.contains(&tsid) {
+                        continue;
+                    }
+                    let bucket = align_down(timestamp, self.interval_ms);
+                    if !expected.contains(&(tsid, bucket)) {
+                        continue;
+                    }
                     // The scan already deduplicated by `__seq__`, so every
                     // timestamp here is a distinct sample.
-                    agg.add_sample(timestamps.value(i), values.value(i));
+                    aggs.entry((tsid, bucket))
+                        .or_default()
+                        .add_sample(timestamp, values.value(i));
                 }
             }
-            if agg.count > 0 {
+            for ((tsid, bucket), agg) in aggs {
                 rows.push(Row {
                     metric_id,
                     tsid,
@@ -444,6 +487,43 @@ impl RollupTable {
             }
         }
         Ok(rows)
+    }
+
+    /// Scans the data table, retrying when a compaction removed a file between
+    /// the manifest lookup and the read.
+    ///
+    /// A compaction commits its new file before it deletes the old ones, so a
+    /// reader that resolved the file list just before the commit can be handed
+    /// a file that is already gone. The manifest has moved on by the time the
+    /// error surfaces, so re-resolving the plan is the fix.
+    async fn scan_data_with_retry(
+        &self,
+        predicates: Vec<Expr>,
+        what: &str,
+    ) -> Result<datafusion::execution::SendableRecordBatchStream> {
+        const MAX_ATTEMPTS: usize = 4;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self
+                .data
+                .scan(ScanRequest {
+                    range: crate::metric::full_range(),
+                    predicate: predicates.clone(),
+                    projections: None,
+                })
+                .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(e) if attempt < MAX_ATTEMPTS && is_transient_read_error(&e) => {
+                    tracing::debug!(attempt, err = ?e, "{what}: file vanished, retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("{what}: {e}").into());
+                }
+            }
+        }
     }
 
     /// Appends the rows to the rollup table.
@@ -636,6 +716,20 @@ impl RollupTable {
     }
 }
 
+/// Whether an engine error is a data file that disappeared mid-read.
+///
+/// Compaction and TTL expiry delete objects after their manifest entry is
+/// gone, so a scan that resolved the file list just before that commit opens a
+/// path that no longer exists. The manifest has moved on by the time the error
+/// surfaces, so the fix is to re-resolve and retry rather than to fail the
+/// query.
+fn is_transient_read_error(err: &common::Error) -> bool {
+    let text = err.to_string();
+    text.contains("No such file or directory")
+        || text.contains("not found")
+        || text.contains("NotFound")
+}
+
 /// Folds the buffered samples of one bucket into an aggregate.
 fn aggregate(samples: &BucketSamples) -> Rollup {
     let mut agg = Rollup {
@@ -774,9 +868,17 @@ impl RollupManager {
     }
 
     /// Publishes the buckets both tables closed before `now`.
+    ///
+    /// Does not rebuild dirty buckets; see [`RollupManager::flush_dirty`].
     pub async fn flush_closed(&self, now_ms: i64) -> Result<()> {
         self.minute.flush_closed(now_ms).await?;
         self.hour.flush_closed(now_ms).await
+    }
+
+    /// Rebuilds the buckets a late write invalidated, in both tables.
+    pub async fn flush_dirty(&self) -> Result<()> {
+        self.minute.flush_dirty().await?;
+        self.hour.flush_dirty().await
     }
 
     /// The finest resolution that divides `step_ms`, if one does.

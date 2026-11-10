@@ -168,7 +168,6 @@ impl ServerMetrics {
             avg_us: sum_us / count,
             p50_us: self.quantile(kind, 0.50, count),
             p99_us: self.quantile(kind, 0.99, count),
-            max_us: self.max_us(kind),
         })
     }
 
@@ -185,21 +184,6 @@ impl ServerMetrics {
         }
         // Above every finite bucket: report the +Inf sentinel.
         u64::MAX
-    }
-
-    /// The tightest finite bucket bound that contains the slowest observation.
-    ///
-    /// With cumulative buckets, the slowest observation is the smallest upper
-    /// bound whose count has reached the total, so scan ascending for the first
-    /// bucket that holds every observation.
-    fn max_us(&self, kind: usize) -> u64 {
-        let total = self.inner.buckets[kind][BUCKET_COUNT - 1].load(Ordering::Relaxed);
-        for (i, upper) in BUCKET_UPPER_US.iter().enumerate() {
-            if self.inner.buckets[kind][i].load(Ordering::Relaxed) >= total {
-                return *upper;
-            }
-        }
-        0
     }
 
     /// Total queries of `kind` (successful + rejected + failed).
@@ -253,38 +237,38 @@ impl ServerMetrics {
         }
         out.push_str("# HELP horae_query_series_total Series returned by queries.\n");
         out.push_str("# TYPE horae_query_series_total counter\n");
-        for kind in 0..QueryKind::COUNT {
+        for (kind, counter) in self.inner.series_returned.iter().enumerate() {
             out.push_str(&format!(
                 "horae_query_series_total{{kind=\"{}\"}} {}\n",
                 QueryKind::name(kind),
-                self.inner.series_returned[kind].load(Ordering::Relaxed)
+                counter.load(Ordering::Relaxed)
             ));
         }
         out.push_str("# HELP horae_query_samples_total Samples returned by queries.\n");
         out.push_str("# TYPE horae_query_samples_total counter\n");
-        for kind in 0..QueryKind::COUNT {
+        for (kind, counter) in self.inner.samples_returned.iter().enumerate() {
             out.push_str(&format!(
                 "horae_query_samples_total{{kind=\"{}\"}} {}\n",
                 QueryKind::name(kind),
-                self.inner.samples_returned[kind].load(Ordering::Relaxed)
+                counter.load(Ordering::Relaxed)
             ));
         }
         out.push_str("# HELP horae_query_rejected_total Requests rejected (4xx).\n");
         out.push_str("# TYPE horae_query_rejected_total counter\n");
-        for kind in 0..QueryKind::COUNT {
+        for (kind, counter) in self.inner.rejected.iter().enumerate() {
             out.push_str(&format!(
                 "horae_query_rejected_total{{kind=\"{}\"}} {}\n",
                 QueryKind::name(kind),
-                self.inner.rejected[kind].load(Ordering::Relaxed)
+                counter.load(Ordering::Relaxed)
             ));
         }
         out.push_str("# HELP horae_query_failed_total Requests that failed (5xx).\n");
         out.push_str("# TYPE horae_query_failed_total counter\n");
-        for kind in 0..QueryKind::COUNT {
+        for (kind, counter) in self.inner.failed.iter().enumerate() {
             out.push_str(&format!(
                 "horae_query_failed_total{{kind=\"{}\"}} {}\n",
                 QueryKind::name(kind),
-                self.inner.failed[kind].load(Ordering::Relaxed)
+                counter.load(Ordering::Relaxed)
             ));
         }
         out
@@ -298,8 +282,6 @@ pub struct LatencyQuantiles {
     pub avg_us: u64,
     pub p50_us: u64,
     pub p99_us: u64,
-    /// Upper bound of the highest non-empty finite bucket, or 0.
-    pub max_us: u64,
 }
 
 /// Formats a bucket bound in seconds, trimming trailing zeros.
@@ -334,10 +316,6 @@ mod tests {
         // in the <=100 ms bucket.
         assert_eq!(q.p99_us, 100_000);
         assert_eq!(q.avg_us, (90 * 1_000 + 9 * 60_000 + 2_000_000) / 100);
-
-        // The 2 s observation is above every finite bucket except the last few;
-        // max_us reports the highest finite bucket that is non-empty (<=2.5 s).
-        assert_eq!(q.max_us, 2_500_000);
     }
 
     #[test]

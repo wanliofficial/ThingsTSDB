@@ -33,6 +33,15 @@ pub struct SchedulerConfig {
     pub new_sst_max_size: ReadableSize,
     pub input_sst_max_num: usize,
     pub input_sst_min_num: usize,
+    /// How long a compacted-away file stays on the object store after its
+    /// manifest entry is removed.
+    ///
+    /// A reader resolves the file list from the manifest and only then opens
+    /// the objects, so deleting immediately would race a scan that resolved the
+    /// list just before the commit. This window covers such a reader; zero
+    /// deletes immediately (tests that count objects) and `gc_orphans` reclaims
+    /// anything that outlives it.
+    pub delete_grace: ReadableDuration,
 }
 
 impl Default for SchedulerConfig {
@@ -45,6 +54,7 @@ impl Default for SchedulerConfig {
             new_sst_max_size: ReadableSize::gb(1_u64),
             input_sst_max_num: 30,
             input_sst_min_num: 5,
+            delete_grace: ReadableDuration::secs(60),
         }
     }
 }

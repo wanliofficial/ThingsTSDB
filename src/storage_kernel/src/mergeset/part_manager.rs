@@ -499,17 +499,26 @@ impl PartManager {
             3
         };
         let out = self.alloc_part_path("part");
-        let part = {
-            let mut writer = PartWriter::new(level);
-            writer.set_seq_range(min_seq, max_seq);
-            for item in &pending {
-                writer.add(item)?;
+        let part = match self.write_flush_part(&out, &pending, min_seq, max_seq, level) {
+            Ok(part) => part,
+            Err(e) => {
+                // The rows left `pending` when the batch was taken; put them
+                // back so they stay searchable and the next flush retries.
+                self.table
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .abort_flush();
+                return Err(e);
             }
-            writer.finish(&out)?
         };
         let count = pending.len();
         let part_bytes = part.size;
         self.register_part(self.attach_cache(part));
+        // The part is searchable now, so the rows can leave the flush buffer.
+        self.table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_flush();
         self.stats.record_flush(part_bytes);
         // Persist the part list so recovery finds the flushed part. Written
         // atomically (temp + rename + dir fsync) so a crash never leaves a torn
@@ -533,6 +542,23 @@ impl PartManager {
                 .len(),
             flushed: true,
         })
+    }
+
+    /// Writes the sorted pending batch of a flush as one part file.
+    fn write_flush_part(
+        &self,
+        out: &PathBuf,
+        pending: &[Vec<u8>],
+        min_seq: u64,
+        max_seq: u64,
+        level: i32,
+    ) -> Result<Part, String> {
+        let mut writer = PartWriter::new(level);
+        writer.set_seq_range(min_seq, max_seq);
+        for item in pending {
+            writer.add(item)?;
+        }
+        writer.finish(out)
     }
 
     /// Runs one merge cycle: claims a window of file parts, merges them, and

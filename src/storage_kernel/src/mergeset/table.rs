@@ -31,6 +31,19 @@ use crate::mergeset::{
 pub struct Table {
     parts: Vec<Part>,
     pending: Vec<Vec<u8>>,
+    /// Rows a flush has taken out of `pending` but not yet published as a
+    /// part.
+    ///
+    /// Without this the flush window would be a visibility hole: the rows are
+    /// acknowledged before the flush starts, and the new part is only
+    /// searchable once it is registered, so a query landing between the two
+    /// would see neither. The flush keeps its own copy of the batch to sort and
+    /// write; the search path unions `pending` with this buffer until the part
+    /// is published.
+    flushing: Vec<Vec<u8>>,
+    /// Sequence range of the batch in `flushing`, restored when a flush aborts
+    /// so the retry's part header still covers the same WAL frames.
+    flushing_seq: (u64, u64),
     /// Highest item sequence handed out by [`Table::reserve_seq_range`].
     next_seq: u64,
     /// Union of the reserved sequence ranges of the pending buffer. `seq_min`
@@ -57,6 +70,8 @@ impl Table {
         Self {
             parts: Vec::new(),
             pending: Vec::new(),
+            flushing: Vec::new(),
+            flushing_seq: (0, 0),
             next_seq: 1,
             seq_min: 0,
             seq_max: 0,
@@ -70,6 +85,8 @@ impl Table {
         Ok(Self {
             parts,
             pending: Vec::new(),
+            flushing: Vec::new(),
+            flushing_seq: (0, 0),
             next_seq: 1,
             seq_min: 0,
             seq_max: 0,
@@ -121,7 +138,11 @@ impl Table {
             return None;
         }
         let items = std::mem::take(&mut self.pending);
+        // The caller sorts, merges and writes its copy; the search path keeps
+        // seeing the rows through `flushing` until the part is published.
+        self.flushing = items.clone();
         let (min_seq, max_seq) = (self.seq_min, self.seq_max);
+        self.flushing_seq = (min_seq, max_seq);
         self.seq_min = 0;
         self.seq_max = 0;
         Some((items, min_seq, max_seq))
@@ -143,7 +164,37 @@ impl Table {
     }
 
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.flushing.len()
+    }
+
+    /// Drops the rows of the last taken batch.
+    ///
+    /// Called once the part that holds them is registered, so the search path
+    /// never loses them.
+    pub fn finish_flush(&mut self) {
+        self.flushing.clear();
+        self.flushing_seq = (0, 0);
+    }
+
+    /// Puts the rows of a taken batch back into the pending buffer.
+    ///
+    /// Called when the flush could not publish its part, so the rows stay
+    /// visible and the next attempt picks them up again.
+    pub fn abort_flush(&mut self) {
+        if self.flushing.is_empty() {
+            return;
+        }
+        let flushing = std::mem::take(&mut self.flushing);
+        self.pending.extend(flushing);
+        let (min_seq, max_seq) = std::mem::take(&mut self.flushing_seq);
+        if min_seq > 0 {
+            self.seq_min = if self.seq_min == 0 {
+                min_seq
+            } else {
+                self.seq_min.min(min_seq)
+            };
+            self.seq_max = self.seq_max.max(max_seq);
+        }
     }
 
     pub fn add(&mut self, item: &[u8]) {
@@ -163,6 +214,8 @@ impl Table {
     /// Ensures the pending buffer is empty (drops any items).
     pub fn clear_pending(&mut self) {
         self.pending.clear();
+        self.flushing.clear();
+        self.flushing_seq = (0, 0);
         self.seq_min = 0;
         self.seq_max = 0;
     }
@@ -174,7 +227,9 @@ impl Table {
         let Some((pending, min_seq, max_seq)) = self.take_pending_with_seq() else {
             return Ok(());
         };
-        self.flush_sorted(path, &pending, min_seq, max_seq, compress_level)
+        self.flush_sorted(path, &pending, min_seq, max_seq, compress_level)?;
+        self.finish_flush();
+        Ok(())
     }
 
     /// Writes an already-taken set of items as a part with a known sequence
@@ -244,10 +299,15 @@ impl Table {
 
     /// Merges the matching pending items into a sorted, deduplicated item list.
     fn merge_pending(&self, dst: &mut Vec<Vec<u8>>, keep: impl Fn(&[u8]) -> bool) {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.flushing.is_empty() {
             return;
         }
-        let mut pending: Vec<&Vec<u8>> = self.pending.iter().filter(|it| keep(it)).collect();
+        let mut pending: Vec<&Vec<u8>> = self
+            .pending
+            .iter()
+            .chain(self.flushing.iter())
+            .filter(|it| keep(it))
+            .collect();
         if pending.is_empty() {
             return;
         }
@@ -485,6 +545,55 @@ mod tests {
         table.add(b"metric000\x02series1");
         table.flush(dir.join("part-cb"), 1).unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A flush takes the pending rows out before their part exists. Those rows
+    /// are already acknowledged, so the search path must keep seeing them for
+    /// the whole window; otherwise a query that lands mid-flush misses data
+    /// that a query before and after it finds.
+    #[test]
+    fn test_taken_batch_stays_searchable_until_its_part_is_published() {
+        let mut table = Table::new();
+        table.add(b"metric000\x02series1");
+        table.add(b"metric000\x02series2");
+
+        // The flush takes the batch but has not published a part yet.
+        let (items, _, _) = table.take_pending_with_seq().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            table.search_prefix(b"metric000").unwrap().len(),
+            2,
+            "the taken rows must stay searchable while the part is written"
+        );
+        // Rows written during the flush are visible too.
+        table.add(b"metric000\x02series3");
+        assert_eq!(table.search_prefix(b"metric000").unwrap().len(), 3);
+
+        // Publishing the part drops the batch; the written rows remain.
+        table.finish_flush();
+        assert_eq!(table.pending_len(), 1);
+        assert_eq!(table.search_prefix(b"metric000").unwrap().len(), 1);
+    }
+
+    /// A failed flush must not swallow the rows it took.
+    #[test]
+    fn test_aborted_batch_returns_to_pending() {
+        let mut table = Table::new();
+        let (min_seq, max_seq) = table.reserve_seq_range(1);
+        table.add_items_with_seq_range([b"metric000\x02series1".to_vec()], min_seq, max_seq);
+        let (items, taken_min, taken_max) = table.take_pending_with_seq().unwrap();
+        assert_eq!((taken_min, taken_max), (min_seq, max_seq));
+        assert_eq!(table.pending_len(), 1, "still visible while flushing");
+
+        table.abort_flush();
+        assert_eq!(table.pending_len(), 1);
+        let (again, again_min, again_max) = table.take_pending_with_seq().unwrap();
+        assert_eq!(again, items);
+        assert_eq!(
+            (again_min, again_max),
+            (min_seq, max_seq),
+            "the retry must still cover the same WAL frames"
+        );
     }
 
     #[test]

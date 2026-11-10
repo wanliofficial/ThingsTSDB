@@ -28,7 +28,7 @@
 //! range, not to the total data volume.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 

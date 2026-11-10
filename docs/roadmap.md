@@ -230,7 +230,6 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   切成「前导部分桶 raw + 已发布表 + 尾部 raw」，避免历史桶里的区间外样本污染结果。
   三种集成测试以 raw `downsample` 为基准逐点比对：6 种聚合 × 3 种 step（含 1h 重聚合）
   × 3 种区间（含非对齐起点）、乱序/迟到写入与 dirty 重建、90 s 回退与重启后仍一致。
-  剩余 Phase 3 验收项：仪表盘 p99 < 50 ms。
 - 已完成（2026-11-11）：黄金查询集进 CI。`src/metric_engine/tests/golden_query_set.rs`
   固定部署（3 个 metric、8 个序列、一天确定性样本）加载后回答 19 条查询：4 种匹配器
   形状（`=`/`!=`/`=~`/`!~`）、仅 metric、双标签、limit 截断、亚分钟窗口、非对齐起点、
@@ -304,9 +303,46 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   不变量：数据文件 PUT 失败时 flush 的磁盘满错误传播到调用方、manifest 从不引用
   未提交文件（读要么报错要么看到空表）、缓冲帧被 `reinsert` 回 WAL 待重试；
   全部 PUT 失败时写入/刷盘报错而表保持一致；时钟回拨一小时或超前不丢行不 panic。
+- 已完成（2026-11-11）：压实后延迟删除，修掉读-压实竞态。TSBS IoT 基准暴露一个真实
+  bug：压实先在 manifest 提交新文件、随即删除旧文件，而已经按旧 manifest 解析出文件
+  列表的读（这里是 rollup 的 dirty 桶重建扫描）打开这些对象时得到 `NotFound`，整个
+  查询失败。现在 `SchedulerConfig::delete_grace`（默认 60 s，0 = 立即删除）控制删除
+  延迟，`do_compaction` 提交后 `spawn` 一个延迟任务再删对象；`gc_orphans` 仍兜底回收
+  任何残留。回归测试 `test_do_compaction_keeps_inputs_readable_before_the_grace_period`
+  断言：压实提交后 manifest 只剩输出、按新 manifest 扫描能读回全部行、输入对象在宽限
+  期内仍存在，并直接调用同一个 `delete_paths` 证明它们确实可回收。
+  rollup 侧另加 `scan_data_with_retry`：重建 dirty 桶时若仍撞上已消失的文件，重解析
+  manifest 后重试（最多 4 次，20 ms 间隔），把已发生的竞态从「查询失败」降级为
+  「一次重试」。另把 `rebuild_dirty` 从「每个 dirty 桶一次扫描」改为「每个 metric 一次
+  扫描」：一次全网迟到写入会标记上千个桶，逐桶扫描会把同一批文件读上千遍。
+- 已完成（2026-11-11）：修掉 mergeset 刷盘的读可见性空洞。全量测试跑出
+  `indexdb` 偶发「搜索返回空集」，根因不是测试抖动：`PartManager::flush_once` 先用
+  `take_pending_with_seq` 把待刷条目从 `Table::pending` 取走，再排序、写 part、
+  注册到 `Table.parts`，这中间读路径既看不到 pending 也看不到新 part —— 已 ack 的
+  写入会短暂消失，一次 `indexdb` 搜索因此可能少返回系列。现在被取走的批次保存在
+  `Table::flushing`（连同其 `flushing_seq`），`search_prefix`/`search_range` 把
+  `pending` 与 `flushing` 并起来读；part 注册后 `finish_flush` 才清空，写 part 失败
+  则 `abort_flush` 把条目（及其序列区间，保证重试的 part 头仍覆盖同一批 WAL 帧）放回
+  pending。回归测试 `test_taken_batch_stays_searchable_until_its_part_is_published`
+  在去掉 `flushing` 合并后立刻失败（读到 0 条），`test_aborted_batch_returns_to_pending`
+  覆盖失败回滚。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层。
 - 分片/副本与再平衡。
-- TSBS IoT 场景基准。
+- 已完成（2026-11-11）：TSBS IoT 场景基准。`benchmarks --bin tsbs_iot_bench`
+  按 TSBS「IoT」用例的形态造数：N 台设备各带 `host`/`region` 标签，每台每 tick
+  上报 8 个 reading（`temperature`、`humidity`、`pressure`、`wind_speed` 等），
+  5% 的 tick 按「设备掉线后补传」
+  重排（先发新样本、再发窗口内较旧的样本），这正是 out-of-order 写路径 + rollup
+  dirty 重建要处理的形态。默认参数 500 设备 × 8 reading × 60 min = 1.44 M 样本、
+  4000 个序列，实测（14 GiB / 8 核开发机，release）：
+  - 写入吞吐 109,751 samples/s（1.44 M 样本 13.1 s，末尾 flush 2.0 s）；
+  - `range` 查询按 `region` 过滤（125 序列）：p50 29.7 ms / p99 35.2 ms；
+    单设备（1 序列）：p50 12.4 ms / p99 14.8 ms；宽 `service` 面板（63 序列）：
+    p50 28.5 ms / p99 32.4 ms；
+  - `latest` 全车队（500 序列）：p99 1.9 ms；
+  - 降采样：1m（3780 点）p99 71.6 ms，1h（63 点）p99 5.5 ms。
+  基准先跑出来的第一个结果不是延迟而是 panic：压实删掉了 rollup 重建正在读的文件，
+  即上面「压实后延迟删除」那条的起因。
 
 ## 七、兼容与迁移
 

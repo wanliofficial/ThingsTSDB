@@ -79,6 +79,7 @@ impl Scheduler {
                 trigger_tx.clone(),
                 format,
                 metrics,
+                config.delete_grace.0,
             );
 
             runtime.spawn(async move {
