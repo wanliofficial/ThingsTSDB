@@ -135,6 +135,35 @@ impl IndexDbManager {
         })
     }
 
+    /// The range the index is queried with: at least one day, and an open lower
+    /// bound (`<= 0`) mapped to the first day of the oldest on-disk partition.
+    ///
+    /// The per-day pruning intersects with the union of every day in the range,
+    /// so a range that starts at the epoch drags the first day's set into every
+    /// query. Day 0 holds no samples, and the per-day rows only exist under
+    /// partitions that were actually written.
+    fn query_bounds(&self, start_ms: i64, end_ms: i64) -> (i64, i64) {
+        const DAY_MS: i64 = 86_400_000;
+        let start = if start_ms > 0 {
+            start_ms
+        } else {
+            let first_month = *self
+                .months
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .next()
+                .unwrap_or(&0);
+            timeutil::month_first_day(first_month) as i64 * DAY_MS
+        };
+        let end = if end_ms > start {
+            end_ms
+        } else {
+            start + DAY_MS
+        };
+        (start, end)
+    }
+
     /// Reads the `{YYYY_MM}` partition directories under `root`.
     fn scan_months(root: &Path) -> BTreeSet<u16> {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -319,11 +348,10 @@ impl IndexDbManager {
         let started = std::time::Instant::now();
         // A range must contain at least one day for the per-day pruning to
         // work; an empty range still resolves the group postings.
-        let end_ms = if end_ms > start_ms {
-            end_ms
-        } else {
-            start_ms + 1
-        };
+        // Day granularity: without a lower bound the range must not start at
+        // the epoch, or the first day's set (often the whole series space for
+        // a dense metric) is scanned and unioned into every query.
+        let (start_ms, end_ms) = self.query_bounds(start_ms, end_ms);
         let first_month = timeutil::month_of_millis(start_ms);
         let last_month = timeutil::month_of_millis(end_ms - 1);
         let mut plan_matchers = Vec::with_capacity(matchers.len() + 1);
@@ -376,11 +404,7 @@ impl IndexDbManager {
     /// matcher list. `DualRead` uses it to decide whether the legacy inverted
     /// index can be skipped for a metric during migration.
     pub fn group_series_ids(&self, group: &[u8], start_ms: i64, end_ms: i64) -> Result<Vec<u64>> {
-        let end_ms = if end_ms > start_ms {
-            end_ms
-        } else {
-            start_ms + 1
-        };
+        let (start_ms, end_ms) = self.query_bounds(start_ms, end_ms);
         let first_month = timeutil::month_of_millis(start_ms);
         let last_month = timeutil::month_of_millis(end_ms - 1);
         let plan = QueryPlan::from_matchers(&[TagMatcher::Equal {

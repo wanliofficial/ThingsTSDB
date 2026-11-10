@@ -31,10 +31,10 @@ use std::{collections::HashMap, sync::Mutex};
 
 use crate::types::Sample;
 
-/// Entries kept by default. One entry is 16 B, so the default cap is ~16 MiB;
-/// a 10M-series deployment can raise it to ~160 MiB (the design note estimates
-/// ~1 GB at 10M with label copies, which this cache does not hold).
-pub const DEFAULT_LAST_CACHE_ENTRIES: usize = 1_000_000;
+/// Entries kept by default (16 B each, ~16 MiB for the map's table). It is
+/// sized for the metric a dashboard is watching: a 10M-series deployment is
+/// expected to raise it, and the write path is bounded by it either way.
+pub const DEFAULT_LAST_CACHE_ENTRIES: usize = 100_000;
 
 /// The newest sample of one series.
 #[derive(Debug, Clone, Copy, PartialEq)]

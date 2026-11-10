@@ -202,6 +202,7 @@ async fn run_read_query(
         // a half-open range.
         start_ms: query.start_timestamp_ms,
         end_ms: query.end_timestamp_ms + 1,
+        limit: 0,
     };
     let series = engine.search(&request).await?;
     let timeseries = series
@@ -389,11 +390,16 @@ fn parse_search_request(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     Ok(SearchRequest {
         metric_name: metric.as_bytes().to_vec(),
         matchers,
         start_ms: start,
         end_ms: end,
+        limit,
     })
 }
 

@@ -201,13 +201,26 @@ fn main() {
     // Cold cost: drop the cache, then time one query per shape. This is the
     // first query after a write, i.e. the price of materializing the sets.
     for (label, plan) in &shapes {
+        // Resolve the pieces separately: reading the day set (narrowed by the
+        // metric group, like a real query) and then the whole filter tree.
+        cache.invalidate();
+        let started = Instant::now();
+        let group = QueryPlan::from_matchers(&[TagMatcher::Equal {
+            key: b"__name__".to_vec(),
+            value: b"m".to_vec(),
+        }]);
+        let day_set = db.search_series_ids_arc(&group, &[day]);
+        let day_micros = started.elapsed().as_micros();
         cache.invalidate();
         let started = Instant::now();
         let ids = db.search_series_ids_arc(plan, &[day]).expect("search");
+        let total_micros = started.elapsed().as_micros();
+        drop(day_set);
         println!(
-            "cold  {label:16} {:>7} us  matched={}",
-            started.elapsed().as_micros(),
-            ids.len()
+            "cold  {label:16} {:>7} us  matched={:<9} day_set={} us",
+            total_micros,
+            ids.len(),
+            day_micros
         );
     }
 

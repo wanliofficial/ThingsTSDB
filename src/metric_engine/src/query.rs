@@ -78,6 +78,13 @@ pub struct SearchRequest {
     /// Milliseconds, samples in `[start_ms, end_ms)` are returned.
     pub start_ms: i64,
     pub end_ms: i64,
+    /// Maximum number of series to materialize, `0` for no limit.
+    ///
+    /// The series are resolved and matched first (that is index work), then
+    /// only this many are scanned and returned. A dashboard panel renders a
+    /// bounded number of series, and scanning samples for the other 100k
+    /// matched series is most of a wide query's cost.
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,8 +122,14 @@ pub enum Aggregation {
 }
 
 /// Above this series count, tsids are filtered in the engine instead of being
-/// pushed down as an IN list, to keep the predicate size reasonable.
-const IN_LIST_LIMIT: usize = 10_000;
+/// pushed down as an IN list.
+///
+/// The predicate is planned once and then evaluated per row, so a large list
+/// costs far more than the row-wise hash lookup it replaces: at 200k series a
+/// two-tag filter that matched 154k series took 1.4 s with the pushdown and
+/// 44 ms without it. Small candidate sets still benefit, because the scan can
+/// then skip rows of other series and the filter is cheap to evaluate.
+const IN_LIST_LIMIT: usize = 1_000;
 
 impl MetricEngine {
     pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SeriesSamples>> {
@@ -124,7 +137,10 @@ impl MetricEngine {
         // Step 1: resolve matchers to series id -> labels.
         let series = self.resolve_series(req).await?;
 
-        // Step 2: scan data.
+        // Step 2: scan data. A `limit` narrows the candidate set to a stable
+        // subset (sorted by series id) so the same query returns the same
+        // series instead of whichever rows the scan happens to reach first.
+        let series = self.limit_series(series, req.limit);
         let candidates: HashSet<u64> = series.keys().copied().collect();
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -160,6 +176,29 @@ impl MetricEngine {
     /// The new index is authoritative once fully migrated; the legacy tables
     /// are still read in `DualRead` so data written before the switch stays
     /// visible.
+    /// Narrows `series` to a stable subset of at most `limit` entries.
+    ///
+    /// Applied before the data scan so a bounded query does not read samples
+    /// for series it will not return; ids are sorted so repeated queries return
+    /// the same series.
+    fn limit_series(
+        &self,
+        series: HashMap<u64, (Vec<u8>, Vec<Label>)>,
+        limit: usize,
+    ) -> HashMap<u64, (Vec<u8>, Vec<Label>)> {
+        if limit == 0 || series.len() <= limit {
+            return series;
+        }
+        let mut ids: Vec<u64> = series.keys().copied().collect();
+        ids.sort_unstable();
+        ids.truncate(limit);
+        let keep: HashSet<u64> = ids.into_iter().collect();
+        series
+            .into_iter()
+            .filter(|(id, _)| keep.contains(id))
+            .collect()
+    }
+
     async fn resolve_series(
         &self,
         req: &SearchRequest,
@@ -224,7 +263,7 @@ impl MetricEngine {
     /// after restart) is resolved with a range scan and promoted back into the
     /// cache.
     pub async fn last_values(&self, req: &SearchRequest) -> Result<Vec<SeriesLatest>> {
-        let series = self.resolve_series(req).await?;
+        let series = self.limit_series(self.resolve_series(req).await?, req.limit);
         if series.is_empty() {
             return Ok(Vec::new());
         }
@@ -423,6 +462,19 @@ impl MetricEngine {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<HashMap<u64, Vec<SamplePoint>>> {
+        self.scan_samples_limited(metric_id, candidates, start_ms, end_ms, 0)
+            .await
+    }
+
+    /// Like [`MetricEngine::scan_samples`] but returns at most `limit` series.
+    async fn scan_samples_limited(
+        &self,
+        metric_id: u64,
+        candidates: &HashSet<u64>,
+        start_ms: i64,
+        end_ms: i64,
+        limit: usize,
+    ) -> Result<HashMap<u64, Vec<SamplePoint>>> {
         let storage = self.data.storage();
         let mut predicates = vec![
             col(data::METRIC_ID_COLUMN).eq(lit(ScalarValue::UInt64(Some(metric_id)))),
@@ -430,7 +482,11 @@ impl MetricEngine {
                 .gt_eq(lit(ScalarValue::Int64(Some(start_ms))))
                 .and(col(data::TIMESTAMP_COLUMN).lt(lit(ScalarValue::Int64(Some(end_ms))))),
         ];
-        if candidates.len() <= IN_LIST_LIMIT {
+        // Push a candidate set down as an IN list only when it is small
+        // enough to pay for; above that the scan stays wide and the batches
+        // are filtered here. (`limit` narrows `candidates` before the scan.)
+        let pushdown = !candidates.is_empty() && candidates.len() <= IN_LIST_LIMIT;
+        if pushdown {
             let values = candidates
                 .iter()
                 .map(|tsid| Expr::Literal(ScalarValue::UInt64(Some(*tsid))))
@@ -473,7 +529,10 @@ impl MetricEngine {
             for i in 0..batch.num_rows() {
                 let tsid = tsids.value(i);
                 // When the in-list pushdown was skipped, filter here.
-                if candidates.len() > IN_LIST_LIMIT && !candidates.contains(&tsid) {
+                if !pushdown && !candidates.contains(&tsid) {
+                    continue;
+                }
+                if limit > 0 && !result.contains_key(&tsid) && result.len() >= limit {
                     continue;
                 }
                 result
@@ -566,18 +625,19 @@ impl LegacyMatcher {
     /// Prometheus semantics: a negative matcher also matches series that do
     /// not carry the label at all.
     fn matches(&self, labels: &[Label]) -> bool {
-        let name = match self {
-            LegacyMatcher::Eq(name, _)
-            | LegacyMatcher::Neq(name, _)
-            | LegacyMatcher::Re(name, _)
-            | LegacyMatcher::Nre(name, _) => name,
-        };
-        let value = labels.iter().find(|l| &l.name == name).map(|l| &l.value);
         match self {
-            LegacyMatcher::Eq(_, want) => value.is_some_and(|v| v == want),
-            LegacyMatcher::Neq(_, want) => !value.is_some_and(|v| v == want),
-            LegacyMatcher::Re(_, re) => value.is_some_and(|v| re.is_match(v)),
-            LegacyMatcher::Nre(_, re) => !value.is_some_and(|v| re.is_match(v)),
+            LegacyMatcher::Eq(name, want) => {
+                labels.iter().any(|l| &l.name == name && &l.value == want)
+            }
+            LegacyMatcher::Neq(name, want) => {
+                !labels.iter().any(|l| &l.name == name && &l.value == want)
+            }
+            LegacyMatcher::Re(name, re) => labels
+                .iter()
+                .any(|l| &l.name == name && re.is_match(&l.value)),
+            LegacyMatcher::Nre(name, re) => !labels
+                .iter()
+                .any(|l| &l.name == name && re.is_match(&l.value)),
         }
     }
 }
@@ -713,6 +773,7 @@ mod tests {
             matchers,
             start_ms: start,
             end_ms: end,
+            limit: 0,
         }
     }
 
@@ -940,6 +1001,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("step_ms"));
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn test_search_limit_bounds_scanned_series() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let engine = open_engine_with_mode(&root, IndexMode::DualRead).await;
+        prepare_data(&engine).await;
+
+        // m1 has two series (A with 3 samples and a 404/job=api one); a limit
+        // of 1 returns exactly one of them, deterministically.
+        let mut req = search_req("m1", vec![], 0, 100);
+        req.limit = 1;
+        let first = engine.search(&req).await.unwrap();
+        assert_eq!(first.len(), 1);
+        let again = engine.search(&req).await.unwrap();
+        assert_eq!(render(&first), render(&again), "limited results are stable");
+
+        // The limit is applied after matching, so a filter still wins.
+        let mut filtered = search_req("m1", vec![matcher("code", "200", MatcherType::Eq)], 0, 100);
+        filtered.limit = 5;
+        let hits = engine.search(&filtered).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].samples.len(), 3);
+
+        // Zero means no limit.
+        let all = engine
+            .search(&search_req("m1", vec![], 0, 100))
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Last values and downsampled reads honour the limit too.
+        let mut last = search_req("m1", vec![], 0, 100);
+        last.limit = 1;
+        assert_eq!(engine.last_values(&last).await.unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .search_downsampled(&last, 20, Aggregation::Avg)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]

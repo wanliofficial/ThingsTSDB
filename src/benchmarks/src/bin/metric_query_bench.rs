@@ -39,7 +39,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let series: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(200_000);
     let queries: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(200);
-    let per_shape = (queries / 5).max(1);
+    let per_shape = (queries / 6).max(1);
 
     let root = std::env::temp_dir().join(format!(
         "metric-query-bench-{}-{}",
@@ -63,6 +63,9 @@ fn main() {
         ))
         .expect("open metric engine");
 
+    // Samples are second-aligned: `window = ts / 1000 * 1000` is evaluated in
+    // integer milliseconds, so a non-aligned `ts` would truncate to the start
+    // of its second but the window only covers `[window, window + 1000)`.
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -86,22 +89,28 @@ fn main() {
         name: name.to_vec(),
         value: value.to_vec(),
     };
-    let shapes: Vec<(&str, Vec<LabelMatcher>)> = vec![
-        ("name only", vec![]),
-        ("eq job", vec![eq(b"job", b"api")]),
-        ("eq job+code", vec![eq(b"job", b"api"), eq(b"code", b"200")]),
-        ("eq instance", vec![eq(b"instance", b"host-12345")]),
-        ("re instance", vec![re(b"instance", b"host-123.*")]),
+    let shapes: Vec<(&str, Vec<LabelMatcher>, usize)> = vec![
+        ("name only", vec![], 0),
+        ("eq job", vec![eq(b"job", b"api")], 0),
+        ("eq job limit=1000", vec![eq(b"job", b"api")], 1_000),
+        (
+            "eq job+code",
+            vec![eq(b"job", b"api"), eq(b"code", b"200")],
+            0,
+        ),
+        ("eq instance", vec![eq(b"instance", b"host-12345")], 0),
+        ("re instance", vec![re(b"instance", b"host-123.*")], 0),
     ];
 
     // One-second window around the sample timestamp.
-    let window = ts / 1_000 * 1_000;
-    for (label, matchers) in &shapes {
+    let window = ts;
+    for (label, matchers, limit) in &shapes {
         let req = SearchRequest {
             metric_name: b"http_requests".to_vec(),
             matchers: matchers.clone(),
             start_ms: window,
-            end_ms: window + 1_000,
+            end_ms: window + 5_000,
+            limit: *limit,
         };
         let mut latencies = Vec::with_capacity(per_shape);
         let mut matched = 0usize;
@@ -117,7 +126,7 @@ fn main() {
             |q: f64| latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)];
         let index_micros = engine.index_stats().map_or(0, |s| s.index_micros()) - index_before;
         println!(
-            "query {label:14} p50={:>7} us  p99={:>7} us  max={:>7} us  avg_matched={:<8} index_avg={} us",
+            "query {label:18} p50={:>7} us  p99={:>7} us  max={:>7} us  avg_matched={:<8} index_avg={} us",
             p(0.50),
             p(0.99),
             latencies[latencies.len() - 1],
@@ -133,6 +142,7 @@ fn main() {
         matchers: vec![eq(b"instance", b"host-12345")],
         start_ms: 0,
         end_ms: ts + 1,
+        limit: 0,
     };
     let mut latencies = Vec::with_capacity(per_shape);
     let mut matched = 0usize;
