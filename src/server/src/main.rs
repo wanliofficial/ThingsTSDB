@@ -1252,5 +1252,96 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        // MetricsQL: `aggr_over_time` aggregates over the window. The two
+        // series are offset by 10 (`api` 0,1,2,3 and `db` 10,11,12,13 over
+        // 10 s steps), so their means are 1.5 and 11.5.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "aggr_over_time(avg, http_requests[60s])"),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2);
+        for series in result {
+            let expected = match series["metric"]["job"].as_str().unwrap() {
+                "api" => 1.5,
+                "db" => 11.5,
+                other => panic!("unexpected job {other}"),
+            };
+            let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
+            assert!((value - expected).abs() < 1e-9, "got {value}");
+        }
+
+        // `predict_linear` extrapolates the same straight lines by one hour.
+        // With four samples 10 s apart the fit is exact: the mean sits 15 s
+        // before the last sample, so the prediction is `mean + 0.1 * (3600 +
+        // 15)` — 363 for `api` and 373 for `db`.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "predict_linear(http_requests[60s], 3600)"),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2);
+        for series in result {
+            let expected = match series["metric"]["job"].as_str().unwrap() {
+                "api" => 363.0,
+                "db" => 373.0,
+                other => panic!("unexpected job {other}"),
+            };
+            let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
+            assert!((value - expected).abs() < 1e-9, "got {value}");
+        }
+
+        // `default` fills an empty result with one label-less sample.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[("query", "default(nonexistent_metric, 7)"), ("time", &time)])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["metric"], serde_json::json!({}));
+        let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert!((value - 7.0).abs() < 1e-9);
+
+        // `absent_over_time` reports a single 1 when nothing is in range.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[("query", "absent_over_time(nope[60s])"), ("time", &time)])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["metric"], serde_json::json!({}));
+        let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert!((value - 1.0).abs() < 1e-9);
     }
 }

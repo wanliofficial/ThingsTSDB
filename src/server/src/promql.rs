@@ -24,12 +24,22 @@
 //! * range functions — `rate`, `irate`, `increase`, `delta`, `idelta`,
 //!   `changes`, `resets`, `*_over_time`;
 //! * instant functions — math (`abs`, `ceil`, `clamp_min`, ...), `timestamp`,
-//!   `sort`, `sort_desc`, `absent`, and the generators `time`, `pi`, `vector`;
+//!   `sort`, `sort_desc`, `absent`, and the generators `time`, `pi`, `vector`,
+//!   plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
 //!   scalars or a vector and a scalar, exact-label matching between two
-//!   vectors, and the set operators `and` / `or` / `unless`.
+//!   vectors, and the set operators `and` / `or` / `unless`;
+//! * a MetricsQL subset on top of PromQL — `aggr_over_time(<agg>, v[range])`,
+//!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`, and
+//!   `predict_linear(v[range], t)`.
+//!
+//! MetricsQL is what VictoriaMetrics' Grafana datasource sends, so these are
+//! accepted alongside PromQL; they reuse the same evaluator and are refused
+//! with the same care (see below). The `rollup_*` family is intentionally
+//! absent: it is a VictoriaMetrics-only interface that assumes its own rollup
+//! tables, and this server's rollup path is still raw-sample based.
 //!
 //! Deliberately **not** implemented: subqueries `[...:...]`, `on(...)` /
 //! `ignoring(...)` / `group_left` / `group_right`, and the string functions
@@ -479,6 +489,7 @@ impl AggOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The instant functions.
 pub enum RangeFunc {
     Rate,
     Irate,
@@ -496,6 +507,15 @@ pub enum RangeFunc {
     StddevOverTime,
     StdvarOverTime,
     QuantileOverTime,
+    /// `absent_over_time(v[range])`.
+    AbsentOverTime,
+    /// `aggr_over_time(<agg>, v[range])`.
+    AggrOverTime(AggOp),
+    /// `tmin_over_time` / `tmax_over_time`.
+    TMinOverTime,
+    TMaxOverTime,
+    /// `predict_linear(v[range], t)`.
+    PredictLinear,
 }
 
 impl RangeFunc {
@@ -517,12 +537,17 @@ impl RangeFunc {
             "stddev_over_time" => RangeFunc::StddevOverTime,
             "stdvar_over_time" => RangeFunc::StdvarOverTime,
             "quantile_over_time" => RangeFunc::QuantileOverTime,
+            "absent_over_time" => RangeFunc::AbsentOverTime,
+            "tmin_over_time" => RangeFunc::TMinOverTime,
+            "tmax_over_time" => RangeFunc::TMaxOverTime,
+            // `predict_linear` takes its range vector first, so it is
+            // dispatched by name in `call` rather than through `parse`.
             _ => return None,
         })
     }
 
     fn takes_param(self) -> bool {
-        matches!(self, RangeFunc::QuantileOverTime)
+        matches!(self, RangeFunc::QuantileOverTime | RangeFunc::PredictLinear)
     }
 }
 
@@ -540,6 +565,8 @@ pub enum MathFunc {
     Round,
     ClampMin,
     ClampMax,
+    /// `default(v, x)`.
+    Default,
     Timestamp,
 }
 
@@ -558,6 +585,8 @@ impl MathFunc {
             "round" => MathFunc::Round,
             "clamp_min" => MathFunc::ClampMin,
             "clamp_max" => MathFunc::ClampMax,
+            // MetricsQL: `default(v, x)` fills an empty result with `x`.
+            "default" => MathFunc::Default,
             "timestamp" => MathFunc::Timestamp,
             _ => return None,
         })
@@ -1136,6 +1165,62 @@ impl Parser {
                     "`{name}` is not supported: this endpoint does not rewrite labels"
                 ))
             }
+            // `aggr_over_time(avg, v[range])` names an aggregation where the
+            // other range functions take a vector, so it is dispatched first.
+            "aggr_over_time" => {
+                self.expect(Token::LParen)?;
+                let op = match self.next() {
+                    Some(Token::Ident(word)) => AggOp::parse(&word).ok_or_else(|| {
+                        Error::Bad(format!(
+                            "`{word}` is not an aggregation; aggr_over_time accepts sum, \
+                             avg, min, max, count, stddev, stdvar"
+                        ))
+                    })?,
+                    Some(Token::Str(word)) => AggOp::parse(&word).ok_or_else(|| {
+                        Error::Bad(format!(
+                            "`{word}` is not an aggregation; aggr_over_time accepts sum, \
+                             avg, min, max, count, stddev, stdvar"
+                        ))
+                    })?,
+                    other => {
+                        return bad(format!(
+                            "expected an aggregation name but found {}",
+                            describe(other)
+                        ))
+                    }
+                };
+                if op.takes_param() {
+                    return bad(format!(
+                        "`{}` needs no parameter inside aggr_over_time",
+                        op.name()
+                    ));
+                }
+                self.expect(Token::Comma)?;
+                let (inner, range_ms) = self.range_argument("aggr_over_time")?;
+                self.expect(Token::RParen)?;
+                return Ok(Expr::RangeFunc {
+                    func: RangeFunc::AggrOverTime(op),
+                    expr: Box::new(inner),
+                    range_ms,
+                    param: None,
+                });
+            }
+            // `predict_linear(v[range], t)` puts the range vector first and the
+            // horizon after it, the reverse of the other parameterised range
+            // functions, so it is dispatched separately too.
+            "predict_linear" => {
+                self.expect(Token::LParen)?;
+                let (inner, range_ms) = self.range_argument(name)?;
+                self.expect(Token::Comma)?;
+                let param = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                return Ok(Expr::RangeFunc {
+                    func: RangeFunc::PredictLinear,
+                    expr: Box::new(inner),
+                    range_ms,
+                    param: Some(Box::new(param)),
+                });
+            }
             _ => {}
         }
         self.expect(Token::LParen)?;
@@ -1188,7 +1273,7 @@ impl Parser {
         }
         if let Some(func) = MathFunc::parse(name) {
             match func {
-                MathFunc::ClampMin | MathFunc::ClampMax => {
+                MathFunc::ClampMin | MathFunc::ClampMax | MathFunc::Default => {
                     let expr = self.expression(0)?;
                     self.expect(Token::Comma)?;
                     let param = self.expression(0)?;
@@ -1925,7 +2010,30 @@ impl<'a> Evaluator<'a> {
         if func == RangeFunc::QuantileOverTime && param.is_none() {
             return bad("quantile_over_time needs a quantile parameter");
         }
+        if let RangeFunc::AggrOverTime(op) = func {
+            if matches!(op, AggOp::Topk | AggOp::Bottomk | AggOp::Group) {
+                return bad(format!(
+                    "`{}` is not an aggregation over_time accepts",
+                    op.name()
+                ));
+            }
+        }
+        if func == RangeFunc::PredictLinear && param.is_none() {
+            return bad("predict_linear needs a horizon in seconds");
+        }
         let mut vector = Vector::default();
+        // `absent_over_time` is the one range function whose answer is "1" when
+        // nothing matched: Prometheus returns a single label-less 1 for a
+        // selector with no samples in the range, and nothing otherwise.
+        if func == RangeFunc::AbsentOverTime {
+            if matrix.0.is_empty() {
+                vector.push(BTreeMap::new(), 1.0);
+            }
+            return Ok(Instant {
+                vector,
+                scalar: None,
+            });
+        }
         for series in &matrix.0 {
             if let Some(value) = apply_range_func(func, &series.samples, range_ms, param) {
                 let mut labels = series.labels.clone();
@@ -1952,6 +2060,36 @@ impl<'a> Evaluator<'a> {
             None => None,
         };
         match func {
+            MathFunc::Default => {
+                let Some(fallback) = param else {
+                    return bad("default needs a fallback value");
+                };
+                let mut vector = Vector::default();
+                if let Some(scalar) = instant.scalar {
+                    vector.push(BTreeMap::new(), scalar);
+                } else {
+                    for point in &instant.vector.0 {
+                        // Prometheus treats NaN as missing here too, so an
+                        // absent or NaN sample is replaced by the fallback.
+                        let value = if point.value.is_nan() {
+                            fallback
+                        } else {
+                            point.value
+                        };
+                        vector.push(point.labels.clone(), value);
+                    }
+                }
+                // An empty result (the common case) gets one fallback sample,
+                // with no labels, so `or vector(...)`-style defaults are not
+                // needed.
+                if vector.is_empty() {
+                    vector.push(BTreeMap::new(), fallback);
+                }
+                return Ok(Instant {
+                    vector,
+                    scalar: None,
+                });
+            }
             MathFunc::ClampMin | MathFunc::ClampMax => {
                 let Some(bound) = param else {
                     return bad("clamp_min/clamp_max need a bound");
@@ -2194,7 +2332,50 @@ fn apply_range_func(
             values.sort_by(|a, b| a.total_cmp(b));
             Some(quantile_of(&values, quantile))
         }
+        // `absent_over_time` is answered by `range_func` from the matrix being
+        // empty or not, so it never needs a per-series value.
+        RangeFunc::AbsentOverTime => None,
+        // MetricsQL: aggregate over time with a named aggregation.
+        RangeFunc::AggrOverTime(op) => Some(aggregate_values(op, &values(samples))),
+        // The timestamp of the extreme sample, in seconds (Prometheus reports
+        // `timestamp()`-shaped numbers, not samples).
+        RangeFunc::TMinOverTime => samples
+            .iter()
+            .min_by(|a, b| a.value.total_cmp(&b.value))
+            .map(|s| s.timestamp as f64 / 1_000.0),
+        RangeFunc::TMaxOverTime => samples
+            .iter()
+            .max_by(|a, b| a.value.total_cmp(&b.value))
+            .map(|s| s.timestamp as f64 / 1_000.0),
+        // Linear extrapolation over the range, evaluated `horizon` seconds past
+        // the last sample (least squares, as Prometheus does).
+        RangeFunc::PredictLinear => {
+            let horizon = param?;
+            let n = samples.len() as f64;
+            let t_mean = samples
+                .iter()
+                .map(|s| s.timestamp as f64 / 1_000.0)
+                .sum::<f64>()
+                / n;
+            let v_mean = samples.iter().map(|s| s.value).sum::<f64>() / n;
+            let mut num = 0.0;
+            let mut den = 0.0;
+            for sample in samples {
+                let dt = sample.timestamp as f64 / 1_000.0 - t_mean;
+                num += dt * (sample.value - v_mean);
+                den += dt * dt;
+            }
+            let slope = if den == 0.0 { 0.0 } else { num / den };
+            let intercept = v_mean - slope * t_mean;
+            let last = samples.last()?.timestamp as f64 / 1_000.0;
+            Some(intercept + slope * (last + horizon))
+        }
     }
+}
+
+/// The values of a series' samples, for the aggregation-over-time functions.
+fn values(samples: &[SamplePoint]) -> Vec<f64> {
+    samples.iter().map(|s| s.value).collect()
 }
 
 /// Prometheus' interpolation between the two neighbouring order statistics.
@@ -2244,7 +2425,8 @@ fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
             }
         }
         // `timestamp` needs the sample's own timestamp, handled by the caller.
-        MathFunc::Timestamp | MathFunc::ClampMin | MathFunc::ClampMax => value,
+        // `default` and the clamps are handled before they reach here.
+        MathFunc::Timestamp | MathFunc::ClampMin | MathFunc::ClampMax | MathFunc::Default => value,
     }
 }
 
@@ -2503,6 +2685,78 @@ mod tests {
         ] {
             parse_ok(query);
         }
+    }
+
+    #[test]
+    fn test_metricsql_extras_parse_and_evaluate() {
+        // `aggr_over_time` names an aggregation, so both bare and quoted names
+        // are accepted.
+        parse_ok(r#"aggr_over_time(avg, m[5m])"#);
+        parse_ok(r#"aggr_over_time("avg", m[5m])"#);
+        parse_ok("absent_over_time(m[5m])");
+        parse_ok("tmin_over_time(m[5m])");
+        parse_ok("tmax_over_time(m[5m])");
+        // `predict_linear` puts the range vector first.
+        parse_ok("predict_linear(m[5m], 3600)");
+        // `default(v, x)`.
+        parse_ok("default(m, 0)");
+        parse_ok(r#"default(m{job="x"}, 0)"#);
+        // Errors name the problem.
+        assert!(parse_err("aggr_over_time(5, m[5m])").contains("aggregation name"));
+        assert!(parse_err("aggr_over_time(nonsense, m[5m])").contains("not an aggregation"));
+        assert!(parse_err("aggr_over_time(topk, m[5m])").contains("no parameter"));
+        assert!(parse_err("predict_linear(m[5m])").contains("expected Comma but found"));
+    }
+
+    #[test]
+    fn test_aggr_and_timestamp_over_time() {
+        let samples = [
+            SamplePoint {
+                timestamp: 0,
+                value: 2.0,
+            },
+            SamplePoint {
+                timestamp: 1_000,
+                value: 4.0,
+            },
+            SamplePoint {
+                timestamp: 2_000,
+                value: 1.0,
+            },
+        ];
+        let values = samples.iter().map(|s| s.value).collect::<Vec<f64>>();
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            apply_range_func(RangeFunc::AggrOverTime(AggOp::Sum), &samples, 3_000, None),
+            Some(7.0)
+        );
+        assert_eq!(
+            apply_range_func(RangeFunc::AggrOverTime(AggOp::Avg), &samples, 3_000, None),
+            Some(7.0 / 3.0)
+        );
+        assert_eq!(
+            apply_range_func(RangeFunc::AggrOverTime(AggOp::Max), &samples, 3_000, None),
+            Some(4.0)
+        );
+        assert_eq!(
+            apply_range_func(RangeFunc::AggrOverTime(AggOp::Min), &samples, 3_000, None),
+            Some(1.0)
+        );
+        // The extreme value is 4 at ts 1 s and 1 at ts 2 s.
+        assert_eq!(
+            apply_range_func(RangeFunc::TMinOverTime, &samples, 3_000, None),
+            Some(2.0)
+        );
+        assert_eq!(
+            apply_range_func(RangeFunc::TMaxOverTime, &samples, 3_000, None),
+            Some(1.0)
+        );
+        // Linear fit of (0,2),(1,4),(2,1): slope -0.5, mean 7/3 at t=1, so the
+        // line is 17/6 - t/2 and the prediction at t = last + 1 = 3 is 4/3.
+        let predicted = apply_range_func(RangeFunc::PredictLinear, &samples, 3_000, Some(1.0))
+            .expect("predict_linear returns a value");
+        assert!((predicted - 4.0 / 3.0).abs() < 1e-9, "got {predicted}");
+        assert!(values.len() == 3);
     }
 
     #[test]

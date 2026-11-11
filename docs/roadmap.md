@@ -257,6 +257,26 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     算术丢弃 `__name__`、子查询与 `rate(裸选择器)` 返回 400 `bad_data`。
   - 已有 `/api/v1/query`、`/api/v1/last`、`/api/v1/query_range` 保持原有的引擎形状
     响应不变（ADR §12.5、roadmap 均按该形状描述），新接口挂独立前缀。
+- 已完成（2026-11-11）：MetricsQL 子集（同一个 `server::promql` 求值器）。
+  VictoriaMetrics 的 Grafana 数据源发的是 MetricsQL，其中一部分只是 PromQL 的
+  超集语法，这里补上不需要额外存储支撑的几个：
+  - `aggr_over_time(<agg>, v[range])`——聚合名可裸写也可加引号（`avg` / `"avg"`），
+    接受 `sum/avg/min/max/count/stddev/stdvar`；`topk`/`bottomk` 要额外参数、
+    `group` 对时间轴无意义，解析期即拒绝并点名；
+  - `absent_over_time(v[range])`——区间内一条样本都没有时返回单条**无标签**的 `1`，
+    否则返回空（与 Prometheus 同名函数同义）；
+  - `tmin_over_time` / `tmax_over_time`——返回极值样本的**时间戳**（秒）而不是值；
+  - `predict_linear(v[range], t)`——对区间内样本做最小二乘直线拟合，从最后一个样本
+    再外推 `t` 秒（与 Prometheus 的实现一致：拟合斜率而非取端点差）；
+  - `default(v, x)`——结果为空时补一条无标签的 `x`，已有样本中的 `NaN` 也换成 `x`
+    （MetricsQL 把 NaN 当缺失值）。
+  - `rollup_*` 明确不做：它以 VictoriaMetrics 自己的 rollup 表为前提，而本服务的
+    求值仍读原始样本，接受它会画出与 VM 不同的数——报错比给出错数好。
+  - 测试：解析与求值单测（`aggr_over_time` 的六种聚合、`tmin/tmax` 的时间戳语义、
+    线性拟合的期望值、`aggr_over_time(topk, ...)` 与缺 horizon 的 `predict_linear`
+    报错），以及走 actix 路由的端到端用例（`aggr_over_time(avg, ...)`=1.5、
+    `predict_linear(..., 3600)`=363、`default(不存在的指标, 7)` 单条无标签 7、
+    `absent_over_time(不存在的指标[60s])`=1）。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
