@@ -24,8 +24,8 @@
 //! * range functions — `rate`, `irate`, `increase`, `delta`, `idelta`,
 //!   `changes`, `resets`, `*_over_time`;
 //! * instant functions — math (`abs`, `ceil`, `clamp_min`, ...), `timestamp`,
-//!   `sort`, `sort_desc`, `absent`, and the generators `time`, `pi`, `vector`,
-//!   plus MetricsQL's `default`;
+//!   `sort`, `sort_desc`, `absent`, `histogram_quantile`, and the generators
+//!   `time`, `pi`, `vector`, plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
@@ -567,6 +567,8 @@ pub enum MathFunc {
     ClampMax,
     /// `default(v, x)`.
     Default,
+    /// `histogram_quantile(q, v)` over classic `le` buckets.
+    HistogramQuantile,
     Timestamp,
 }
 
@@ -587,6 +589,7 @@ impl MathFunc {
             "clamp_max" => MathFunc::ClampMax,
             // MetricsQL: `default(v, x)` fills an empty result with `x`.
             "default" => MathFunc::Default,
+            "histogram_quantile" => MathFunc::HistogramQuantile,
             "timestamp" => MathFunc::Timestamp,
             _ => return None,
         })
@@ -1277,6 +1280,19 @@ impl Parser {
                     let expr = self.expression(0)?;
                     self.expect(Token::Comma)?;
                     let param = self.expression(0)?;
+                    self.expect(Token::RParen)?;
+                    return Ok(Expr::MathFunc {
+                        func,
+                        param: Some(Box::new(param)),
+                        expr: Box::new(expr),
+                    });
+                }
+                // `histogram_quantile(q, v)` also takes the quantile first,
+                // but it needs the whole vector to group the buckets.
+                MathFunc::HistogramQuantile => {
+                    let param = self.expression(0)?;
+                    self.expect(Token::Comma)?;
+                    let expr = self.expression(0)?;
                     self.expect(Token::RParen)?;
                     return Ok(Expr::MathFunc {
                         func,
@@ -2090,6 +2106,23 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 });
             }
+            // `histogram_quantile(q, v)`: group the classic histogram's `le`
+            // buckets per histogram, then interpolate within the bucket that
+            // holds the requested rank (Prometheus' `BucketQuantile`).
+            MathFunc::HistogramQuantile => {
+                let Some(quantile) = param else {
+                    return bad("histogram_quantile needs a quantile");
+                };
+                if instant.scalar.is_some() {
+                    return bad(
+                        "histogram_quantile needs an instant vector of `le` buckets, not a scalar",
+                    );
+                }
+                return Ok(Instant {
+                    vector: histogram_quantile(quantile, &instant.vector)?,
+                    scalar: None,
+                });
+            }
             MathFunc::ClampMin | MathFunc::ClampMax => {
                 let Some(bound) = param else {
                     return bad("clamp_min/clamp_max need a bound");
@@ -2378,6 +2411,126 @@ fn values(samples: &[SamplePoint]) -> Vec<f64> {
     samples.iter().map(|s| s.value).collect()
 }
 
+/// `histogram_quantile(q, v)` for classic `le` buckets.
+///
+/// Every series must carry a `le` bucket bound; `_sum`/`_count` series (or a
+/// missing `by (le)` aggregation) are refused by name rather than dropped, so
+/// a panel that passes the wrong metric hears about it instead of drawing an
+/// empty graph.
+fn histogram_quantile(quantile: f64, vector: &Vector) -> Result<Vector> {
+    type Groups = BTreeMap<BTreeMap<String, String>, Vec<(f64, f64)>>;
+    let mut groups: Groups = BTreeMap::new();
+    for point in &vector.0 {
+        let Some(raw) = point.labels.get("le") else {
+            return bad(format!(
+                "histogram_quantile needs a `le` label on every series; {} has none",
+                label_string(&point.labels)
+            ));
+        };
+        let Ok(upper) = raw.trim().parse::<f64>() else {
+            return bad(format!(
+                "histogram_quantile cannot read `le={raw}` as a bucket bound"
+            ));
+        };
+        let mut labels = point.labels.clone();
+        labels.remove("le");
+        labels.remove("__name__");
+        groups.entry(labels).or_default().push((upper, point.value));
+    }
+    let mut out = Vector::default();
+    for (labels, mut buckets) in groups {
+        out.push(labels, bucket_quantile(quantile, &mut buckets));
+    }
+    Ok(out)
+}
+
+/// Prometheus' `BucketQuantile` for classic histograms.
+///
+/// Buckets are sorted by upper bound, buckets sharing a bound are coalesced
+/// (counts added), and a count that is lower than its predecessor is clamped
+/// up to it: Prometheus makes both corrections silently, since a decrease can
+/// only come from inconsistent input or float noise.
+///
+/// The cases Prometheus answers with NaN are kept: fewer than two buckets, no
+/// `+Inf` bucket, or zero observations. A quantile that lands in the `+Inf`
+/// bucket answers the upper bound of the last finite bucket, as Prometheus
+/// does — the distribution gives no information about how far into `+Inf` it
+/// really is.
+fn bucket_quantile(quantile: f64, buckets: &mut [(f64, f64)]) -> f64 {
+    if quantile.is_nan() {
+        return f64::NAN;
+    }
+    if quantile < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if quantile > 1.0 {
+        return f64::INFINITY;
+    }
+    if buckets.is_empty() {
+        return f64::NAN;
+    }
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if buckets.last().map(|(upper, _)| *upper) != Some(f64::INFINITY) {
+        return f64::NAN;
+    }
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(buckets.len());
+    for (upper, count) in buckets.iter().copied() {
+        if count.is_nan() {
+            return f64::NAN;
+        }
+        match merged.last_mut() {
+            Some((last_upper, last_count)) if *last_upper == upper => *last_count += count,
+            _ => merged.push((upper, count)),
+        }
+    }
+    let mut previous = merged[0].1;
+    for entry in merged.iter_mut().skip(1) {
+        if entry.1 < previous {
+            entry.1 = previous;
+        } else {
+            previous = entry.1;
+        }
+    }
+    if merged.len() < 2 {
+        return f64::NAN;
+    }
+    let observations = merged[merged.len() - 1].1;
+    if observations == 0.0 {
+        return f64::NAN;
+    }
+    let rank = quantile * observations;
+    // Only the finite buckets are searched: falling past them puts the answer
+    // in the `+Inf` bucket.
+    let index = merged[..merged.len() - 1]
+        .iter()
+        .position(|(_, count)| *count >= rank);
+    match index {
+        None => merged[merged.len() - 2].0,
+        Some(0) if merged[0].0 <= 0.0 => merged[0].0,
+        Some(index) => {
+            let (end, count) = merged[index];
+            let (start, below) = if index == 0 {
+                (0.0, 0.0)
+            } else {
+                merged[index - 1]
+            };
+            let count = count - below;
+            let rank = rank - below;
+            start + (end - start) * (rank / count)
+        }
+    }
+}
+
+/// Renders a label set for an error message, e.g. `{job="api"}`.
+fn label_string(labels: &BTreeMap<String, String>) -> String {
+    let body = labels
+        .iter()
+        .map(|(name, value)| format!("{name}={value:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
 /// Prometheus' interpolation between the two neighbouring order statistics.
 fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
     if sorted.is_empty() || quantile.is_nan() {
@@ -2425,8 +2578,13 @@ fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
             }
         }
         // `timestamp` needs the sample's own timestamp, handled by the caller.
-        // `default` and the clamps are handled before they reach here.
-        MathFunc::Timestamp | MathFunc::ClampMin | MathFunc::ClampMax | MathFunc::Default => value,
+        // `default`, `histogram_quantile` and the clamps are handled before
+        // they reach here.
+        MathFunc::Timestamp
+        | MathFunc::ClampMin
+        | MathFunc::ClampMax
+        | MathFunc::Default
+        | MathFunc::HistogramQuantile => value,
     }
 }
 
@@ -2673,6 +2831,8 @@ mod tests {
             "round(http_requests, 0.5)",
             r#"rate(http_requests{job="api"}[5m] offset 1h)"#,
             "sort_desc(http_requests)",
+            "histogram_quantile(0.9, http_latency_bucket)",
+            "histogram_quantile(0.5, sum by (le) (rate(http_latency_bucket[5m])))",
             "absent(http_requests)",
             "vector(1)",
             "time()",
@@ -2854,6 +3014,92 @@ mod tests {
             apply_range_func(RangeFunc::CountOverTime, &samples, 4_000, None),
             Some(4.0)
         );
+    }
+
+    #[test]
+    fn test_histogram_quantile_interpolates_classic_buckets() {
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 10/20/30/40 observations up to 0.1/0.5/1/+Inf.
+        let buckets = vec![(f64::INFINITY, 40.0), (0.5, 20.0), (0.1, 10.0), (1.0, 30.0)];
+        assert!(approx(bucket_quantile(0.5, &mut buckets.clone()), 0.5));
+        assert!(approx(bucket_quantile(0.25, &mut buckets.clone()), 0.1));
+        assert!(approx(bucket_quantile(0.75, &mut buckets.clone()), 1.0));
+        // Into the `+Inf` bucket: the last finite bound, not `+Inf`, since the
+        // bucket says nothing about how far past it the observations go.
+        assert!(approx(bucket_quantile(0.95, &mut buckets.clone()), 1.0));
+        assert!(approx(bucket_quantile(0.0, &mut buckets.clone()), 0.0));
+        assert!(bucket_quantile(f64::NAN, &mut buckets.clone()).is_nan());
+        assert_eq!(
+            bucket_quantile(-1.0, &mut buckets.clone()),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(bucket_quantile(2.0, &mut buckets.clone()), f64::INFINITY);
+        // Inputs that cannot describe a distribution answer NaN, as in
+        // Prometheus, rather than an invented value.
+        let mut no_inf = vec![(0.1, 1.0), (1.0, 2.0)];
+        assert!(bucket_quantile(0.5, &mut no_inf).is_nan());
+        let mut single = vec![(f64::INFINITY, 5.0)];
+        assert!(bucket_quantile(0.5, &mut single).is_nan());
+        let mut no_observations = vec![(0.5, 0.0), (f64::INFINITY, 0.0)];
+        assert!(bucket_quantile(0.5, &mut no_observations).is_nan());
+        // Equal bounds are coalesced and a decreasing count is clamped up;
+        // Prometheus makes both corrections silently.
+        let mut duplicate = vec![(0.5, 1.0), (0.5, 1.0), (f64::INFINITY, 4.0)];
+        assert!(approx(bucket_quantile(0.5, &mut duplicate), 0.5));
+        let mut decreasing = vec![(0.1, 5.0), (0.5, 3.0), (f64::INFINITY, 5.0)];
+        assert!(approx(bucket_quantile(0.5, &mut decreasing), 0.05));
+    }
+
+    #[test]
+    fn test_histogram_quantile_groups_buckets_per_histogram() {
+        let bucket = |job: &str, le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("__name__".to_string(), "latency_bucket".to_string()),
+                ("job".to_string(), job.to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        let mut vector = Vector::default();
+        // `api`: 2/4/6/8 observations, `db`: 18/20/22/24.
+        for (job, base) in [("api", 0.0), ("db", 16.0)] {
+            vector.0.push(bucket(job, "0.1", base + 2.0));
+            vector.0.push(bucket(job, "0.5", base + 4.0));
+            vector.0.push(bucket(job, "1", base + 6.0));
+            vector.0.push(bucket(job, "+Inf", base + 8.0));
+        }
+        let out = histogram_quantile(0.75, &vector).expect("both histograms are complete");
+        assert_eq!(out.0.len(), 2);
+        let value = |job: &str| {
+            out.0
+                .iter()
+                .find(|point| point.labels.get("job") == Some(&job.to_string()))
+                .unwrap_or_else(|| panic!("missing {job}"))
+                .value
+        };
+        // api: rank 6 of 8 sits exactly on the 1 s bound.
+        assert!((value("api") - 1.0).abs() < 1e-9);
+        // db: rank 18 of 24 sits exactly on the 0.1 s bound (start 0, end 0.1,
+        // 18 of 18 observations in the first bucket).
+        assert!((value("db") - 0.1).abs() < 1e-9);
+        // `__name__` and `le` are dropped; `job` stays as the grouping label.
+        for point in &out.0 {
+            assert!(!point.labels.contains_key("__name__"));
+            assert!(!point.labels.contains_key("le"));
+        }
+        // A series without `le` is an error naming the series, not silently
+        // dropped: a panel that passed `_sum`/`_count` would otherwise show
+        // an empty graph.
+        let mut mixed = vector.clone();
+        mixed.0.push(Point {
+            labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
+            value: 0.0,
+            sample_ts: None,
+        });
+        let error = histogram_quantile(0.75, &mixed).unwrap_err();
+        assert!(error.message().contains("`le` label"));
+        assert!(error.message().contains("job=\"api\""));
     }
 
     #[test]

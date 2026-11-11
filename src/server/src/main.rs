@@ -1052,6 +1052,23 @@ mod tests {
             })
             .collect();
         backend.write(samples).await.unwrap();
+        // A classic histogram: one series per `le` bucket, 1/2/3/4
+        // observations up to 0.1/0.5/1/+Inf.
+        let buckets: Vec<Sample> = [("0.1", 1.0), ("0.5", 2.0), ("1", 3.0), ("+Inf", 4.0)]
+            .iter()
+            .map(|(le, count)| Sample {
+                name: b"http_latency_bucket".to_vec(),
+                labels: vec![Label {
+                    name: b"le".to_vec(),
+                    value: le.as_bytes().to_vec(),
+                }],
+                timestamp: now - 5_000,
+                value: *count,
+                name_id: None,
+                series_id: None,
+            })
+            .collect();
+        backend.write(buckets).await.unwrap();
         backend.flush_all().await.unwrap();
 
         let app = actix_web::test::init_service(
@@ -1343,5 +1360,44 @@ mod tests {
         assert_eq!(result[0]["metric"], serde_json::json!({}));
         let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
         assert!((value - 1.0).abs() < 1e-9);
+
+        // `histogram_quantile` groups the `le` buckets into one histogram and
+        // interpolates: rank 2 of 4 falls exactly on the 0.5 bucket bound.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "histogram_quantile(0.5, http_latency_bucket)"),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1, "one histogram collapses to one sample");
+        // `__name__` and `le` are dropped from the answer.
+        assert_eq!(result[0]["metric"], serde_json::json!({}));
+        let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert!((value - 0.5).abs() < 1e-9, "got {value}");
+
+        // A series without `le` is refused by name: that is what a panel that
+        // forgot `sum by (le)` (or passed `_sum`) would send.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "histogram_quantile(0.5, http_requests)"),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
     }
 }

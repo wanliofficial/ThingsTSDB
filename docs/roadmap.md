@@ -229,6 +229,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     （下降视为归零后继续累加），单位是「每秒」；
   - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp_min/clamp_max/
     timestamp`，以及 `sort`、`sort_desc`、`absent`、`vector()`、`time()`、`pi()`；
+    （`histogram_quantile` 见下面单独一条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk`，支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
     并保留分组标签，与 Prometheus 一致；
@@ -277,6 +278,24 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     报错），以及走 actix 路由的端到端用例（`aggr_over_time(avg, ...)`=1.5、
     `predict_linear(..., 3600)`=363、`default(不存在的指标, 7)` 单条无标签 7、
     `absent_over_time(不存在的指标[60s])`=1）。
+- 已完成（2026-11-11）：`histogram_quantile(q, v)`（经典直方图的 `le` 桶）。
+  Grafana 的延迟面板几乎都写成 `histogram_quantile(0.9, sum by (le) (rate(x_bucket[5m])))`，
+  之前这个函数会被当作未知函数拒绝。实现按 Prometheus 的 `BucketQuantile`：
+  - 按「除 `le` 与 `__name__` 之外的全部标签」把桶归成一个直方图，`le` 解析为 f64
+    （含 `+Inf`）；同一边界的桶先合并（计数相加），计数低于前一个桶时向上钳平——
+    这两步 Prometheus 也是静默做的；
+  - 在有限桶里找累计计数首次 ≥ `q * observations` 的桶，桶内线性插值（第一个桶的
+    隐含下界为 0，若其上界 ≤ 0 则直接返回该上界）；`q` 落进 `+Inf` 桶时返回最后一个
+    有限桶的上界，不假装知道分布的尾巴；
+  - `q` 为 NaN / <0 / >1 分别返回 `NaN` / `-Inf` / `+Inf`；桶不足两个、缺 `+Inf` 桶、
+    观测数为 0 返回 `NaN`——这些都是 Prometheus 的既有语义，照抄而不是另造一个数；
+  - 结果只保留分组标签（去掉 `le` 与 `__name__`）；每条序列都必须带可解析的 `le`，
+    否则按该序列的标签报 `bad_data`：面板漏写 `sum by (le)` 或误传 `_sum`/`_count`
+    时会看到原因，而不是一张空图。
+  - 测试：`bucket_quantile` 的插值/`+Inf`/NaN 分支、重复边界与递减计数的修正、
+    按标签分组与标签裁剪、缺 `le` 的报错；端到端（actix 路由 + 真实引擎）写入
+    1/2/3/4 四个桶后断言 `histogram_quantile(0.5, http_latency_bucket)` 是单条
+    无标签的 `0.5`，缺 `le` 的 `histogram_quantile(0.5, http_requests)` 返回 400。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
