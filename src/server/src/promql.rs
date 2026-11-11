@@ -29,8 +29,9 @@
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
-//!   scalars or a vector and a scalar, exact-label matching between two
-//!   vectors, and the set operators `and` / `or` / `unless`;
+//!   scalars or a vector and a scalar, vector matching between two vectors
+//!   (`on` / `ignoring`, `group_left` / `group_right`), and the set operators
+//!   `and` / `or` / `unless`;
 //! * a MetricsQL subset on top of PromQL — `aggr_over_time(<agg>, v[range])`,
 //!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`, and
 //!   `predict_linear(v[range], t)`.
@@ -41,11 +42,19 @@
 //! absent: it is a VictoriaMetrics-only interface that assumes its own rollup
 //! tables, and this server's rollup path is still raw-sample based.
 //!
-//! Deliberately **not** implemented: subqueries `[...:...]`, `on(...)` /
-//! `ignoring(...)` / `group_left` / `group_right`, and the string functions
-//! (`label_replace`, `label_join`). Those are rejected with a message naming
-//! the gap: a panel that silently receives `a + b` where it asked for
-//! `a + on(instance) b` would draw a wrong line, which is worse than an error.
+//! Vector matching follows Prometheus' `VectorBinop` / `resultMetric`: the
+//! right side is the "one" side (a `group_right` query is evaluated as the
+//! mirrored `group_left`), the match key is the `on` labels or every label but
+//! `__name__` and the `ignoring` ones, a duplicate key on the "one" side is an
+//! error naming both series, and a one-to-one match that pairs one series twice
+//! is an error telling the caller to add `group_left`/`group_right`. Arithmetic
+//! and `bool` comparisons drop `__name__`; a filtering comparison keeps it.
+//!
+//! Deliberately **not** implemented: subqueries `[...:...]` and the string
+//! functions (`label_replace`, `label_join`). Those are rejected with a
+//! message naming the gap: a panel that silently receives an approximated
+//! answer where it asked for something else would draw a wrong line, which is
+//! worse than an error.
 //!
 //! Evaluation asks the engine for each selector's raw samples over the union
 //! window once, then evaluates the expression per step. One scan per selector
@@ -380,6 +389,79 @@ pub enum Grouping {
     Without(Vec<String>),
 }
 
+/// How many samples on each side of a binary operation may share one match
+/// key, following Prometheus' `VectorMatchCardinality`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cardinality {
+    /// The unmodified case: one series per match key on either side.
+    #[default]
+    OneToOne,
+    ManyToOne,
+    OneToMany,
+    ManyToMany,
+}
+
+/// How the two sides of a binary operation are matched, i.e. the
+/// `on(...)` / `ignoring(...)` / `group_left(...)` / `group_right(...)`
+/// modifiers after the operator.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorMatching {
+    /// `on(...)` keeps only `matching_labels`; `ignoring(...)` drops them.
+    pub on: bool,
+    /// The labels named by `on(...)` or `ignoring(...)`.
+    pub matching_labels: Vec<String>,
+    pub card: Cardinality,
+    /// The `group_left(...)` / `group_right(...)` labels, which are copied
+    /// from the "one" side of the match.
+    pub include: Vec<String>,
+}
+
+impl VectorMatching {
+    /// True when no modifier was given, i.e. the default "match on every
+    /// label except `__name__`" rule.
+    #[cfg(test)]
+    fn is_default(&self) -> bool {
+        !self.on
+            && self.matching_labels.is_empty()
+            && self.card == Cardinality::OneToOne
+            && self.include.is_empty()
+    }
+}
+
+/// A label set, as found in `Point::labels`.
+type LabelSet = BTreeMap<String, String>;
+
+/// The match key of a label set: the label pairs that decide whether two
+/// series on the two sides of a binary operation are the same series.
+type MatchKey = Vec<(String, String)>;
+
+/// The match key of a label set under `matching`.
+///
+/// `on(...)` keeps exactly the named labels (present ones only), everything
+/// else keeps every label but `__name__` and the ignored ones — which is what
+/// Prometheus' signature function does, so two series that a query treats as
+/// "the same series" produce the same key.
+fn matching_signature(labels: &LabelSet, matching: &VectorMatching) -> MatchKey {
+    labels
+        .iter()
+        .filter(|(name, _)| {
+            if matching.on {
+                matching
+                    .matching_labels
+                    .iter()
+                    .any(|label| label == name.as_str())
+            } else {
+                name.as_str() != "__name__"
+                    && !matching
+                        .matching_labels
+                        .iter()
+                        .any(|label| label == name.as_str())
+            }
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -400,6 +482,26 @@ pub enum BinaryOp {
 }
 
 impl BinaryOp {
+    fn name(self) -> &'static str {
+        match self {
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
+            BinaryOp::Pow => "^",
+            BinaryOp::Eq => "==",
+            BinaryOp::Neq => "!=",
+            BinaryOp::Gt => ">",
+            BinaryOp::Lt => "<",
+            BinaryOp::Gte => ">=",
+            BinaryOp::Lte => "<=",
+            BinaryOp::And => "and",
+            BinaryOp::Or => "or",
+            BinaryOp::Unless => "unless",
+        }
+    }
+
     fn is_comparison(self) -> bool {
         matches!(
             self,
@@ -628,6 +730,10 @@ pub enum Expr {
         rhs: Box<Expr>,
         /// `bool` makes a comparison return 0/1 instead of filtering.
         ret_bool: bool,
+        /// The `on` / `ignoring` / `group_left` / `group_right` modifiers.
+        /// `VectorMatching::default()` is one-to-one on all labels but
+        /// `__name__`, which is what an unmodified operator does.
+        matching: VectorMatching,
     },
     Aggregation {
         op: AggOp,
@@ -886,19 +992,6 @@ impl Parser {
                 break;
             }
             self.pos += 1;
-            // `and on (x)` / `or ignoring (y)` etc. need vector matching, which
-            // this evaluator does not implement (it matches on all labels).
-            if let Some(Token::Ident(modifier)) = self.peek() {
-                if matches!(
-                    modifier.as_str(),
-                    "on" | "ignoring" | "group_left" | "group_right"
-                ) {
-                    return bad(format!(
-                        "`{modifier}` vector matching is not supported; this endpoint matches \
-                         two vectors on all labels (except __name__)"
-                    ));
-                }
-            }
             let ret_bool = if op.is_comparison() && self.peek_ident_is("bool") {
                 self.pos += 1;
                 true
@@ -908,15 +1001,91 @@ impl Parser {
             if is_ident && !op.is_set() {
                 unreachable!("only set operators are spelled with words");
             }
+            let matching = self.bin_modifier(op)?;
             let rhs = self.expression(bp + 1)?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 ret_bool,
+                matching,
             };
         }
         Ok(lhs)
+    }
+
+    /// Parses the modifiers after a binary operator: an optional
+    /// `on(...)` / `ignoring(...)` and an optional
+    /// `group_left(...)` / `group_right(...)`.
+    fn bin_modifier(&mut self, op: BinaryOp) -> Result<VectorMatching> {
+        let mut matching = VectorMatching::default();
+        if self.peek_ident_is("on") || self.peek_ident_is("ignoring") {
+            matching.on = self.peek_ident_is("on");
+            self.pos += 1;
+            matching.matching_labels = self.label_list()?;
+        }
+        let card = if self.peek_ident_is("group_left") {
+            self.pos += 1;
+            Cardinality::ManyToOne
+        } else if self.peek_ident_is("group_right") {
+            self.pos += 1;
+            Cardinality::OneToMany
+        } else {
+            Cardinality::OneToOne
+        };
+        if card != Cardinality::OneToOne {
+            matching.card = card;
+            // The trailing label list is optional.
+            if matches!(self.peek(), Some(Token::LParen)) {
+                matching.include = self.label_list()?;
+            }
+        }
+        if op.is_set() {
+            if matching.card != Cardinality::OneToOne {
+                return bad(format!("no grouping allowed for `{}` operation", op.name()));
+            }
+            // Set operators are implicitly many-to-many: several series may
+            // share a match key on either side.
+            matching.card = Cardinality::ManyToMany;
+        }
+        if matching.on {
+            for name in &matching.include {
+                if matching.matching_labels.contains(name) {
+                    return bad(format!(
+                        "label {name:?} must not occur in ON and GROUP clause at once"
+                    ));
+                }
+            }
+        }
+        // Prometheus' `fill(...)` / `fill_left(...)` / `fill_right(...)`
+        // modifiers are not implemented; name them rather than leaving the
+        // caller guessing.
+        for unsupported in ["fill", "fill_left", "fill_right"] {
+            if self.peek_ident_is(unsupported) {
+                return bad(format!("`{unsupported}` vector matching is not supported"));
+            }
+        }
+        Ok(matching)
+    }
+
+    /// Parses `(a, b, c)`, allowing the trailing comma Prometheus accepts.
+    fn label_list(&mut self) -> Result<Vec<String>> {
+        self.expect(Token::LParen)?;
+        let mut labels = Vec::new();
+        loop {
+            if !self.eat(&Token::Comma) {
+                match self.ident() {
+                    Some(name) => labels.push(name),
+                    None => break,
+                }
+                continue;
+            }
+            if matches!(self.peek(), Some(Token::RParen)) {
+                break;
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok(labels)
     }
 
     fn peek_ident_is(&self, name: &str) -> bool {
@@ -945,6 +1114,7 @@ impl Parser {
             _ => false,
         } {
             self.pos += 1;
+            let matching = self.bin_modifier(BinaryOp::Pow)?;
             // Right associative, and the exponent may be a bare scalar.
             let rhs = self.expression(6)?;
             return Ok(Expr::Binary {
@@ -952,6 +1122,7 @@ impl Parser {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 ret_bool: false,
+                matching,
             });
         }
         Ok(lhs)
@@ -1493,23 +1664,11 @@ fn render(expr: &Expr) -> String {
 pub struct Point {
     /// Labels of the series. `__name__` is present for a raw selector result
     /// and dropped as soon as an operation derives a new value.
-    pub labels: BTreeMap<String, String>,
+    pub labels: LabelSet,
     pub value: f64,
     /// The sample's own timestamp, when it came from a stored point. Derived
     /// values inherit it from their input so `timestamp()` can report it.
     pub sample_ts: Option<i64>,
-}
-
-impl Point {
-    /// The identity used for exact vector matching: every label except
-    /// `__name__`, as Prometheus does.
-    fn signature(&self) -> Vec<(String, String)> {
-        self.labels
-            .iter()
-            .filter(|(name, _)| name.as_str() != "__name__")
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
-    }
 }
 
 /// An instant vector.
@@ -1523,7 +1682,7 @@ impl Vector {
     /// `quantile_over_time(NaN, ...)` all produce a NaN sample in Prometheus,
     /// and the JSON layer already renders it as `"NaN"`. Dropping it would
     /// silently remove a series from the answer.
-    fn push(&mut self, labels: BTreeMap<String, String>, value: f64) {
+    fn push(&mut self, labels: LabelSet, value: f64) {
         self.0.push(Point {
             labels,
             value,
@@ -1531,12 +1690,18 @@ impl Vector {
         });
     }
 
-    fn push_sample(&mut self, labels: BTreeMap<String, String>, value: f64, sample_ts: i64) {
+    fn push_sample(&mut self, labels: LabelSet, value: f64, sample_ts: i64) {
         self.0.push(Point {
             labels,
             value,
             sample_ts: Some(sample_ts),
         });
+    }
+
+    /// Appends a sample unchanged, labels and timestamp included (the set
+    /// operators pass their input through).
+    fn push_point(&mut self, point: &Point) {
+        self.0.push(point.clone());
     }
 
     fn is_empty(&self) -> bool {
@@ -1547,7 +1712,7 @@ impl Vector {
 /// One series' samples inside a range, ascending by timestamp.
 #[derive(Debug, Clone, Default)]
 pub struct RangeSeries {
-    pub labels: BTreeMap<String, String>,
+    pub labels: LabelSet,
     pub samples: Vec<SamplePoint>,
 }
 
@@ -1682,7 +1847,8 @@ impl<'a> Evaluator<'a> {
                 lhs,
                 rhs,
                 ret_bool,
-            } => self.binary(*op, lhs, rhs, *ret_bool, at_ms),
+                matching,
+            } => self.binary(*op, lhs, rhs, *ret_bool, matching, at_ms),
             Expr::Aggregation {
                 op,
                 expr,
@@ -1826,10 +1992,29 @@ impl<'a> Evaluator<'a> {
         lhs: &Expr,
         rhs: &Expr,
         ret_bool: bool,
+        matching: &VectorMatching,
         at_ms: i64,
     ) -> Result<Instant> {
         let left = self.eval(lhs, at_ms)?;
         let right = self.eval(rhs, at_ms)?;
+        // Prometheus only honours vector matching between two instant vectors;
+        // with a scalar on either side the modifiers are meaningless, and
+        // silently ignoring them would answer a different query.
+        let both_vectors = left.scalar.is_none() && right.scalar.is_none();
+        if !both_vectors {
+            if !matching.matching_labels.is_empty() {
+                return bad("vector matching only allowed between instant vectors");
+            }
+            if !matching.include.is_empty() || matching.card != Cardinality::OneToOne {
+                return bad("grouping labels only allowed between instant vectors");
+            }
+            if op.is_set() {
+                return bad(format!(
+                    "set operator `{}` not allowed in binary scalar expression",
+                    op.name()
+                ));
+            }
+        }
         match (left.scalar, right.scalar) {
             (Some(a), Some(b)) => {
                 let value = op.apply(a, b);
@@ -1848,7 +2033,7 @@ impl<'a> Evaluator<'a> {
                 scalar: None,
             }),
             (None, None) => Ok(Instant {
-                vector: self.binary_vectors(op, &left.vector, &right.vector, ret_bool)?,
+                vector: binary_vectors(op, &left.vector, &right.vector, ret_bool, matching)?,
                 scalar: None,
             }),
         }
@@ -1886,76 +2071,6 @@ impl<'a> Evaluator<'a> {
             out.push(labels, value);
         }
         out
-    }
-
-    fn binary_vectors(
-        &self,
-        op: BinaryOp,
-        lhs: &Vector,
-        rhs: &Vector,
-        ret_bool: bool,
-    ) -> Result<Vector> {
-        let mut out = Vector::default();
-        if op.is_set() {
-            let mut right: HashMap<Vec<(String, String)>, &Point> = HashMap::new();
-            for point in &rhs.0 {
-                right.insert(point.signature(), point);
-            }
-            for point in &lhs.0 {
-                let signature = point.signature();
-                match op {
-                    BinaryOp::And => {
-                        if right.contains_key(&signature) {
-                            out.push(point.labels.clone(), point.value);
-                        }
-                    }
-                    BinaryOp::Unless => {
-                        if !right.contains_key(&signature) {
-                            out.push(point.labels.clone(), point.value);
-                        }
-                    }
-                    BinaryOp::Or => {
-                        if !right.contains_key(&signature) {
-                            out.push(point.labels.clone(), point.value);
-                        }
-                    }
-                    _ => unreachable!("checked is_set"),
-                }
-            }
-            if op == BinaryOp::Or {
-                let left: HashSet<Vec<(String, String)>> =
-                    lhs.0.iter().map(|point| point.signature()).collect();
-                for point in &rhs.0 {
-                    if !left.contains(&point.signature()) {
-                        out.push(point.labels.clone(), point.value);
-                    }
-                }
-            }
-            return Ok(out);
-        }
-
-        let mut right: HashMap<Vec<(String, String)>, &Point> = HashMap::new();
-        for point in &rhs.0 {
-            right.insert(point.signature(), point);
-        }
-        for point in &lhs.0 {
-            let Some(other) = right.get(&point.signature()) else {
-                continue;
-            };
-            let value = op.apply(point.value, other.value);
-            if op.is_comparison() && !ret_bool {
-                if value == 1.0 {
-                    out.push(point.labels.clone(), point.value);
-                }
-                continue;
-            }
-            let mut labels = point.labels.clone();
-            if !op.is_comparison() {
-                labels.remove("__name__");
-            }
-            out.push(labels, value);
-        }
-        Ok(out)
     }
 
     fn aggregate(
@@ -2406,6 +2521,221 @@ fn apply_range_func(
     }
 }
 
+/// Evaluates a binary operation between two instant vectors.
+///
+/// The control flow follows Prometheus' `VectorBinop`: a one-to-many match is
+/// evaluated as many-to-one with the sides swapped (and the operand order
+/// restored when applying the operator), the right side is the "one" side, and
+/// the result keeps the left side's labels apart from what the matching rules
+/// and the operator itself change.
+fn binary_vectors(
+    op: BinaryOp,
+    lhs: &Vector,
+    rhs: &Vector,
+    ret_bool: bool,
+    matching: &VectorMatching,
+) -> Result<Vector> {
+    if op.is_set() {
+        return set_vectors(op, lhs, rhs, matching);
+    }
+    if matching.card == Cardinality::ManyToMany {
+        return bad(format!(
+            "many-to-many matching is only allowed for set operators, not `{}`",
+            op.name()
+        ));
+    }
+    // Evaluate `a group_right b` as `b group_left a` and swap the operands
+    // back when the operator is applied.
+    let swapped = matching.card == Cardinality::OneToMany;
+    let (many, one) = if swapped { (rhs, lhs) } else { (lhs, rhs) };
+
+    // Every match key must be unique on the "one" side; two series that share
+    // one would make the pairing ambiguous.
+    let mut one_sides: HashMap<MatchKey, &Point> = HashMap::new();
+    for point in &one.0 {
+        let signature = matching_signature(&point.labels, matching);
+        if let Some(previous) = one_sides.insert(signature.clone(), point) {
+            let mut first = label_string(&previous.labels);
+            let mut second = label_string(&point.labels);
+            if second < first {
+                std::mem::swap(&mut first, &mut second);
+            }
+            let side = if swapped { "left" } else { "right" };
+            let group: BTreeMap<String, String> = signature.into_iter().collect();
+            return bad(format!(
+                "found duplicate series for the match group {} on the {side} hand-side of the \
+                 operation: [{first}, {second}]; many-to-many matching not allowed: matching \
+                 labels must be unique on one side",
+                label_string(&group)
+            ));
+        }
+    }
+
+    let mut out = Vector::default();
+    let mut taken_one_to_one: HashSet<MatchKey> = HashSet::new();
+    // For `group_left`/`group_right` the grouping labels must still make the
+    // result unique; track the result label sets per match key to catch a
+    // collision instead of emitting two identical series.
+    let mut taken_many: HashMap<MatchKey, HashSet<LabelSet>> = HashMap::new();
+
+    for point in &many.0 {
+        let signature = matching_signature(&point.labels, matching);
+        let Some(other) = one_sides.get(&signature) else {
+            continue;
+        };
+        // After a swap `point` is the original right operand, so put the
+        // operands back in query order.
+        let (left_value, right_value) = if swapped {
+            (other.value, point.value)
+        } else {
+            (point.value, other.value)
+        };
+        let value = op.apply(left_value, right_value);
+        let keep = if op.is_comparison() && !ret_bool {
+            value == 1.0
+        } else {
+            true
+        };
+
+        let mut labels = point.labels.clone();
+        // Arithmetic results describe a new quantity, and a `bool` comparison
+        // no longer reports the left metric; a filtering comparison does.
+        if changes_metric_schema(op) || ret_bool {
+            labels.remove("__name__");
+        }
+        if matching.card == Cardinality::OneToOne {
+            if matching.on {
+                labels.retain(|name, _| matching.matching_labels.contains(name));
+            } else {
+                for name in &matching.matching_labels {
+                    labels.remove(name);
+                }
+            }
+        }
+        // `group_left(...)` / `group_right(...)` labels come from the "one"
+        // side, since that is the side that describes the group.
+        for name in &matching.include {
+            match other.labels.get(name) {
+                Some(value) => {
+                    labels.insert(name.clone(), value.clone());
+                }
+                None => {
+                    labels.remove(name);
+                }
+            }
+        }
+
+        if matching.card == Cardinality::OneToOne {
+            if !taken_one_to_one.insert(signature) {
+                return bad(
+                    "multiple matches for labels: many-to-one matching must be explicit \
+                     (group_left/group_right)",
+                );
+            }
+        } else {
+            let inserted = taken_many.entry(signature).or_default();
+            if !inserted.insert(labels.clone()) {
+                return bad(
+                    "multiple matches for labels: grouping labels must ensure unique matches",
+                );
+            }
+        }
+
+        if !keep {
+            continue;
+        }
+        // A comparison without `bool` reports the left operand's value.
+        out.push(
+            labels,
+            if op.is_comparison() && !ret_bool {
+                left_value
+            } else {
+                value
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Whether an operator produces a different quantity than its operands, which
+/// means the result can no longer be called by the left metric's name.
+fn changes_metric_schema(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::Pow
+    )
+}
+
+/// `and` / `or` / `unless`: both sides are matched many-to-many, and the
+/// samples are passed through unchanged.
+fn set_vectors(
+    op: BinaryOp,
+    lhs: &Vector,
+    rhs: &Vector,
+    matching: &VectorMatching,
+) -> Result<Vector> {
+    if matching.card != Cardinality::ManyToMany {
+        return bad(format!(
+            "set operations must always be many-to-many, not `{}` matching",
+            match matching.card {
+                Cardinality::OneToOne => "one-to-one",
+                Cardinality::ManyToOne => "many-to-one",
+                Cardinality::OneToMany => "one-to-many",
+                Cardinality::ManyToMany => "many-to-many",
+            }
+        ));
+    }
+    let mut out = Vector::default();
+    match op {
+        BinaryOp::And => {
+            let right: HashSet<MatchKey> = rhs
+                .0
+                .iter()
+                .map(|point| matching_signature(&point.labels, matching))
+                .collect();
+            for point in &lhs.0 {
+                if right.contains(&matching_signature(&point.labels, matching)) {
+                    out.push_point(point);
+                }
+            }
+        }
+        BinaryOp::Unless => {
+            let right: HashSet<MatchKey> = rhs
+                .0
+                .iter()
+                .map(|point| matching_signature(&point.labels, matching))
+                .collect();
+            for point in &lhs.0 {
+                if !right.contains(&matching_signature(&point.labels, matching)) {
+                    out.push_point(point);
+                }
+            }
+        }
+        BinaryOp::Or => {
+            let left: HashSet<MatchKey> = lhs
+                .0
+                .iter()
+                .map(|point| matching_signature(&point.labels, matching))
+                .collect();
+            for point in &lhs.0 {
+                out.push_point(point);
+            }
+            for point in &rhs.0 {
+                if !left.contains(&matching_signature(&point.labels, matching)) {
+                    out.push_point(point);
+                }
+            }
+        }
+        _ => unreachable!("checked is_set"),
+    }
+    Ok(out)
+}
+
 /// The values of a series' samples, for the aggregation-over-time functions.
 fn values(samples: &[SamplePoint]) -> Vec<f64> {
     samples.iter().map(|s| s.value).collect()
@@ -2522,7 +2852,7 @@ fn bucket_quantile(quantile: f64, buckets: &mut [(f64, f64)]) -> f64 {
 }
 
 /// Renders a label set for an error message, e.g. `{job="api"}`.
-fn label_string(labels: &BTreeMap<String, String>) -> String {
+fn label_string(labels: &LabelSet) -> String {
     let body = labels
         .iter()
         .map(|(name, value)| format!("{name}={value:?}"))
@@ -2660,8 +2990,7 @@ pub async fn range_query(
     // Result series keyed by their exact label set, in first-seen order so the
     // output is stable across identical queries.
     let mut order: Vec<Vec<(String, String)>> = Vec::new();
-    let mut series: HashMap<Vec<(String, String)>, (BTreeMap<String, String>, Vec<(i64, f64)>)> =
-        HashMap::new();
+    let mut series: HashMap<MatchKey, (LabelSet, Vec<(i64, f64)>)> = HashMap::new();
 
     let mut at = start_ms;
     loop {
@@ -2922,13 +3251,16 @@ mod tests {
     #[test]
     fn test_unsupported_constructs_are_named() {
         // Each message must say what is missing, not just "invalid".
-        assert!(parse_err("a + on(instance) b").contains("vector matching"));
         assert!(parse_err(r#"label_replace(a, "x", "$1", "y", "(.*)")"#).contains("label_replace"));
         assert!(parse_err("a[5m:1m]").contains("subquer"));
         assert!(parse_err("nonsense_func(a)").contains("unknown function"));
         assert!(parse_err("rate(a)").contains("range vector"));
         assert!(parse_err("a{").contains("label name"));
         assert!(parse_err("").contains("empty"));
+        // Set operators cannot be given grouping.
+        assert!(parse_err("a and on(x) group_left b").contains("no grouping allowed"));
+        // Prometheus' `fill` family is named rather than misparsed.
+        assert!(parse_err("a + fill(0) b").contains("`fill` vector matching"));
     }
 
     #[test]
@@ -3120,5 +3452,415 @@ mod tests {
         assert_eq!(BinaryOp::Div.apply(1.0, 0.0), f64::INFINITY);
         assert_eq!(BinaryOp::Gt.apply(2.0, 1.0), 1.0);
         assert_eq!(BinaryOp::Gt.apply(1.0, 2.0), 0.0);
+    }
+
+    /// A point with the given labels and value, for the matching tests.
+    fn point(pairs: &[(&str, &str)], value: f64) -> Point {
+        Point {
+            labels: pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            value,
+            sample_ts: None,
+        }
+    }
+
+    fn vector(points: Vec<Point>) -> Vector {
+        Vector(points)
+    }
+
+    /// Renders a result as `label=value` pairs sorted by label set, so a test
+    /// can assert on the whole answer without depending on ordering.
+    fn rendered(result: &Vector) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = result
+            .0
+            .iter()
+            .map(|point| (label_string(&point.labels), point.value))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The matching modifiers of a parsed binary expression.
+    fn matching(query: &str) -> VectorMatching {
+        match parse_ok(query) {
+            Expr::Binary { matching, .. } => matching,
+            other => panic!("{query:?} is not a binary expression: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_vector_matching_modifiers_parse() {
+        // The unmodified form is one-to-one on everything but `__name__`.
+        assert_eq!(matching("a + b"), VectorMatching::default());
+        assert!(matching("a + b").is_default());
+
+        let on = matching("a + on(instance) b");
+        assert!(on.on);
+        assert_eq!(on.matching_labels, vec!["instance".to_string()]);
+        assert_eq!(on.card, Cardinality::OneToOne);
+
+        let ignoring = matching("a + ignoring(instance, job) b");
+        assert!(!ignoring.on);
+        assert_eq!(
+            ignoring.matching_labels,
+            vec!["instance".to_string(), "job".to_string()]
+        );
+
+        // `group_left` / `group_right` come after `on`/`ignoring`, and their
+        // label list is optional.
+        let group_left = matching("a * on(job) group_left(instance) b");
+        assert_eq!(group_left.card, Cardinality::ManyToOne);
+        assert_eq!(group_left.include, vec!["instance".to_string()]);
+        assert_eq!(matching("a * group_left b").include, Vec::<String>::new());
+
+        let group_right = matching("a / ignoring(code) group_right(instance) b");
+        assert_eq!(group_right.card, Cardinality::OneToMany);
+        assert_eq!(group_right.include, vec!["instance".to_string()]);
+
+        // `bool` sits before the matching modifiers.
+        let bool_cmp = matching("a > bool on(job) b");
+        assert!(bool_cmp.on);
+        assert_eq!(bool_cmp.matching_labels, vec!["job".to_string()]);
+        assert!(matches!(
+            parse_ok("a > bool on(job) b"),
+            Expr::Binary { ret_bool: true, .. }
+        ));
+
+        // Set operators are implicitly many-to-many.
+        assert_eq!(matching("a and on(job) b").card, Cardinality::ManyToMany);
+        assert_eq!(matching("a or b").card, Cardinality::ManyToMany);
+
+        // An empty grouping list is legal in Prometheus.
+        assert!(matching("a + on() b").on);
+        assert!(matching("a + on() b").matching_labels.is_empty());
+
+        // Errors name the problem.
+        assert!(parse_err("a + on(instance) group_left(instance) b")
+            .contains("must not occur in ON and GROUP clause"));
+        assert!(parse_err("a and group_left b").contains("no grouping allowed"));
+    }
+
+    #[test]
+    fn test_one_to_one_matching_drops_or_keeps_labels() {
+        // Distinct metric names, same `instance`: `on(instance)` pairs them.
+        let lhs = vector(vec![point(
+            &[("__name__", "a"), ("instance", "i1"), ("job", "x")],
+            2.0,
+        )]);
+        let rhs = vector(vec![point(
+            &[("__name__", "b"), ("instance", "i1"), ("job", "y")],
+            8.0,
+        )]);
+
+        // `on` keeps only the matching labels in the result.
+        let on = VectorMatching {
+            on: true,
+            matching_labels: vec!["instance".to_string()],
+            ..VectorMatching::default()
+        };
+        let result = binary_vectors(BinaryOp::Div, &lhs, &rhs, false, &on).unwrap();
+        assert_eq!(
+            rendered(&result),
+            vec![("{instance=\"i1\"}".to_string(), 0.25)]
+        );
+
+        // `ignoring(job)` keeps the rest of the left labels, minus `__name__`
+        // (arithmetic changes the metric's meaning).
+        let ignoring = VectorMatching {
+            matching_labels: vec!["job".to_string()],
+            ..VectorMatching::default()
+        };
+        let result = binary_vectors(BinaryOp::Div, &lhs, &rhs, false, &ignoring).unwrap();
+        assert_eq!(
+            rendered(&result),
+            vec![("{instance=\"i1\"}".to_string(), 0.25)]
+        );
+    }
+
+    #[test]
+    fn test_unmatched_series_are_dropped() {
+        let lhs = vector(vec![
+            point(&[("__name__", "a"), ("instance", "i1")], 1.0),
+            point(&[("__name__", "a"), ("instance", "i2")], 2.0),
+        ]);
+        let rhs = vector(vec![point(&[("__name__", "b"), ("instance", "i1")], 10.0)]);
+        let matching = VectorMatching {
+            on: true,
+            matching_labels: vec!["instance".to_string()],
+            ..VectorMatching::default()
+        };
+        let result = binary_vectors(BinaryOp::Sub, &lhs, &rhs, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&result),
+            vec![("{instance=\"i1\"}".to_string(), -9.0)]
+        );
+    }
+
+    #[test]
+    fn test_group_left_copies_labels_from_the_one_side() {
+        // The left side is the "many" side: two series share `job="api"`.
+        let lhs = vector(vec![
+            point(
+                &[("__name__", "errors"), ("job", "api"), ("code", "500")],
+                1.0,
+            ),
+            point(
+                &[("__name__", "errors"), ("job", "api"), ("code", "503")],
+                3.0,
+            ),
+        ]);
+        // The right side is the "one" side, with a `version` only it knows.
+        let rhs = vector(vec![point(
+            &[("__name__", "requests"), ("job", "api"), ("version", "v2")],
+            4.0,
+        )]);
+        let matching = VectorMatching {
+            on: true,
+            matching_labels: vec!["job".to_string()],
+            card: Cardinality::ManyToOne,
+            include: vec!["version".to_string()],
+        };
+        let result = binary_vectors(BinaryOp::Div, &lhs, &rhs, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&result),
+            vec![
+                (
+                    "{code=\"500\",job=\"api\",version=\"v2\"}".to_string(),
+                    0.25
+                ),
+                (
+                    "{code=\"503\",job=\"api\",version=\"v2\"}".to_string(),
+                    0.75
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_group_right_mirrors_group_left() {
+        // `one group_right many` (one-to-many): the right side is the "many"
+        // side, so the pair is evaluated as `many group_left one` and the
+        // operand order is restored when applying the operator.
+        let one = vector(vec![point(
+            &[("__name__", "b"), ("instance", "i1"), ("y", "k")],
+            20.0,
+        )]);
+        let many = vector(vec![
+            point(&[("__name__", "a"), ("instance", "i1"), ("x", "1")], 10.0),
+            point(&[("__name__", "a"), ("instance", "i1"), ("x", "2")], 2.0),
+        ]);
+        let matching = VectorMatching {
+            on: true,
+            matching_labels: vec!["instance".to_string()],
+            card: Cardinality::OneToMany,
+            include: vec!["y".to_string()],
+        };
+        // `one / many`: 20/10 and 20/2, not the inverse.
+        let result = binary_vectors(BinaryOp::Div, &one, &many, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&result),
+            vec![
+                ("{instance=\"i1\",x=\"1\",y=\"k\"}".to_string(), 2.0),
+                ("{instance=\"i1\",x=\"2\",y=\"k\"}".to_string(), 10.0),
+            ]
+        );
+        // A filtering comparison reports the left (one-side) value and keeps
+        // `__name__` — and with `group_right` the labels come from the *many*
+        // side of the query, which after the swap is the original right
+        // operand, so the name is `a`.
+        let result = binary_vectors(BinaryOp::Gt, &one, &many, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&result),
+            vec![
+                (
+                    "{__name__=\"a\",instance=\"i1\",x=\"1\",y=\"k\"}".to_string(),
+                    20.0
+                ),
+                (
+                    "{__name__=\"a\",instance=\"i1\",x=\"2\",y=\"k\"}".to_string(),
+                    20.0
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_matching_errors_name_the_problem() {
+        // A match key that repeats on the "one" side is ambiguous.
+        let lhs = vector(vec![point(&[("__name__", "a"), ("instance", "i1")], 1.0)]);
+        let rhs = vector(vec![
+            point(&[("__name__", "b"), ("instance", "i1"), ("code", "1")], 1.0),
+            point(&[("__name__", "b"), ("instance", "i1"), ("code", "2")], 2.0),
+        ]);
+        let matching = VectorMatching {
+            on: true,
+            matching_labels: vec!["instance".to_string()],
+            ..VectorMatching::default()
+        };
+        let error = binary_vectors(BinaryOp::Add, &lhs, &rhs, false, &matching).unwrap_err();
+        assert!(error.message().contains("found duplicate series"));
+        assert!(error
+            .message()
+            .contains("many-to-many matching not allowed"));
+
+        // One-to-one matching that would emit two results for one series must
+        // tell the caller to use `group_left`.
+        let many = vector(vec![
+            point(&[("__name__", "a"), ("instance", "i1")], 1.0),
+            point(&[("__name__", "a"), ("instance", "i1")], 2.0),
+        ]);
+        let one = vector(vec![point(&[("__name__", "b"), ("instance", "i1")], 1.0)]);
+        let error = binary_vectors(BinaryOp::Add, &many, &one, false, &matching).unwrap_err();
+        assert!(error.message().contains("multiple matches for labels"));
+        assert!(error.message().contains("group_left/group_right"));
+
+        // Two results with identical labels are refused too, even with
+        // grouping: they would be the same series twice.
+        let grouped = VectorMatching {
+            on: true,
+            matching_labels: vec!["instance".to_string()],
+            card: Cardinality::ManyToOne,
+            include: Vec::new(),
+        };
+        let error = binary_vectors(BinaryOp::Add, &many, &one, false, &grouped).unwrap_err();
+        assert!(error
+            .message()
+            .contains("grouping labels must ensure unique matches"));
+
+        // Many-to-many is reserved for set operators.
+        let many_to_many = VectorMatching {
+            card: Cardinality::ManyToMany,
+            ..VectorMatching::default()
+        };
+        let error = binary_vectors(BinaryOp::Add, &lhs, &rhs, false, &many_to_many).unwrap_err();
+        assert!(error.message().contains("only allowed for set operators"));
+    }
+
+    #[test]
+    fn test_set_operators_use_the_match_key() {
+        // Different `code`, same `instance`: `on(instance)` pairs them.
+        let lhs = vector(vec![
+            point(
+                &[("__name__", "a"), ("instance", "i1"), ("code", "500")],
+                1.0,
+            ),
+            point(
+                &[("__name__", "a"), ("instance", "i2"), ("code", "500")],
+                2.0,
+            ),
+        ]);
+        let rhs = vector(vec![point(
+            &[("__name__", "b"), ("instance", "i1"), ("code", "200")],
+            3.0,
+        )]);
+        let matching = VectorMatching {
+            on: true,
+            matching_labels: vec!["instance".to_string()],
+            card: Cardinality::ManyToMany,
+            include: Vec::new(),
+        };
+        let and = binary_vectors(BinaryOp::And, &lhs, &rhs, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&and),
+            vec![(
+                "{__name__=\"a\",code=\"500\",instance=\"i1\"}".to_string(),
+                1.0
+            )]
+        );
+        // `unless` keeps the left series the right side does not match.
+        let unless = binary_vectors(BinaryOp::Unless, &lhs, &rhs, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&unless),
+            vec![(
+                "{__name__=\"a\",code=\"500\",instance=\"i2\"}".to_string(),
+                2.0
+            )]
+        );
+        // `or on(instance)` keeps every left series and only adds right ones
+        // whose match key is absent on the left: `b` matches `i1`, so it is
+        // dropped. Set operators pass their input through, `__name__`
+        // included.
+        let or = binary_vectors(BinaryOp::Or, &lhs, &rhs, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&or),
+            vec![
+                (
+                    "{__name__=\"a\",code=\"500\",instance=\"i1\"}".to_string(),
+                    1.0
+                ),
+                (
+                    "{__name__=\"a\",code=\"500\",instance=\"i2\"}".to_string(),
+                    2.0
+                ),
+            ]
+        );
+        // With the default match key `code` is part of it, so nothing on the
+        // left matches and both sides survive.
+        let or_default = binary_vectors(
+            BinaryOp::Or,
+            &lhs,
+            &rhs,
+            false,
+            &VectorMatching {
+                card: Cardinality::ManyToMany,
+                ..VectorMatching::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rendered(&or_default),
+            vec![
+                (
+                    "{__name__=\"a\",code=\"500\",instance=\"i1\"}".to_string(),
+                    1.0
+                ),
+                (
+                    "{__name__=\"a\",code=\"500\",instance=\"i2\"}".to_string(),
+                    2.0
+                ),
+                (
+                    "{__name__=\"b\",code=\"200\",instance=\"i1\"}".to_string(),
+                    3.0
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comparison_keeps_the_name_unless_bool() {
+        let lhs = vector(vec![point(&[("__name__", "a"), ("instance", "i1")], 5.0)]);
+        let rhs = vector(vec![point(&[("__name__", "b"), ("instance", "i1")], 1.0)]);
+        let matching = VectorMatching {
+            on: true,
+            matching_labels: vec!["instance".to_string()],
+            ..VectorMatching::default()
+        };
+        // With the default matching a filtering comparison keeps the left
+        // series' labels, `__name__` included.
+        let filtered =
+            binary_vectors(BinaryOp::Gt, &lhs, &rhs, false, &VectorMatching::default()).unwrap();
+        assert_eq!(
+            rendered(&filtered),
+            vec![("{__name__=\"a\",instance=\"i1\"}".to_string(), 5.0)]
+        );
+        // `on(...)` narrows the result to the matching labels, so `__name__`
+        // is gone even though the comparison only filters: Prometheus'
+        // `resultMetric` calls `Keep` for a one-to-one `on` match.
+        let narrowed = binary_vectors(BinaryOp::Gt, &lhs, &rhs, false, &matching).unwrap();
+        assert_eq!(
+            rendered(&narrowed),
+            vec![("{instance=\"i1\"}".to_string(), 5.0)]
+        );
+        // `bool` reports 1 and drops `__name__`.
+        let boolean = binary_vectors(BinaryOp::Gt, &lhs, &rhs, true, &matching).unwrap();
+        assert_eq!(
+            rendered(&boolean),
+            vec![("{instance=\"i1\"}".to_string(), 1.0)]
+        );
+        // A filtering comparison that fails emits nothing.
+        let failed = binary_vectors(BinaryOp::Lt, &lhs, &rhs, false, &matching).unwrap();
+        assert!(failed.is_empty());
     }
 }

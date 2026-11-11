@@ -1069,6 +1069,41 @@ mod tests {
             })
             .collect();
         backend.write(buckets).await.unwrap();
+        // Two more metrics sharing nothing but `job`, for vector matching:
+        // `http_errors` has three series (two on `job="api"`, so an
+        // `on(job)` one-to-one match against it must be refused), and
+        // `http_retries` has exactly one per job, with a `zone` label that
+        // only the "one" side knows.
+        let extra = {
+            let mut samples = Vec::new();
+            let mut push = |name: &[u8], job: &[u8], other: Option<(&[u8], &[u8])>, value: f64| {
+                let mut labels = vec![Label {
+                    name: b"job".to_vec(),
+                    value: job.to_vec(),
+                }];
+                if let Some((label, label_value)) = other {
+                    labels.push(Label {
+                        name: label.to_vec(),
+                        value: label_value.to_vec(),
+                    });
+                }
+                samples.push(Sample {
+                    name: name.to_vec(),
+                    labels,
+                    timestamp: now - 1_000,
+                    value,
+                    name_id: None,
+                    series_id: None,
+                });
+            };
+            push(b"http_errors", b"api", Some((b"code", b"500")), 1.0);
+            push(b"http_errors", b"api", Some((b"code", b"503")), 2.0);
+            push(b"http_errors", b"db", Some((b"code", b"500")), 4.0);
+            push(b"http_retries", b"api", Some((b"zone", b"z1")), 2.0);
+            push(b"http_retries", b"db", Some((b"zone", b"z2")), 4.0);
+            samples
+        };
+        backend.write(extra).await.unwrap();
         backend.flush_all().await.unwrap();
 
         let app = actix_web::test::init_service(
@@ -1399,5 +1434,119 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        // Vector matching: `http_requests` and `http_retries` share only `job`,
+        // so an unmodified `a / b` would not pair anything and `on(job)`
+        // pairs them per job. At `now` the last samples are 3 and 13 for
+        // requests (api/db) and 2 and 4 for retries: 1.5 and 3.25.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "http_requests / on(job) http_retries"),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2);
+        for series in result {
+            let expected = match series["metric"]["job"].as_str().unwrap() {
+                "api" => 1.5,
+                "db" => 3.25,
+                other => panic!("unexpected job {other}"),
+            };
+            // `on` keeps exactly the matching labels, and arithmetic drops
+            // `__name__`.
+            assert_eq!(
+                series["metric"].as_object().unwrap().len(),
+                1,
+                "only `job` survives `on(job)`"
+            );
+            let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
+            assert!((value - expected).abs() < 1e-9, "got {value}");
+        }
+
+        // `group_left(zone)` copies `zone` from the "one" side (`retries`) onto
+        // every matching `errors` series: 1/2, 2/2 and 4/4.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        (
+                            "query",
+                            "http_errors / on(job) group_left(zone) http_retries",
+                        ),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 3);
+        for series in result {
+            let job = series["metric"]["job"].as_str().unwrap();
+            let code = series["metric"]["code"].as_str().unwrap();
+            let zone = series["metric"]["zone"].as_str().unwrap();
+            let expected = match (job, code, zone) {
+                ("api", "500", "z1") => 0.5,
+                ("api", "503", "z1") => 1.0,
+                ("db", "500", "z2") => 1.0,
+                other => panic!("unexpected labels {other:?}"),
+            };
+            let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
+            assert!((value - expected).abs() < 1e-9, "got {value}");
+        }
+
+        // Two `errors` series on one `job` make a one-to-one `on(job)` match
+        // ambiguous; the error says so instead of picking one.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "http_requests / on(job) http_errors"),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body: Value = actix_web::test::read_body_json(response).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("found duplicate series"));
+
+        // Set operators use the same match key and pass their input through
+        // unchanged, `__name__` included: every `errors` job also appears in
+        // `retries`, so `and on(job)` keeps all three series.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "http_errors and on(job) http_retries"),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 3);
+        for series in result {
+            assert_eq!(series["metric"]["__name__"], "http_errors");
+        }
     }
 }

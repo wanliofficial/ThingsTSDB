@@ -236,10 +236,27 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - **二元运算**：算术 `+ - * / % ^`、比较 `== != > < >= <=`（含 `bool` 修饰符）、
     集合运算 `and / or / unless`；标量-向量与向量-向量（按除 `__name__` 外的全标签
     精确匹配）；算术结果丢弃 `__name__`，比较过滤时保留左侧标签与原值。
+  - **向量匹配**（2026-11-11 补齐）：`on(...)` / `ignoring(...)` /
+    `group_left(...)` / `group_right(...)`，语义照抄 Prometheus 的
+    `VectorBinop`/`resultMetric`：
+    - 匹配键 = `on` 列的标签，或「除 `__name__` 与 `ignoring` 列出的标签外的全部
+      标签」；右侧是 "one" 侧，`group_right` 按镜像的 `group_left` 求值再还原
+      操作数顺序（`a group_right b` 的除法不会算成 `b / a`）；
+    - "one" 侧同一匹配键出现两条序列 → 报错并列出两条序列，指出这是一次
+      隐式的 many-to-many；
+    - one-to-one 匹配下同一条左侧序列被匹配两次 → 报错提示必须显式写
+      `group_left`/`group_right`；`group_x` 下结果标签重复 → 报错提示分组标签
+      必须保证唯一；
+    - one-to-one 结果里 `on` 只保留匹配标签、`ignoring` 删掉这些标签；
+      `group_x(...)` 的标签取自 "one" 侧；算术与 `bool` 比较丢弃 `__name__`，
+      过滤型比较保留；
+    - 集合运算强制 many-to-many（出现 `group_x` 直接报错），样本原样透传
+      并保留 `__name__`；
+    - 标量一侧带匹配修饰符、集合运算用于标量表达式，都报错而不是静默忽略；
+      Prometheus 的 `fill`/`fill_left`/`fill_right` 明确点名不支持。
   - **明确不实现**并以 `errorType=bad_data` 点名的能力：子查询 `[...:...]`、
-    `on(...)`/`ignoring(...)`/`group_left`/`group_right` 向量匹配、`label_replace`/
-    `label_join`。理由写在模块文档里：面板想要的 `a + on(instance) b` 若被静默
-    当成 `a + b`，画出的线是错的，比直接报错更糟。
+    `label_replace`/`label_join`。理由写在模块文档里：这些能力若被静默近似，
+    画出的线是错的，比直接报错更糟。
   - **求值策略**：每个选择器只向引擎要一次**原始样本**，窗口由表达式里最远的
     `offset`/`@`/range 推出（`Expr::scan_window`），之后每个 step 在内存里按
     Prometheus 的取点规则求值（即时选择器取 5 分钟回看内的最后一个样本，区间向量
@@ -253,9 +270,19 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     复合时长（`1h30m`）、四种匹配符与引号转义、聚合分组键（`by`/`without` 对
     `__name__` 的处理）、计数器回绕下的 `rate`/`increase`/`delta`/`changes`/`resets`、
     分位数插值、以及「不支持的构造必须报出具体名字」。
+  - 向量匹配的单元测试覆盖：修饰符的解析形状（`on`/`ignoring`/`group_left`/
+    `group_right` 是否带标签、`bool` 的顺序、集合运算隐式 many-to-many）、`on` 与
+    `ignoring` 对结果标签的取舍、"one" 侧重复匹配键与 one-to-one 重复匹配的报错
+    文案、`group_left` 从 "one" 侧取标签、`group_right` 的镜像求值（除法与比较的
+    操作数顺序）、未匹配序列被丢弃、`and`/`or`/`unless` 按匹配键过滤并保留
+    `__name__`、以及 `bool` 比较丢弃 `__name__` 而过滤型比较保留。
   - 端到端测试（走 actix 路由 + 真实引擎）覆盖：`sum by (job)` 出两条序列、
     `rate(metric[60s])` 对 0,1,2,3（10 s 间隔）算出 0.1/s、`topk`、比较过滤与
-    算术丢弃 `__name__`、子查询与 `rate(裸选择器)` 返回 400 `bad_data`。
+    算术丢弃 `__name__`、`http_requests / on(job) http_retries` 得到 1.5/3.25、
+    `group_left(zone)` 把 `zone` 带到三条 `errors` 序列上、`on(job)` 匹配
+    两条同 `job` 序列时返回 400 并报 `found duplicate series`、
+    `and on(job)` 保留 `__name__`，以及子查询与 `rate(裸选择器)` 返回 400
+    `bad_data`。
   - 已有 `/api/v1/query`、`/api/v1/last`、`/api/v1/query_range` 保持原有的引擎形状
     响应不变（ADR §12.5、roadmap 均按该形状描述），新接口挂独立前缀。
 - 已完成（2026-11-11）：MetricsQL 子集（同一个 `server::promql` 求值器）。
