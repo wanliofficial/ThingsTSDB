@@ -346,6 +346,16 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   pending。回归测试 `test_taken_batch_stays_searchable_until_its_part_is_published`
   在去掉 `flushing` 合并后立刻失败（读到 0 条），`test_aborted_batch_returns_to_pending`
   覆盖失败回滚。
+- 已完成（2026-11-11）：修掉重启后 part id 复用导致的首次刷盘失败。`PartManager` 的
+  part id 来自内存计数器 `next_part_id`，新进程从 0 开始；而 `recover_from_disk` 只把
+  `parts.json` 里的 part 重新注册，没有把计数器推到已有 part 之后。于是**每次重启后**
+  第一次 `flush_once` 都会尝试分配 `part-…0001`，与磁盘上已存在的同名目录冲突，
+  `PartWriter::finish` 返回 `part … already has a metadata.json`，该轮刷盘失败（行被
+  `abort_flush` 放回 pending），要等计数器追平历史高水位才能恢复写入。实测在重启的
+  server 上复现（`part-manager loop error`）。现在 `recover_from_disk` 结束时扫描目录，
+  把 `part-*` / `merge-*`（含中断合并留下的残留）里的最大 id 推进到计数器。
+  回归测试 `test_flush_after_restart_does_not_reuse_a_part_id`：刷出一个 part，新
+  `PartManager` 恢复后再刷，断言成功且新 part 与旧 part 目录不同。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层。
 - 已完成（2026-11-11）：静态分片、quorum 副本与按前缀复制的再平衡。
   `metric_engine::cluster` 是一张纯函数的放置表 + 每 `(node, shard)` 一个引擎目录：

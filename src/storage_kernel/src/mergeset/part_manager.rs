@@ -422,7 +422,48 @@ impl PartManager {
                 }
             }
         }
+        // Part ids come from an in-memory counter that starts at zero in a
+        // fresh process. Without this, the first flush after a restart would
+        // allocate `part-…0001`, collide with the part already on disk, and
+        // fail; every following flush would collide in turn until the counter
+        // caught up with the high-water mark, so a restarted index could not
+        // be written to for as many intervals as it had parts.
+        self.advance_part_id_past_disk();
         Ok(recovered)
+    }
+
+    /// Moves the part-id counter past every part directory already present.
+    ///
+    /// Both live parts and leftovers from an interrupted merge count: any name
+    /// that exists is unusable as a new id.
+    fn advance_part_id_past_disk(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut highest = 0u64;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some((tag, id)) = name.split_once('-') else {
+                continue;
+            };
+            if tag != "part" && tag != "merge" {
+                continue;
+            }
+            let Ok(id) = u64::from_str_radix(id, 16) else {
+                continue;
+            };
+            highest = highest.max(id);
+        }
+        if highest == 0 {
+            return;
+        }
+        let mut next = self.next_part_id.lock().unwrap_or_else(|e| e.into_inner());
+        if *next < highest {
+            *next = highest;
+        }
     }
 
     /// Replays index WAL frames that are not yet covered by a persisted part
@@ -823,6 +864,42 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 1_000);
+    }
+
+    /// A restart must not reuse a part id that already exists on disk: doing so
+    /// made the first flush after every restart fail with
+    /// `part … already has a metadata.json`.
+    #[test]
+    fn test_flush_after_restart_does_not_reuse_a_part_id() {
+        let dir = TempDir::new();
+        {
+            let table = Arc::new(Mutex::new(Table::new()));
+            let pm = PartManager::new(table.clone(), &dir.0, ManagerConfig::default());
+            for item in make_items(100) {
+                table.lock().unwrap().add(&item);
+            }
+            pm.flush_once().unwrap();
+            assert_eq!(pm.file_parts().len(), 1);
+        }
+        // Second "process": the id counter restarts at zero while
+        // `part-…0001` sits in the directory.
+        let table = Arc::new(Mutex::new(Table::new()));
+        let pm = PartManager::new(table.clone(), &dir.0, ManagerConfig::default());
+        assert_eq!(pm.recover_from_disk().unwrap(), 1);
+        for item in make_items(50) {
+            table.lock().unwrap().add(&item);
+        }
+        let outcome = pm
+            .flush_once()
+            .expect("a flush after restart must not reuse an existing part id");
+        assert!(outcome.flushed);
+        assert_eq!(outcome.file_parts, 2);
+        let names: std::collections::HashSet<PathBuf> = pm
+            .file_parts()
+            .iter()
+            .map(|p| p.path().to_path_buf())
+            .collect();
+        assert_eq!(names.len(), 2, "the two parts must live in different dirs");
     }
 
     #[test]
