@@ -3434,6 +3434,8 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
+ "temp-dir",
+ "test-log",
  "tokio",
  "toml",
  "tracing",

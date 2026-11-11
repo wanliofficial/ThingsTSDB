@@ -17,6 +17,7 @@
 
 mod config;
 mod metrics;
+mod prometheus;
 
 use std::{
     fs,
@@ -672,7 +673,7 @@ fn convert_request(request: &RemoteWriteRequest) -> Vec<Sample> {
 /// static cluster of `(node, shard)` engines. The handlers only ever see this
 /// enum, so the endpoints do not care which one is behind them.
 #[derive(Clone)]
-enum Backend {
+pub(crate) enum Backend {
     Single(MetricEngineRef),
     Cluster(Arc<metric_engine::Cluster>),
 }
@@ -744,16 +745,16 @@ impl Backend {
     }
 }
 
-struct AppState {
-    backend: Backend,
+pub(crate) struct AppState {
+    pub(crate) backend: Backend,
     /// The static topology, when the server runs as a cluster. Kept so the
     /// rebalance endpoint can recompute placement.
-    cluster_map: Option<metric_engine::ShardMap>,
+    pub(crate) cluster_map: Option<metric_engine::ShardMap>,
     /// Object store and engine root, needed by the rebalance endpoint.
-    store: ObjectStoreRef,
-    root: String,
-    keep_writing: Arc<AtomicBool>,
-    metrics: ServerMetrics,
+    pub(crate) store: ObjectStoreRef,
+    pub(crate) root: String,
+    pub(crate) keep_writing: Arc<AtomicBool>,
+    pub(crate) metrics: ServerMetrics,
 }
 
 pub fn main() {
@@ -878,6 +879,13 @@ pub fn main() {
                 .service(stats_json)
                 .service(cluster_json)
                 .service(rebalance_endpoint)
+                // Prometheus HTTP API, so Grafana's Prometheus data source can
+                // read this server directly (roadmap Phase 3).
+                .service(prometheus::query_endpoint)
+                .service(prometheus::query_range_endpoint)
+                .service(prometheus::series_endpoint)
+                .service(prometheus::labels_endpoint)
+                .service(prometheus::label_values_endpoint)
         })
         .workers(4)
         .bind(("127.0.0.1", port))
@@ -949,5 +957,215 @@ fn bench_write(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use columnar_storage::{
+        config::StorageConfig, storage::StorageRuntimes, types::ObjectStoreRef,
+    };
+    use metric_engine::{IndexMode, Label};
+    use object_store::local::LocalFileSystem;
+    use serde_json::Value;
+
+    use super::*;
+
+    /// Opens a single-engine backend over a scratch directory.
+    async fn backend(root: &str) -> Backend {
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let runtimes = StorageRuntimes::new(rt.clone(), rt);
+        let store: ObjectStoreRef = Arc::new(LocalFileSystem::new());
+        let engine = MetricEngine::try_open_with_index_mode(
+            root,
+            std::time::Duration::from_secs(8 * 3600),
+            store,
+            StorageConfig::default(),
+            runtimes,
+            IndexMode::New,
+        )
+        .await
+        .unwrap();
+        Backend::Single(Arc::new(engine))
+    }
+
+    fn state(backend: Backend, root: &str) -> AppState {
+        AppState {
+            backend,
+            cluster_map: None,
+            store: Arc::new(LocalFileSystem::new()),
+            root: root.to_string(),
+            keep_writing: Arc::new(AtomicBool::new(false)),
+            metrics: ServerMetrics::default(),
+        }
+    }
+
+    /// Percent-encodes a query-string value (actix needs the URI already
+    /// escaped, since a selector contains `{`, `"` and `,`).
+    fn encode(raw: &str) -> String {
+        let mut out = String::new();
+        for byte in raw.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
+    }
+
+    fn qs(pairs: &[(&str, &str)]) -> String {
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={}", encode(v)))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    /// The Prometheus endpoints must answer real engine data, not just parse a
+    /// query: this writes two series and checks the instant, range, series and
+    /// label answers Grafana would consume. Requests go through the actix
+    /// router, so path and query-parameter wiring is covered too.
+    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+    async fn test_prometheus_endpoints_serve_engine_data() {
+        let dir = temp_dir::TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let backend = backend(&root).await;
+        let now = common::now();
+        let samples: Vec<Sample> = ["api", "db"]
+            .iter()
+            .enumerate()
+            .flat_map(|(i, job)| {
+                (0..4).map(move |t| Sample {
+                    name: b"http_requests".to_vec(),
+                    labels: vec![Label {
+                        name: b"job".to_vec(),
+                        value: job.as_bytes().to_vec(),
+                    }],
+                    timestamp: now - (4 - t) * 10_000,
+                    value: (i * 10 + t as usize) as f64,
+                    name_id: None,
+                    series_id: None,
+                })
+            })
+            .collect();
+        backend.write(samples).await.unwrap();
+        backend.flush_all().await.unwrap();
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(Data::new(state(backend, &root)))
+                .service(prometheus::query_endpoint)
+                .service(prometheus::query_range_endpoint)
+                .service(prometheus::series_endpoint)
+                .service(prometheus::labels_endpoint)
+                .service(prometheus::label_values_endpoint),
+        )
+        .await;
+
+        let now_s = now as f64 / 1_000.0;
+        let start_s = (now - 60_000) as f64 / 1_000.0;
+        let time = now_s.to_string();
+        let start = start_s.to_string();
+
+        // Instant query: one series, `vector` shape, value as a string.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[("query", r#"http_requests{job="api"}"#), ("time", &time),])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["data"]["resultType"], "vector");
+        assert_eq!(body["data"]["result"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["data"]["result"][0]["metric"]["__name__"],
+            "http_requests"
+        );
+        assert_eq!(body["data"]["result"][0]["metric"]["job"], "api");
+
+        // Range query: every series, `matrix` shape, points never past `end`.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query_range?{}",
+                    qs(&[
+                        ("query", "http_requests"),
+                        ("start", &start),
+                        ("end", &time),
+                        ("step", "10"),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(body["data"]["resultType"], "matrix");
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2);
+        for series in result {
+            for point in series["values"].as_array().unwrap() {
+                assert!(point[0].as_f64().unwrap() <= now_s);
+            }
+        }
+
+        // Label discovery, as a Grafana template variable would use it.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/label/job/values?{}",
+                    qs(&[("match[]", "http_requests")])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(body["data"], serde_json::json!(["api", "db"]));
+
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/series?{}",
+                    qs(&[("match[]", r#"http_requests{job!="db"}"#)])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"][0]["job"], "api");
+
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/labels?{}",
+                    qs(&[("match[]", "http_requests")])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(body["data"], serde_json::json!(["__name__", "job"]));
+
+        // An unsupported expression is a `bad_data` error, not a wrong answer.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[("query", "rate(http_requests[5m])")])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body: Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["errorType"], "bad_data");
     }
 }

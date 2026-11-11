@@ -201,6 +201,26 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   Last Cache（每序列最新值）；rollup 表（1m/1h）与自动选择。
 - 查询语言：先扩展现有 Search API（正则、label API），再评估移植 `esm-metricsql`/`esm-promql`
   的 MetricsQL 子集；Grafana 对接。
+- 已完成（部分，2026-11-11）：Grafana 对接（Prometheus HTTP API 兼容层）。
+  `server::prometheus` 在 `/prom/api/v1/*` 下按 Prometheus 的响应信封作答，
+  Grafana 的 Prometheus 数据源可直连，无需中间转换器：
+  - `GET /prom/api/v1/query`（即时值，`resultType=vector`，默认回看 5 分钟，与
+    Prometheus 一致）、`GET /prom/api/v1/query_range`（`resultType=matrix`，
+    `step` 以秒为单位，内部用 `search_downsampled(..., Last)` 让每个 step 桶出一点）；
+  - `GET /prom/api/v1/series`、`/prom/api/v1/labels`、`/prom/api/v1/label/<name>/values`，
+    供 dashboard 的变量下拉使用；三者只取每个序列的最新样本（走 last cache），
+    不为一个变量列表去扫全量历史；
+  - 时间戳按 Prometheus 语义用「秒」（允许小数），样本值按 Prometheus 的文本形式
+    输出（`1.0`、`NaN`、`+Inf`），`__name__` 与其余标签一起进 `metric` 对象。
+  - PromQL 只支持**选择器**子集：`metric`、`metric{a="v",b!="v",c=~"re",d!~"re"}`、
+    `{__name__="metric"}`；函数、聚合、二元运算、区间向量一律返回
+    `errorType=bad_data` 并说明原因，而不是给出一个与面板意图不符的结果。
+    解析器单独测试了引号内转义与逗号切分（`m{path="/a\",b"}`）。
+  - 实测捕获并修掉一个语义偏差：降采样桶按 epoch 对齐，末桶可能被标到 `end` 之后
+    （15 s step 时出现 `end + 15 s` 的点），Grafana 会把这一步画到面板范围外；
+    `clip_to_window` 现在裁掉 `end` 之后的点，并丢掉因此变空的序列。
+  - 已有 `/api/v1/query`、`/api/v1/last`、`/api/v1/query_range` 保持原有的引擎形状
+    响应不变（ADR §12.5、roadmap 均按该形状描述），新接口挂独立前缀。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
