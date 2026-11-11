@@ -206,7 +206,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   Grafana 的 Prometheus 数据源可直连，无需中间转换器：
   - `GET /prom/api/v1/query`（即时值，`resultType=vector`，默认回看 5 分钟，与
     Prometheus 一致）、`GET /prom/api/v1/query_range`（`resultType=matrix`，
-    `step` 以秒为单位，内部用 `search_downsampled(..., Last)` 让每个 step 桶出一点）；
+    `step` 以秒为单位，在 `[start, end]` 上逐 step 求值，见下面 PromQL 子集一节）；
   - `GET /prom/api/v1/series`、`/prom/api/v1/labels`、`/prom/api/v1/label/<name>/values`，
     供 dashboard 的变量下拉使用；三者只取每个序列的最新样本（走 last cache），
     不为一个变量列表去扫全量历史；
@@ -219,6 +219,42 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 实测捕获并修掉一个语义偏差：降采样桶按 epoch 对齐，末桶可能被标到 `end` 之后
     （15 s step 时出现 `end + 15 s` 的点），Grafana 会把这一步画到面板范围外；
     `clip_to_window` 现在裁掉 `end` 之后的点，并丢掉因此变空的序列。
+- 已完成（2026-11-11）：PromQL 表达式子集（`server::promql`）。
+  `/prom/api/v1/query` 与 `/query_range` 从「只认选择器」升级为一个真正的求值器：
+  - **选择器**：`metric`、`metric{a="v",b!="v",c=~"re",d!~"re"}`、`{__name__="metric"}`，
+    支持 `offset 5m` 与 `@ <ts>` / `@ start()` / `@ end()`；
+  - **区间向量** `metric[5m]` 与区间函数：`rate`、`irate`、`increase`、`delta`、
+    `idelta`、`changes`、`resets`、`*_over_time`（`avg/min/max/sum/count/last/stddev/
+    stdvar/quantile`）。`rate`/`increase` 按 Prometheus 规则处理计数器回绕
+    （下降视为归零后继续累加），单位是「每秒」；
+  - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp_min/clamp_max/
+    timestamp`，以及 `sort`、`sort_desc`、`absent`、`vector()`、`time()`、`pi()`；
+  - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk`，支持
+    `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
+    并保留分组标签，与 Prometheus 一致；
+  - **二元运算**：算术 `+ - * / % ^`、比较 `== != > < >= <=`（含 `bool` 修饰符）、
+    集合运算 `and / or / unless`；标量-向量与向量-向量（按除 `__name__` 外的全标签
+    精确匹配）；算术结果丢弃 `__name__`，比较过滤时保留左侧标签与原值。
+  - **明确不实现**并以 `errorType=bad_data` 点名的能力：子查询 `[...:...]`、
+    `on(...)`/`ignoring(...)`/`group_left`/`group_right` 向量匹配、`label_replace`/
+    `label_join`。理由写在模块文档里：面板想要的 `a + on(instance) b` 若被静默
+    当成 `a + b`，画出的线是错的，比直接报错更糟。
+  - **求值策略**：每个选择器只向引擎要一次**原始样本**，窗口由表达式里最远的
+    `offset`/`@`/range 推出（`Expr::scan_window`），之后每个 step 在内存里按
+    Prometheus 的取点规则求值（即时选择器取 5 分钟回看内的最后一个样本，区间向量
+    左开右闭）。这样 step 数不放大引擎调用次数。代价是这条路径不走 rollup 表
+    （`search_downsampled`），宽区间查询读的是原始点；把求值器接到 rollup 上
+    是后续工作。
+  - 区间查询按 `start + k*step` 逐点求值，因此**不会**产生晚于 `end` 的点——
+    这正是上一版用 epoch 对齐降采样后必须靠 `clip_to_window` 裁掉的偏差，新的
+    求值路径从构造上消除了它。
+  - 单元测试覆盖：运算符优先级（`1 + 2 * 3`、`^` 右结合、比较低于算术）、
+    复合时长（`1h30m`）、四种匹配符与引号转义、聚合分组键（`by`/`without` 对
+    `__name__` 的处理）、计数器回绕下的 `rate`/`increase`/`delta`/`changes`/`resets`、
+    分位数插值、以及「不支持的构造必须报出具体名字」。
+  - 端到端测试（走 actix 路由 + 真实引擎）覆盖：`sum by (job)` 出两条序列、
+    `rate(metric[60s])` 对 0,1,2,3（10 s 间隔）算出 0.1/s、`topk`、比较过滤与
+    算术丢弃 `__name__`、子查询与 `rate(裸选择器)` 返回 400 `bad_data`。
   - 已有 `/api/v1/query`、`/api/v1/last`、`/api/v1/query_range` 保持原有的引擎形状
     响应不变（ADR §12.5、roadmap 均按该形状描述），新接口挂独立前缀。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`

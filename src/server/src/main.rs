@@ -18,6 +18,7 @@
 mod config;
 mod metrics;
 mod prometheus;
+mod promql;
 
 use std::{
     fs,
@@ -1152,13 +1153,36 @@ mod tests {
         .await;
         assert_eq!(body["data"], serde_json::json!(["__name__", "job"]));
 
-        // An unsupported expression is a `bad_data` error, not a wrong answer.
+        // A PromQL aggregation over the same data: `sum` drops the labels and
+        // keeps only `__name__` for a bare selector.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query_range?{}",
+                    qs(&[
+                        ("query", "sum(http_requests)"),
+                        ("start", &start),
+                        ("end", &time),
+                        ("step", "10"),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(body["data"]["resultType"], "matrix");
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1, "an aggregation collapses to one series");
+        assert_eq!(result[0]["metric"], serde_json::json!({}));
+
+        // An unsupported construct is a `bad_data` error naming the gap, not a
+        // wrong answer.
         let response = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
                 .uri(&format!(
                     "/prom/api/v1/query?{}",
-                    qs(&[("query", "rate(http_requests[5m])")])
+                    qs(&[("query", "http_requests[5m:1m]")])
                 ))
                 .to_request(),
         )
@@ -1167,5 +1191,66 @@ mod tests {
         let body: Value = actix_web::test::read_body_json(response).await;
         assert_eq!(body["status"], "error");
         assert_eq!(body["errorType"], "bad_data");
+        assert!(body["error"].as_str().unwrap().contains("subqueries"));
+
+        // `rate` over a range selector, and a `by` aggregation: these are the
+        // two shapes most dashboard panels use.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query_range?{}",
+                    qs(&[
+                        ("query", r#"sum by (job) (http_requests)"#),
+                        ("start", &start),
+                        ("end", &time),
+                        ("step", "10"),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2, "one series per job");
+        let mut jobs: Vec<&str> = result
+            .iter()
+            .map(|series| series["metric"]["job"].as_str().unwrap())
+            .collect();
+        jobs.sort_unstable();
+        assert_eq!(jobs, vec!["api", "db"]);
+
+        // `rate` needs a range vector, so this exercises the range-selector
+        // path against stored samples.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[("query", "rate(http_requests[60s])"), ("time", &time)])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(body["status"], "success");
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2);
+        for series in result {
+            // Values are 0,1,2,3 over 10 s steps, so the rate is 0.1/s.
+            let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
+            assert!((value - 0.1).abs() < 1e-9, "got {value}");
+        }
+
+        // `rate` needs a range vector; a bare selector is rejected.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[("query", "rate(http_requests)")])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
     }
 }

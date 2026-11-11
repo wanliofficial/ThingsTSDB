@@ -45,7 +45,7 @@ use actix_web::{
     web::{self, Data},
     HttpResponse,
 };
-use metric_engine::{Label, LabelMatcher, MatcherType, SearchRequest, SeriesSamples};
+use metric_engine::{Label, LabelMatcher, MatcherType, SearchRequest};
 use serde_json::{json, Value};
 
 use crate::AppState;
@@ -297,7 +297,7 @@ fn ts_ms(raw: &str, what: &str) -> std::result::Result<i64, String> {
 }
 
 /// Prometheus renders sample values as strings to keep full f64 precision.
-fn format_value(value: f64) -> String {
+pub(crate) fn format_value(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
     }
@@ -316,7 +316,7 @@ fn format_value(value: f64) -> String {
 }
 
 /// The `metric` object of a Prometheus result: `__name__` plus every label.
-fn label_map(metric_name: &[u8], labels: &[Label]) -> serde_json::Map<String, Value> {
+pub(crate) fn label_map(metric_name: &[u8], labels: &[Label]) -> serde_json::Map<String, Value> {
     let mut map = serde_json::Map::new();
     map.insert(
         "__name__".to_string(),
@@ -332,80 +332,27 @@ fn label_map(metric_name: &[u8], labels: &[Label]) -> serde_json::Map<String, Va
 }
 
 /// Epoch seconds as the JSON number Prometheus uses (fractional is allowed).
-fn seconds_json(ms: i64) -> Value {
+pub(crate) fn seconds_json(ms: i64) -> Value {
     json!(ms as f64 / MS_PER_SEC)
-}
-
-/// One `matrix` (or `vector`) entry from a series' samples.
-fn matrix_entry(series: &SeriesSamples) -> Value {
-    json!({
-        "metric": label_map(&series.metric_name, &series.labels),
-        "values": series
-            .samples
-            .iter()
-            .map(|p| json!([seconds_json(p.timestamp), format_value(p.value)]))
-            .collect::<Vec<_>>(),
-    })
-}
-
-fn vector_entry(series: &SeriesSamples) -> Value {
-    let Some(last) = series.samples.last() else {
-        return Value::Null;
-    };
-    json!({
-        "metric": label_map(&series.metric_name, &series.labels),
-        "value": [seconds_json(last.timestamp), format_value(last.value)],
-    })
-}
-
-/// Drops points after the requested `end`.
-///
-/// Downsampling aligns buckets to epoch multiples and reports the bucket's
-/// timestamp, so the bucket containing `end` can be stamped just past it (a
-/// 15 s step ends up at `end + <15 s`). Prometheus never returns a point later
-/// than `end`, and a dashboard would draw a step outside the panel range, so
-/// the tail is trimmed here.
-fn clip_to_window(mut series: Vec<SeriesSamples>, end_ms: i64) -> Vec<SeriesSamples> {
-    for series in series.iter_mut() {
-        series.samples.retain(|p| p.timestamp <= end_ms);
-    }
-    series.retain(|s| !s.samples.is_empty());
-    series
-}
-
-fn matrix(series: &[SeriesSamples]) -> HttpResponse {
-    success(json!({
-        "resultType": "matrix",
-        "result": series.iter().map(matrix_entry).collect::<Vec<_>>(),
-    }))
-}
-
-fn vector(series: &[SeriesSamples]) -> HttpResponse {
-    success(json!({
-        "resultType": "vector",
-        "result": series
-            .iter()
-            .filter(|s| !s.samples.is_empty())
-            .map(vector_entry)
-            .collect::<Vec<_>>(),
-    }))
 }
 
 /// `GET /prom/api/v1/query_range?query=&start=&end=&step=`
 ///
-/// `step` is in seconds. Every result point is the last sample inside its
-/// `step`-aligned bucket, which is what a dashboard panel draws.
+/// `step` is in seconds. The expression is evaluated at every step in
+/// `[start, end]`, so the result never contains a point past `end`. PromQL
+/// support is described in `crate::promql`; unsupported constructs are refused
+/// with `bad_data` rather than approximated.
 #[get("/prom/api/v1/query_range")]
 pub async fn query_range_endpoint(
     data: Data<AppState>,
     params: web::Query<HashMap<String, String>>,
 ) -> HttpResponse {
-    let Some(expr) = params.get("query") else {
+    let Some(query) = params.get("query") else {
         return error("bad_data", "query is required");
     };
-    let selector = match parse_selector(expr) {
-        Ok(selector) => selector,
-        Err(message) => return error("bad_data", message),
+    let expr = match crate::promql::parse(query) {
+        Ok(expr) => expr,
+        Err(e) => return error(e.error_type(), e.message()),
     };
     let start_ms = match params.get("start").map(|v| ts_ms(v, "start")).transpose() {
         Ok(Some(v)) => v,
@@ -417,58 +364,44 @@ pub async fn query_range_endpoint(
         Ok(None) => return error("bad_data", "end is required"),
         Err(message) => return error("bad_data", message),
     };
-    if end_ms < start_ms {
-        return error("bad_data", "end must not be before start");
-    }
     let step_ms = match params.get("step").map(|v| ts_ms(v, "step")).transpose() {
-        Ok(Some(v)) if v > 0 => v,
-        Ok(Some(_)) => return error("bad_data", "step must be positive"),
+        Ok(Some(v)) => v,
         Ok(None) => return error("bad_data", "step is required"),
         Err(message) => return error("bad_data", message),
     };
 
-    match data
-        .backend
-        .search_downsampled(
-            &selector.to_request(start_ms, end_ms + 1, 0),
-            step_ms,
-            metric_engine::Aggregation::Last,
-        )
-        .await
-    {
-        Ok(series) => matrix(&clip_to_window(series, end_ms)),
-        Err(e) => error("execution", format!("query failed: {e}")),
+    match crate::promql::range_query(&data.backend, &expr, start_ms, end_ms, step_ms).await {
+        Ok(data) => success(data),
+        Err(e) => error(e.error_type(), e.message()),
     }
 }
 
 /// `GET /prom/api/v1/query?query=&time=`
 ///
-/// Returns the newest sample at or before `time`. Prometheus defaults the
-/// lookback window to five minutes; a series silent for longer has no value.
+/// Evaluates at `time` (default: now). A plain selector returns the newest
+/// sample within Prometheus' five-minute lookback; a series silent for longer
+/// has no value.
 #[get("/prom/api/v1/query")]
 pub async fn query_endpoint(
     data: Data<AppState>,
     params: web::Query<HashMap<String, String>>,
 ) -> HttpResponse {
-    const LOOKBACK_MS: i64 = 5 * 60 * 1_000;
-
-    let Some(expr) = params.get("query") else {
+    let Some(query) = params.get("query") else {
         return error("bad_data", "query is required");
     };
-    let selector = match parse_selector(expr) {
-        Ok(selector) => selector,
-        Err(message) => return error("bad_data", message),
+    let expr = match crate::promql::parse(query) {
+        Ok(expr) => expr,
+        Err(e) => return error(e.error_type(), e.message()),
     };
-    let now_ms = match params.get("time").map(|v| ts_ms(v, "time")).transpose() {
+    let at_ms = match params.get("time").map(|v| ts_ms(v, "time")).transpose() {
         Ok(Some(v)) => v,
         Ok(None) => common::now(),
         Err(message) => return error("bad_data", message),
     };
 
-    let request = selector.to_request(now_ms - LOOKBACK_MS, now_ms + 1, 0);
-    match data.backend.search(&request).await {
-        Ok(series) => vector(&series),
-        Err(e) => error("execution", format!("query failed: {e}")),
+    match crate::promql::instant_query(&data.backend, &expr, at_ms).await {
+        Ok(data) => success(data),
+        Err(e) => error(e.error_type(), e.message()),
     }
 }
 
@@ -676,69 +609,5 @@ mod tests {
         assert_eq!(ts_ms("1700000000", "t").unwrap(), 1_700_000_000_000);
         assert_eq!(ts_ms("1700000000.5", "t").unwrap(), 1_700_000_000_500);
         assert!(ts_ms("abc", "t").is_err());
-    }
-
-    #[test]
-    fn test_points_after_end_are_clipped() {
-        // A step-aligned bucket can be stamped past `end`; Prometheus never
-        // returns such a point, so it must not leak into the matrix.
-        let series = SeriesSamples {
-            metric_name: b"m".to_vec(),
-            labels: Vec::new(),
-            samples: vec![
-                metric_engine::SamplePoint {
-                    timestamp: 1_000,
-                    value: 1.0,
-                },
-                metric_engine::SamplePoint {
-                    timestamp: 2_000,
-                    value: 2.0,
-                },
-                metric_engine::SamplePoint {
-                    timestamp: 3_000,
-                    value: 3.0,
-                },
-            ],
-        };
-        let clipped = clip_to_window(vec![series], 2_000);
-        assert_eq!(clipped.len(), 1);
-        assert_eq!(clipped[0].samples.len(), 2);
-        assert_eq!(clipped[0].samples[1].timestamp, 2_000);
-
-        // A series with nothing before `end` disappears rather than rendering
-        // as an empty entry.
-        let mut empty = clipped[0].clone();
-        empty.samples.clear();
-        assert!(clip_to_window(vec![empty], 2_000).is_empty());
-    }
-
-    #[test]
-    fn test_matrix_and_vector_shapes() {
-        let series = SeriesSamples {
-            metric_name: b"http_requests".to_vec(),
-            labels: vec![Label {
-                name: b"job".to_vec(),
-                value: b"api".to_vec(),
-            }],
-            samples: vec![
-                metric_engine::SamplePoint {
-                    timestamp: 1_700_000_000_000,
-                    value: 3.0,
-                },
-                metric_engine::SamplePoint {
-                    timestamp: 1_700_000_015_000,
-                    value: 4.5,
-                },
-            ],
-        };
-        let entry = matrix_entry(&series);
-        assert_eq!(entry["metric"]["__name__"], "http_requests");
-        assert_eq!(entry["metric"]["job"], "api");
-        assert_eq!(entry["values"][0][0], 1_700_000_000.0);
-        assert_eq!(entry["values"][0][1], "3.0");
-
-        let entry = vector_entry(&series);
-        assert_eq!(entry["value"][0], 1_700_000_015.0);
-        assert_eq!(entry["value"][1], "4.5");
     }
 }
