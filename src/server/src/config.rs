@@ -70,6 +70,9 @@ pub struct MetricEngineConfig {
     /// with a longer-lived metric. Physical reclamation stays with the global
     /// segment TTL.
     pub retention: RetentionConfig,
+    /// Static sharding and replication (roadmap Phase 4). Absent (the default)
+    /// means a single local engine rooted at `storage.object_store.data_dir`.
+    pub cluster: Option<ClusterConfig>,
 }
 
 impl Default for MetricEngineConfig {
@@ -80,7 +83,47 @@ impl Default for MetricEngineConfig {
             storage: StorageConfig::default(),
             index_mode: IndexModeConfig::default(),
             retention: RetentionConfig::default(),
+            cluster: None,
         }
+    }
+}
+
+/// Static cluster topology (roadmap Phase 4).
+///
+/// ```toml
+/// [metric_engine.cluster]
+/// nodes = ["node-a", "node-b", "node-c"]
+/// shards = 64
+/// replicas = 2
+/// ```
+///
+/// Every node name is a directory under `storage.object_store.data_dir`; the
+/// server opens the `(node, shard)` engines of *every* node it is configured
+/// with. For a real multi-process deployment each process would list only its
+/// own node and reach the others over the network — this build has no
+/// inter-node RPC, so the cluster is a local simulation of the placement, used
+/// to exercise and operate the shard map.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    pub nodes: Vec<String>,
+    pub shards: usize,
+    pub replicas: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            nodes: vec!["node-a".to_string()],
+            shards: 1,
+            replicas: 1,
+        }
+    }
+}
+
+impl From<&ClusterConfig> for metric_engine::ClusterConfig {
+    fn from(config: &ClusterConfig) -> Self {
+        metric_engine::ClusterConfig::new(config.nodes.clone(), config.shards, config.replicas)
     }
 }
 
@@ -244,6 +287,50 @@ fn default_max_retries() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[metric_engine.cluster]` table parses into the engine's topology, and
+    /// leaving it out keeps the single-engine default.
+    #[test]
+    fn cluster_config_parses_into_a_topology() {
+        let body = r#"
+            [metric_engine.cluster]
+            nodes = ["node-a", "node-b", "node-c"]
+            shards = 64
+            replicas = 2
+        "#;
+        let config: Config = toml::from_str(body).unwrap();
+        let cluster = config.metric_engine.cluster.as_ref().unwrap();
+        assert_eq!(cluster.nodes, vec!["node-a", "node-b", "node-c"]);
+        assert_eq!(cluster.shards, 64);
+        assert_eq!(cluster.replicas, 2);
+
+        let topology: metric_engine::ClusterConfig = cluster.into();
+        let map = metric_engine::ShardMap::new(topology).unwrap();
+        assert_eq!(map.shard_count(), 64);
+        assert_eq!(map.replicas(), 2);
+        // Every shard has `replicas` distinct owners drawn from the node list.
+        for shard in 0..map.shard_count() {
+            let owners = map.owners(shard);
+            assert_eq!(owners.len(), 2);
+            assert_ne!(owners[0], owners[1]);
+        }
+
+        let plain: Config = toml::from_str("").unwrap();
+        assert!(plain.metric_engine.cluster.is_none());
+    }
+
+    /// A topology the engine cannot satisfy is rejected rather than silently
+    /// degraded into fewer copies.
+    #[test]
+    fn cluster_config_rejects_unreachable_replicas() {
+        let cluster = ClusterConfig {
+            nodes: vec!["a".into(), "b".into()],
+            shards: 4,
+            replicas: 3,
+        };
+        let err = metric_engine::ShardMap::new((&cluster).into()).unwrap_err();
+        assert!(err.to_string().contains("replicas must be between"));
+    }
 
     /// A `[metric_engine.retention.per_metric]` table parses into a
     /// `RetentionPolicy` keyed by metric name with millisecond windows.

@@ -18,6 +18,7 @@
 //! Metric Engine entry point.
 
 pub mod backup;
+pub mod cluster;
 pub mod data;
 pub mod engine;
 pub mod index;
@@ -30,6 +31,10 @@ pub mod rollup;
 pub mod types;
 
 pub use backup::BackupStats;
+pub use cluster::{
+    rebalance, rebalance_from_disk, Cluster, ClusterConfig, Migration, RebalanceReport, ShardMap,
+    WriteReport,
+};
 pub use engine::{MetricEngine, MetricEngineRef};
 pub use indexdb::{IndexDbManager, IndexMode, IndexQueryStats};
 pub use last_cache::{LastCache, LastValue};

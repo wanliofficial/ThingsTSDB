@@ -34,6 +34,7 @@ use actix_web::{
 };
 use bytes::Bytes as BytesBuf;
 use clap::Parser;
+use columnar_storage::types::ObjectStoreRef;
 use common::now;
 use metric_engine::{
     types::Label, Aggregation, LabelMatcher, MatcherType, MetricEngine, MetricEngineRef, Sample,
@@ -78,7 +79,7 @@ async fn toggle(data: web::Data<AppState>) -> impl Responder {
 
 #[get("/compact")]
 async fn compact(data: web::Data<AppState>) -> impl Responder {
-    if let Err(e) = data.engine.compact().await {
+    if let Err(e) = data.backend.compact().await {
         error!("compact failed, err:{e}");
     }
     HttpResponse::Ok().body("Task submit!")
@@ -108,7 +109,7 @@ async fn prometheus_write(body: Bytes, data: web::Data<AppState>) -> impl Respon
     let num_series = request.timeseries.len();
     drop(request);
 
-    match data.engine.write(samples).await {
+    match data.backend.write(samples).await {
         Ok(()) => {
             info!(num_series, "Remote write handled");
             HttpResponse::NoContent().finish()
@@ -144,7 +145,7 @@ async fn prometheus_read(body: Bytes, data: web::Data<AppState>) -> impl Respond
 
     let mut results = Vec::with_capacity(request.queries.len());
     for query in &request.queries {
-        match run_read_query(&data.engine, query).await {
+        match run_read_query(&data.backend, query).await {
             Ok(timeseries) => {
                 results.push(pb_types::prometheus::remote_read::QueryResult { timeseries })
             }
@@ -173,7 +174,7 @@ async fn prometheus_read(body: Bytes, data: web::Data<AppState>) -> impl Respond
 /// within `[start_timestamp_ms, end_timestamp_ms]` (inclusive, Prometheus
 /// semantics) are returned.
 async fn run_read_query(
-    engine: &MetricEngineRef,
+    backend: &Backend,
     query: &PbQuery,
 ) -> metric_engine::Result<Vec<pb_types::prometheus::remote_write::TimeSeries>> {
     let mut metric_name: Option<String> = None;
@@ -209,7 +210,7 @@ async fn run_read_query(
         end_ms: query.end_timestamp_ms + 1,
         limit: 0,
     };
-    let series = engine.search(&request).await?;
+    let series = backend.search(&request).await?;
     let timeseries = series
         .into_iter()
         .map(|s| pb_types::prometheus::remote_write::TimeSeries {
@@ -262,7 +263,7 @@ async fn query_json(
         }
     };
     let started = Instant::now();
-    match data.engine.search(&request).await {
+    match data.backend.search(&request).await {
         Ok(series) => {
             let samples = series.iter().map(|s| s.samples.len() as u64).sum::<u64>();
             data.metrics.observe(
@@ -317,7 +318,7 @@ async fn last_json(
         }
     };
     let started = Instant::now();
-    match data.engine.last_values(&request).await {
+    match data.backend.last_values(&request).await {
         Ok(series) => {
             data.metrics.observe(
                 QueryKind::LAST,
@@ -391,7 +392,7 @@ async fn query_range_json(
         }
     };
     let started = Instant::now();
-    match data.engine.search_downsampled(&request, step, agg).await {
+    match data.backend.search_downsampled(&request, step, agg).await {
         Ok(series) => {
             let samples = series.iter().map(|s| s.samples.len() as u64).sum::<u64>();
             data.metrics.observe(
@@ -453,6 +454,136 @@ async fn stats_json(data: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
         .body(body)
+}
+
+/// The static topology this process is serving, plus the placement it derives
+/// from it. `/api/v1/cluster` is the operator's view of where every shard
+/// lives (roadmap Phase 4: sharding, replication and rebalancing).
+#[get("/api/v1/cluster")]
+async fn cluster_json(data: web::Data<AppState>) -> impl Responder {
+    let Some(map) = &data.cluster_map else {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "mode": "single",
+            "root": data.root,
+        }));
+    };
+    let shards: Vec<serde_json::Value> = (0..map.shard_count())
+        .map(|shard| {
+            serde_json::json!({
+                "shard": shard,
+                "owners": map.owners(shard),
+            })
+        })
+        .collect();
+    HttpResponse::Ok().json(serde_json::json!({
+        "mode": "cluster",
+        "root": data.root,
+        "nodes": map.nodes(),
+        "shards": map.shard_count(),
+        "replicas": map.replicas(),
+        "placement": shards,
+    }))
+}
+
+/// Repairs the cluster: flushes every replica to a durable point, then copies
+/// any shard prefix a replica is missing from one that has it.
+///
+/// `POST /api/v1/rebalance` with no parameters refills the *current* topology,
+/// which is what a node that lost a directory or fell behind needs. Pass
+/// `nodes=a,b,c` (optionally `shards=`, `replicas=`) to plan against a new one:
+/// the copies are made, but serving the new placement needs a restart, since
+/// the open engines are fixed at startup. `plan=1` only reports what would be
+/// copied.
+#[post("/api/v1/rebalance")]
+async fn rebalance_endpoint(
+    data: web::Data<AppState>,
+    params: web::Query<std::collections::HashMap<String, String>>,
+) -> impl Responder {
+    let Some(current) = &data.cluster_map else {
+        return HttpResponse::BadRequest().body("this server does not run a cluster");
+    };
+    let plan_only = matches!(
+        params.get("plan").map(String::as_str),
+        Some("1") | Some("true")
+    );
+
+    let target = match params.get("nodes") {
+        Some(nodes) => {
+            let config = metric_engine::ClusterConfig::new(
+                nodes
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                params
+                    .get("shards")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| current.shard_count()),
+                params
+                    .get("replicas")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| current.replicas()),
+            );
+            match metric_engine::ShardMap::new(config) {
+                Ok(map) => map,
+                Err(e) => return HttpResponse::BadRequest().body(format!("bad topology: {e}")),
+            }
+        }
+        None => current.clone(),
+    };
+
+    // A copy has to see a stable object set, so publish every buffered sample
+    // first: a part that is still only in memory would not be copied.
+    if !plan_only {
+        if let Err(e) = data.backend.flush_all().await {
+            error!("rebalance flush failed, err:{e}");
+            return HttpResponse::InternalServerError()
+                .body(format!("flush before rebalance failed: {e}"));
+        }
+    }
+
+    if plan_only {
+        // `Migration` is a plain data struct in the engine crate, which does
+        // not depend on serde, so build the JSON here.
+        let migrations: Vec<serde_json::Value> = target
+            .migrations(current)
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "shard": m.shard,
+                    "added": m.added,
+                    "removed": m.removed,
+                })
+            })
+            .collect();
+        return HttpResponse::Ok().json(serde_json::json!({
+            "shards_to_copy": migrations.len(),
+            "plan": migrations,
+            "restart_required": target != *current,
+        }));
+    }
+
+    let report =
+        match metric_engine::rebalance_from_disk(data.store.as_ref(), &data.root, &target).await {
+            Ok(report) => report,
+            Err(e) => {
+                error!("rebalance failed, err:{e}");
+                return HttpResponse::InternalServerError().body(format!("rebalance failed: {e}"));
+            }
+        };
+    info!(
+        shards = report.shards_moved,
+        objects = report.objects,
+        bytes = report.bytes,
+        "Rebalance finished"
+    );
+    HttpResponse::Ok().json(serde_json::json!({
+        "shards_copied": report.shards_moved,
+        "objects": report.objects,
+        "bytes": report.bytes,
+        "restart_required": target != *current,
+    }))
 }
 
 /// Parses `metric`, `start`, `end` and an exact-match `filter` list such as
@@ -535,8 +666,92 @@ fn convert_request(request: &RemoteWriteRequest) -> Vec<Sample> {
     samples
 }
 
+/// The query/write surface the HTTP handlers talk to.
+///
+/// A deployment is either one engine (`[metric_engine.cluster]` absent) or a
+/// static cluster of `(node, shard)` engines. The handlers only ever see this
+/// enum, so the endpoints do not care which one is behind them.
+#[derive(Clone)]
+enum Backend {
+    Single(MetricEngineRef),
+    Cluster(Arc<metric_engine::Cluster>),
+}
+
+impl Backend {
+    async fn write(&self, samples: Vec<Sample>) -> metric_engine::Result<()> {
+        match self {
+            Backend::Single(engine) => engine.write(samples).await,
+            Backend::Cluster(cluster) => {
+                let report = cluster.write(samples).await?;
+                if report.failed > 0 {
+                    warn!(
+                        samples = report.samples,
+                        shards = report.shards,
+                        writes = report.writes,
+                        failed = report.failed,
+                        "replicated write degraded: a replica did not acknowledge"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn search(
+        &self,
+        request: &SearchRequest,
+    ) -> metric_engine::Result<Vec<metric_engine::SeriesSamples>> {
+        match self {
+            Backend::Single(engine) => engine.search(request).await,
+            Backend::Cluster(cluster) => cluster.search(request).await,
+        }
+    }
+
+    async fn last_values(
+        &self,
+        request: &SearchRequest,
+    ) -> metric_engine::Result<Vec<metric_engine::SeriesLatest>> {
+        match self {
+            Backend::Single(engine) => engine.last_values(request).await,
+            Backend::Cluster(cluster) => cluster.last_values(request).await,
+        }
+    }
+
+    async fn search_downsampled(
+        &self,
+        request: &SearchRequest,
+        step_ms: i64,
+        agg: Aggregation,
+    ) -> metric_engine::Result<Vec<metric_engine::SeriesSamples>> {
+        match self {
+            Backend::Single(engine) => engine.search_downsampled(request, step_ms, agg).await,
+            Backend::Cluster(cluster) => cluster.search_downsampled(request, step_ms, agg).await,
+        }
+    }
+
+    async fn compact(&self) -> metric_engine::Result<()> {
+        match self {
+            Backend::Single(engine) => engine.compact().await,
+            Backend::Cluster(cluster) => cluster.compact().await,
+        }
+    }
+
+    async fn flush_all(&self) -> metric_engine::Result<()> {
+        match self {
+            Backend::Single(engine) => engine.flush_all().await,
+            Backend::Cluster(cluster) => cluster.flush_all().await,
+        }
+    }
+}
+
 struct AppState {
-    engine: MetricEngineRef,
+    backend: Backend,
+    /// The static topology, when the server runs as a cluster. Kept so the
+    /// rebalance endpoint can recompute placement.
+    cluster_map: Option<metric_engine::ShardMap>,
+    /// Object store and engine root, needed by the rebalance endpoint.
+    store: ObjectStoreRef,
+    root: String,
     keep_writing: Arc<AtomicBool>,
     metrics: ServerMetrics,
 }
@@ -581,25 +796,55 @@ pub fn main() {
     let enable_write = config.test.enable_write;
     let write_rt = build_multi_runtime("write", write_worker_num);
     let keep_writing = Arc::new(AtomicBool::new(true));
+    let cluster_config = config.metric_engine.cluster.clone();
+    let data_dir = object_store_config.data_dir.clone();
     let _ = rt.block_on(async move {
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(
-            MetricEngine::try_open_with_index_mode(
-                &object_store_config.data_dir,
-                segment_duration,
-                store,
-                storage_opts,
-                runtimes,
-                index_mode,
-            )
-            .await
-            .unwrap()
-            .with_retention(retention),
-        );
+        let store: ObjectStoreRef = Arc::new(LocalFileSystem::new());
+        // A configured cluster replaces the single engine: every `(node,
+        // shard)` pair is an engine rooted at `{data_dir}/{node}/shard-{n}`,
+        // and the handlers go through `Backend`.
+        let (backend, cluster_map) = match cluster_config {
+            Some(ref cluster) => {
+                let map = metric_engine::ShardMap::new(cluster.into()).unwrap();
+                let opened = metric_engine::Cluster::open_with_retention(
+                    &data_dir,
+                    store.clone(),
+                    storage_opts,
+                    runtimes,
+                    map.clone(),
+                    retention,
+                )
+                .await
+                .unwrap();
+                info!(
+                    nodes = map.nodes().len(),
+                    shards = map.shard_count(),
+                    replicas = map.replicas(),
+                    "Cluster opened"
+                );
+                (Backend::Cluster(Arc::new(opened)), Some(map))
+            }
+            None => {
+                let engine = Arc::new(
+                    MetricEngine::try_open_with_index_mode(
+                        &data_dir,
+                        segment_duration,
+                        store.clone(),
+                        storage_opts,
+                        runtimes,
+                        index_mode,
+                    )
+                    .await
+                    .unwrap()
+                    .with_retention(retention),
+                );
+                (Backend::Single(engine), None)
+            }
+        };
 
         if enable_write {
             bench_write(
-                engine.clone(),
+                backend.clone(),
                 write_rt.clone(),
                 write_worker_num,
                 write_interval,
@@ -608,7 +853,10 @@ pub fn main() {
         }
 
         let app_state = Data::new(AppState {
-            engine,
+            backend,
+            cluster_map,
+            store,
+            root: data_dir,
             keep_writing,
             metrics: ServerMetrics::default(),
         });
@@ -628,6 +876,8 @@ pub fn main() {
                 .service(last_json)
                 .service(query_range_json)
                 .service(stats_json)
+                .service(cluster_json)
+                .service(rebalance_endpoint)
         })
         .workers(4)
         .bind(("127.0.0.1", port))
@@ -648,9 +898,9 @@ fn build_multi_runtime(name: &str, workers: usize) -> columnar_storage::types::R
     Arc::new(rt)
 }
 
-/// Write synthetic samples through the engine, for benchmark and demo.
+/// Write synthetic samples through the backend, for benchmark and demo.
 fn bench_write(
-    engine: MetricEngineRef,
+    backend: Backend,
     rt: columnar_storage::types::RuntimeRef,
     workers: usize,
     interval: std::time::Duration,
@@ -660,7 +910,7 @@ fn bench_write(
     const INSTANCES: [&[u8]; 4] = [b"10.0.0.1", b"10.0.0.2", b"10.0.0.3", b"10.0.0.4"];
 
     for worker_id in 0..workers {
-        let engine = engine.clone();
+        let backend = backend.clone();
         let keep_writing = keep_writing.clone();
         rt.spawn(async move {
             loop {
@@ -694,7 +944,7 @@ fn bench_write(
                         sample.timestamp += worker_id as i64;
                     }
                 }
-                if let Err(e) = engine.write(samples).await {
+                if let Err(e) = backend.write(samples).await {
                     error!("bench write failed, err:{}", e);
                 }
             }

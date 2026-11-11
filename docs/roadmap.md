@@ -327,7 +327,38 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   在去掉 `flushing` 合并后立刻失败（读到 0 条），`test_aborted_batch_returns_to_pending`
   覆盖失败回滚。
 - 对象存储（S3/OSS）数据与索引 checkpoint、冷热分层。
-- 分片/副本与再平衡。
+- 已完成（2026-11-11）：静态分片、quorum 副本与按前缀复制的再平衡。
+  `metric_engine::cluster` 是一张纯函数的放置表 + 每 `(node, shard)` 一个引擎目录：
+  - **series → shard** 用 jump consistent hash（`jump_hash`）。无状态、跨进程一致，
+    桶数从 `n` 变到 `n+1` 只搬约 `1/n` 的 series —— 这是「改分片数很便宜」的前提。
+  - **shard → node** 用 rendezvous hashing 取分数最高的 `replicas` 个节点，同分按
+    名字排序，因此每个节点各自算出的放置完全相同。加/删节点只移动它自己的 shard。
+  - 数据布局 `{root}/{node}/shard-{n}`，一个 shard 就是一个引擎根，所以**迁移一个
+    shard = 复制一个前缀**，复用 `backup::copy_prefix`；本地盘和对象存储同一套代码。
+  - 写入复制到 shard 的全部 owner，按 `replicas/2 + 1` 计 quorum；未达 quorum 返回
+    「write below quorum」错误，达到 quorum 但有副本失败则通过 `WriteReport::failed`
+    暴露降级（server 打 `warn!`），不静默吞掉。
+  - 读查询全部引擎再合并：shard 之间的 series 不相交，所以合并只在副本之间去重
+    （按 timestamp），结果按 `(metric, labels)` 排序，同一查询重复执行结果稳定。
+  - 再平衡有两种入口：`rebalance(from, to)` 有旧拓扑时按 `migrations` 只复制真正换了
+    owner 的 shard；`rebalance_from_disk(to)` 没有旧拓扑时（进程重启后的常态）直接
+    扫盘算出「某副本的前缀为空而另一个有数据」，既覆盖新节点加入，也覆盖副本目录丢失
+    后的补齐。二者都只复制、不删除；删数据是要人显式决定的操作。
+  - server 侧：`[metric_engine.cluster] nodes/shards/replicas` 配置后走 `Backend::Cluster`
+    （`write`/`search`/`last_values`/`search_downsampled`/`compact`/`flush_all` 都按
+    cluster 语义分发），`GET /api/v1/cluster` 输出放置表，`POST /api/v1/rebalance`
+    先 `flush_all` 再补副本，`?plan=1` 只出计划、`?nodes=a,b,c` 按新拓扑复制
+    （`restart_required` 提示引擎在启动时固定，换放置需重启）。
+  - 集成测试（`tests/cluster_lifecycle.rs`）走完整生命周期：写入 → 关掉重开（模拟重启）
+    → 加节点后按新拓扑复制 → 删掉一个副本目录（模拟丢盘）后自愈 → 再读。断言方式不是
+    「拿单个 shard 和集群总数比」（那只有在 shard 数 = 1 时才对），而是先按
+    `ShardMap::shard_of` 和 series key 算出每个 shard 应持有哪些 hostname，再逐
+    `(node, shard)` 目录核对，最后和集群整体读数对照，从而同时验证「放置正确」和
+    「副本齐了」两件事。
+  **明确不是共识协议**：没有选主、没有日志复制、没有自动修复。模型是「N 个节点持有同一
+  shard 的相同副本、quorum 写、读任意节点合并」；落后节点靠重拷前缀或 `restore_from`
+  追上。server 内的 cluster 是单进程内的放置模拟（每节点一个目录），因为本仓库还没有
+  节点间 RPC。
 - 已完成（2026-11-11）：TSBS IoT 场景基准。`benchmarks --bin tsbs_iot_bench`
   按 TSBS「IoT」用例的形态造数：N 台设备各带 `host`/`region` 标签，每台每 tick
   上报 8 个 reading（`temperature`、`humidity`、`pressure`、`wind_speed` 等），
