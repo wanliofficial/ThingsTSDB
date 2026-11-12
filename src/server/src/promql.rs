@@ -4528,6 +4528,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        // No `by`/`without` aggregates over all label dimensions: one group
+        // whose output labelset is empty.
         assert_eq!(group_key(&labels, None), Vec::new());
         assert_eq!(
             group_key(&labels, Some(&Grouping::By(vec!["job".into()]))),
@@ -4537,6 +4539,44 @@ mod tests {
         assert_eq!(
             group_key(&labels, Some(&Grouping::Without(vec!["instance".into()]))),
             vec![("job".to_string(), "api".to_string())]
+        );
+        // An empty `without ()` drops only `__name__`, so it groups per
+        // labelset — unlike the default above.
+        assert_eq!(
+            group_key(&labels, Some(&Grouping::Without(Vec::new()))),
+            vec![
+                ("instance".to_string(), "a".to_string()),
+                ("job".to_string(), "api".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_default_aggregation_collapses_to_one_series() {
+        // Prometheus' `sum(m)` with no `by`/`without` aggregates over every
+        // label dimension and returns a single `{}` series; `without ()` is a
+        // different thing (it keeps all labels but `__name__`).
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0), (1_000, 2.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 10.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 2_000).vector);
+        // The latest sample of each series: 2 + 10.
+        assert_eq!(run("sum(m)"), vec![("{}".to_string(), 12.0)]);
+        assert_eq!(run("count(m)"), vec![("{}".to_string(), 2.0)]);
+        assert_eq!(
+            run("count(m) without ()"),
+            vec![
+                ("{job=\"api\"}".to_string(), 1.0),
+                ("{job=\"db\"}".to_string(), 1.0)
+            ]
+        );
+        assert_eq!(
+            run("sum by (job) (m)"),
+            vec![
+                ("{job=\"api\"}".to_string(), 2.0),
+                ("{job=\"db\"}".to_string(), 10.0)
+            ]
         );
     }
 

@@ -235,7 +235,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     （`histogram_quantile` 见下面单独一条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile`，支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
-    并保留分组标签，与 Prometheus 一致；
+    并保留分组标签，与 Prometheus 一致。不写 `by`/`without` 时按官方文档「聚合
+    全部标签维度」处理，即整个向量并成一条无标签序列（`sum(m)` 只有一个
+    `{}`）；注意这与显式的 `without ()` 不同 —— 后者保留除 `__name__` 外的
+    全部标签，因此每个标签集各自一条；
   - **二元运算**：算术 `+ - * / % ^`、比较 `== != > < >= <=`（含 `bool` 修饰符）、
     集合运算 `and / or / unless`；标量-向量与向量-向量（按除 `__name__` 外的全标签
     精确匹配）；算术结果丢弃 `__name__`，比较过滤时保留左侧标签与原值。
@@ -406,6 +409,12 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`present_over_time` 对普通序列与全 NaN 序列都返回 1、空区间不出现；
     `mad_over_time` 对 `[1,2,3,4]` 得 1、单样本得 0、含 NaN 得 NaN；解析测试
     覆盖两个新函数名。
+- 已完成（2026-11-12）：钉住「不写 `by`/`without`」的默认聚合语义。查
+  Prometheus 官方文档与 `promql/engine.go`（`generateGroupingKey` 在 grouping
+  为空且非 `without` 时直接返回 0）确认：此时是**聚合全部标签维度**，整个向量
+  并成一条无标签序列，`without ()` 才是「除 `__name__` 外全标签分组」。代码原本
+  已是前者，这一轮补上回归测试 `test_default_aggregation_collapses_to_one_series`
+  与文档说明，避免再被误改成 `without ()`。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
