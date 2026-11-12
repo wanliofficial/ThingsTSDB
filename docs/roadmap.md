@@ -224,13 +224,16 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - **选择器**：`metric`、`metric{a="v",b!="v",c=~"re",d!~"re"}`、`{__name__="metric"}`，
     支持 `offset 5m` 与 `@ <ts>` / `@ start()` / `@ end()`；
   - **区间向量** `metric[5m]` 与区间函数：`rate`、`irate`、`increase`、`delta`、
-    `idelta`、`changes`、`resets`、`*_over_time`（`avg/min/max/sum/count/last/stddev/
-    stdvar/quantile`）。`rate`/`increase` 按 Prometheus 规则处理计数器回绕
-    （下降视为归零后继续累加），单位是「每秒」；
-  - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp_min/clamp_max/
-    timestamp`，以及 `sort`、`sort_desc`、`absent`、`vector()`、`time()`、`pi()`；
+    `idelta`、`changes`、`resets`、`deriv`、`*_over_time`（`avg/min/max/sum/count/
+    last/stddev/stdvar/quantile`）。`rate`/`increase` 按 Prometheus 规则处理计数器
+    回绕（下降视为归零后继续累加），单位是「每秒」；`deriv` 是最小二乘斜率
+    （每秒），只有 1 个样本时该序列不出现；
+  - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp/clamp_min/
+    clamp_max/timestamp/scalar`，以及 `sort`、`sort_desc`、`absent`、`vector()`、
+    `time()`、`pi()`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
+    days_in_month/hour/minute`；
     （`histogram_quantile` 见下面单独一条）
-  - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk`，支持
+  - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile`，支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
     并保留分组标签，与 Prometheus 一致；
   - **二元运算**：算术 `+ - * / % ^`、比较 `== != > < >= <=`（含 `bool` 修饰符）、
@@ -365,6 +368,34 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     解析期错误（非法正则/标签名/非字符串参数/缺源标签）、标量参数求值错误；端到端
     （actix 路由 + 真实引擎）覆盖 `label_replace` 派生 `instance` 且值不变、
     `label_join` 拼接 `api/`、非法正则返回 400 `bad_data`。
+- 已完成（2026-11-12）：补齐 Grafana 面板高频的 PromQL 函数。语义逐条对照
+  Prometheus 的实现：
+  - `clamp(v, min, max)`：逐样本取 `max(min, min(max, value))`，丢弃 `__name__`；
+    `max < min` 返回**空向量**（不是原值）。NaN 走 Go `math.Min/Max` 的语义，
+    即 NaN 会传播，不会被钳成边界（Rust 的 `f64::min/max` 会忽略 NaN，因此
+    `clamp` / `clamp_min` / `clamp_max` 统一改用 `go_min` / `go_max`）；
+  - `scalar(v)`：恰好 1 个浮点样本时返回该值，0 个或多个返回 `NaN`，结果是
+    `resultType=scalar`；
+  - `deriv(v[range])`：最小二乘斜率（单位「每秒」），与 `predict_linear` 共用
+    同一份 `linear_regression`。样本少于 2 个时该序列不出现；全等序列的斜率是
+    精确的 0（避免浮点噪声），全为 Infinity 时按 Prometheus 返回 NaN；
+  - 日期函数 `day_of_month` / `day_of_week` / `day_of_year` / `days_in_month` /
+    `hour` / `minute` / `month` / `year`：参数可选。有参数时把每个样本的
+    **值**当作 Unix 秒（UTC，向下取整后计算，样本自身的时间戳不参与）；无参数
+    （`year()`）时用求值时刻。两者都丢弃 `__name__`，无参数形式返回单条无标签
+    样本。日历换算用 Howard Hinnant 的 `civil_from_days` 纯整数算法，不引入时区
+    或时间库；`day_of_week` 与 Go 一致（周日为 0）；非有限值（NaN/Inf）没有
+    日期，按 0 秒处理；
+  - `quantile(q, v)` 聚合：按 `by`/`without` 分组后排序插值，复用
+    `quantile_over_time` 的 `quantile_of`；`q` 为 NaN 时结果是 NaN，`q<0`/`q>1`
+    分别是 `-Inf`/`+Inf`。`q` 是必填参数且写在向量前（`quantile by (job)
+    (0.5, m)` 也支持），缺参数在解析期报错；`aggr_over_time` 仍拒绝它并提示改用
+    `quantile_over_time`。
+  - 测试：`clamp` 的上下界/`max<min` 空结果/NaN 传播；`scalar` 的 1 个、0 个、
+    多个样本与标量参数；`deriv` 的斜率、常量序列、单样本消失以及与
+    `predict_linear` 的斜率一致；日期函数在闰日 2024-02-29T13:45:00Z 上的
+    全部分量与 `year()` 的求值时刻语义；`quantile` 的插值、分组、越界与 NaN；
+    解析测试覆盖全部新函数。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50

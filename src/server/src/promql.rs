@@ -24,13 +24,14 @@
 //! * subqueries `expr[5m:1m]` (and `[5m:]`, which uses the default one-minute
 //!   step) as function arguments, including nested ones;
 //! * range functions — `rate`, `irate`, `increase`, `delta`, `idelta`,
-//!   `changes`, `resets`, `*_over_time`;
-//! * instant functions — math (`abs`, `ceil`, `clamp_min`, ...), `timestamp`,
-//!   `sort`, `sort_desc`, `absent`, `histogram_quantile`, `label_replace` /
-//!   `label_join`, and the generators `time`, `pi`, `vector`, plus MetricsQL's
-//!   `default`;
+//!   `changes`, `resets`, `deriv`, `*_over_time`;
+//! * instant functions — math (`abs`, `ceil`, `clamp`, `clamp_min`, ...),
+//!   `scalar`, the date functions (`year`, `month`, `day_of_month`, ...),
+//!   `timestamp`, `sort`, `sort_desc`, `absent`, `histogram_quantile`,
+//!   `label_replace` / `label_join`, and the generators `time`, `pi`, `vector`,
+//!   plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
-//!   `stdvar`, `topk`, `bottomk`, with `by` / `without`;
+//!   `stdvar`, `topk`, `bottomk`, `quantile`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
 //!   scalars or a vector and a scalar, vector matching between two vectors
 //!   (`on` / `ignoring`, `group_left` / `group_right`), and the set operators
@@ -677,6 +678,7 @@ pub enum AggOp {
     Stdvar,
     Topk,
     Bottomk,
+    Quantile,
 }
 
 impl AggOp {
@@ -692,6 +694,7 @@ impl AggOp {
             AggOp::Stdvar => "stdvar",
             AggOp::Topk => "topk",
             AggOp::Bottomk => "bottomk",
+            AggOp::Quantile => "quantile",
         }
     }
 
@@ -707,13 +710,14 @@ impl AggOp {
             "stdvar" => AggOp::Stdvar,
             "topk" => AggOp::Topk,
             "bottomk" => AggOp::Bottomk,
+            "quantile" => AggOp::Quantile,
             _ => return None,
         })
     }
 
-    /// `topk` / `bottomk` take a parameter before the vector.
+    /// `topk` / `bottomk` / `quantile` take a parameter before the vector.
     fn takes_param(self) -> bool {
-        matches!(self, AggOp::Topk | AggOp::Bottomk)
+        matches!(self, AggOp::Topk | AggOp::Bottomk | AggOp::Quantile)
     }
 }
 
@@ -745,6 +749,8 @@ pub enum RangeFunc {
     TMaxOverTime,
     /// `predict_linear(v[range], t)`.
     PredictLinear,
+    /// `deriv(v[range])` — the least-squares slope, in per-second units.
+    Deriv,
 }
 
 impl RangeFunc {
@@ -769,6 +775,7 @@ impl RangeFunc {
             "absent_over_time" => RangeFunc::AbsentOverTime,
             "tmin_over_time" => RangeFunc::TMinOverTime,
             "tmax_over_time" => RangeFunc::TMaxOverTime,
+            "deriv" => RangeFunc::Deriv,
             // `predict_linear` takes its range vector first, so it is
             // dispatched by name in `call` rather than through `parse`.
             _ => return None,
@@ -829,6 +836,137 @@ impl MathFunc {
 pub enum SortDir {
     Asc,
     Desc,
+}
+
+/// The `*_of_*` / component date functions.
+///
+/// Prometheus implements them all through `dateWrapper`: an argument is
+/// optional, and with one each sample's **value** is read as Unix seconds
+/// (the sample's timestamp is irrelevant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateFunc {
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    DaysInMonth,
+    Hour,
+    Minute,
+    Month,
+    Year,
+}
+
+impl DateFunc {
+    fn parse(name: &str) -> Option<DateFunc> {
+        Some(match name {
+            "day_of_month" => DateFunc::DayOfMonth,
+            "day_of_week" => DateFunc::DayOfWeek,
+            "day_of_year" => DateFunc::DayOfYear,
+            "days_in_month" => DateFunc::DaysInMonth,
+            "hour" => DateFunc::Hour,
+            "minute" => DateFunc::Minute,
+            "month" => DateFunc::Month,
+            "year" => DateFunc::Year,
+            _ => return None,
+        })
+    }
+
+    /// The component of `unix_secs`, in UTC, exactly as `dateWrapper` reads it.
+    /// `days_in_month` counts by asking for the 32nd day of the month, which
+    /// Go normalises back into the last day of that month.
+    fn of(self, unix_secs: f64) -> f64 {
+        let seconds = unix_secs.floor();
+        let date = civil_from_unix_seconds(seconds);
+        match self {
+            DateFunc::DayOfMonth => f64::from(date.day),
+            DateFunc::DayOfWeek => weekday_from_days(date.days) as f64,
+            DateFunc::DayOfYear => (date.days - days_from_civil(date.year, 1, 1) + 1) as f64,
+            DateFunc::DaysInMonth => f64::from(days_in_month(date.year, date.month)),
+            DateFunc::Hour => f64::from(date.hour),
+            DateFunc::Minute => f64::from(date.minute),
+            DateFunc::Month => f64::from(date.month),
+            DateFunc::Year => f64::from(date.year),
+        }
+    }
+}
+
+/// A UTC calendar instant, with the day count since the Unix epoch kept so
+/// `day_of_year` and `day_of_week` do not need a second conversion.
+struct CivilDate {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    /// Days since 1970-01-01.
+    days: i64,
+}
+
+/// Converts Unix seconds to a UTC calendar date.
+///
+/// Howard Hinnant's `civil_from_days`: shift the epoch to 0000-03-01 so leap
+/// days land at the end of the 400-year cycle, then undo the shift. Integer
+/// arithmetic only, so no dependency and no floating-point rounding.
+fn civil_from_unix_seconds(unix_secs: f64) -> CivilDate {
+    // A NaN or infinite sample has no date; Go's `int64` conversion is
+    // unspecified there, so treat it as the epoch. Finite values are clamped
+    // into a range whose day count is far from overflowing the integer
+    // arithmetic below (about ±31 million years).
+    const MAX_UNIX_SECS: f64 = 1.0e15;
+    let total_seconds = if unix_secs.is_finite() {
+        unix_secs.clamp(-MAX_UNIX_SECS, MAX_UNIX_SECS)
+    } else {
+        0.0
+    };
+    let days = (total_seconds / 86_400.0).floor() as i64;
+    // `rem_euclid` keeps the time of day in [0, 86400) even for the negative
+    // extremes, where `total - days * 86400` would not.
+    let secs_of_day = total_seconds.rem_euclid(86_400.0) as i64;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = (year + i64::from(month <= 2)) as i32;
+
+    CivilDate {
+        year,
+        month,
+        day,
+        hour: (secs_of_day / 3_600) as u32,
+        minute: ((secs_of_day % 3_600) / 60) as u32,
+        days,
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// 1970-01-01 was a Thursday (4).
+fn weekday_from_days(days: i64) -> i64 {
+    (days + 4).rem_euclid(7)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -915,6 +1053,21 @@ pub enum Expr {
     Absent(Box<Expr>),
     /// `vector(scalar)` lifts a scalar into a one-sample vector.
     Vector(Box<Expr>),
+    /// `scalar(v)` — the sole value of a one-sample vector, NaN otherwise.
+    Scalar(Box<Expr>),
+    /// `clamp(v, min, max)` — both bounds are scalars, and `max < min` yields
+    /// an empty result rather than the input.
+    Clamp {
+        expr: Box<Expr>,
+        min: Box<Expr>,
+        max: Box<Expr>,
+    },
+    /// `day_of_month(v)` and friends. With an argument each sample's value is
+    /// read as Unix seconds; with none the evaluation instant is used.
+    DateFunc {
+        func: DateFunc,
+        expr: Option<Box<Expr>>,
+    },
     /// `time()` — the evaluation instant in seconds.
     Time,
 }
@@ -954,6 +1107,17 @@ impl Expr {
             }
             Expr::Sort { expr, .. } | Expr::Absent(expr) | Expr::Vector(expr) => {
                 expr.selectors(out)
+            }
+            Expr::Scalar(expr) => expr.selectors(out),
+            Expr::Clamp { expr, min, max } => {
+                expr.selectors(out);
+                min.selectors(out);
+                max.selectors(out);
+            }
+            Expr::DateFunc { expr, .. } => {
+                if let Some(expr) = expr {
+                    expr.selectors(out);
+                }
             }
             Expr::LabelReplace { expr, .. } | Expr::LabelJoin { expr, .. } => expr.selectors(out),
         }
@@ -1052,6 +1216,17 @@ impl Expr {
             }
             Expr::Sort { expr, .. } | Expr::Absent(expr) | Expr::Vector(expr) => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
+            }
+            Expr::Scalar(expr) => expr.widen_window(query_start_ms, query_end_ms, start, end),
+            Expr::Clamp { expr, min, max } => {
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
+                min.widen_window(query_start_ms, query_end_ms, start, end);
+                max.widen_window(query_start_ms, query_end_ms, start, end);
+            }
+            Expr::DateFunc { expr, .. } => {
+                if let Some(expr) = expr {
+                    expr.widen_window(query_start_ms, query_end_ms, start, end);
+                }
             }
             Expr::LabelReplace { expr, .. } | Expr::LabelJoin { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
@@ -1505,12 +1680,20 @@ impl Parser {
                         return bad(format!("expected a grouping after {name}"));
                     };
                     self.expect(Token::LParen)?;
+                    // `topk` / `bottomk` / `quantile` carry a parameter first.
+                    let param = if op.takes_param() {
+                        let param = self.expression(0)?;
+                        self.expect(Token::Comma)?;
+                        Some(Box::new(param))
+                    } else {
+                        None
+                    };
                     let expr = self.expression(0)?;
                     self.expect(Token::RParen)?;
                     Ok(Expr::Aggregation {
                         op,
                         expr: Box::new(expr),
-                        param: None,
+                        param,
                         grouping: Some(grouping),
                     })
                 } else {
@@ -1646,7 +1829,8 @@ impl Parser {
                 };
                 if op.takes_param() {
                     return bad(format!(
-                        "`{}` needs no parameter inside aggr_over_time",
+                        "`{}` takes a parameter and is not an aggregation over_time accepts; \
+                         use quantile_over_time for a quantile",
                         op.name()
                     ));
                 }
@@ -1775,6 +1959,24 @@ impl Parser {
             }
         }
         match name {
+            "clamp" => {
+                let expr = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let min = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let max = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Clamp {
+                    expr: Box::new(expr),
+                    min: Box::new(min),
+                    max: Box::new(max),
+                })
+            }
+            "scalar" => {
+                let expr = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Scalar(Box::new(expr)))
+            }
             "sort" | "sort_desc" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
@@ -1805,12 +2007,26 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(Expr::Number(std::f64::consts::PI))
             }
+            other if DateFunc::parse(other).is_some() => {
+                let func = DateFunc::parse(other).expect("checked above");
+                // The argument is optional: `year()` reads the evaluation
+                // instant, `year(v)` each sample's value as Unix seconds.
+                let expr = if self.eat(&Token::RParen) {
+                    None
+                } else {
+                    let expr = self.expression(0)?;
+                    self.expect(Token::RParen)?;
+                    Some(Box::new(expr))
+                };
+                Ok(Expr::DateFunc { func, expr })
+            }
             other => bad(format!(
                 "unknown function {other:?}; supported range functions are rate, irate, \
-                 increase, delta, idelta, changes, resets and *_over_time, the math \
+                 increase, delta, idelta, deriv, changes, resets and *_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
-                 clamp_min, clamp_max, timestamp, and the label functions label_replace \
-                 and label_join"
+                 clamp, clamp_min, clamp_max, scalar, timestamp, the date functions \
+                 day_of_month, day_of_week, day_of_year, days_in_month, hour, minute, \
+                 month, year, and the label functions label_replace and label_join"
             )),
         }
     }
@@ -2164,6 +2380,79 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 })
             }
+            Expr::Scalar(expr) => {
+                let instant = self.eval(expr, at_ms)?;
+                // Prometheus returns NaN unless exactly one float sample is
+                // present; a scalar argument is already such a sample.
+                let value = match (instant.scalar, instant.vector.0.as_slice()) {
+                    (Some(value), _) => value,
+                    (None, [point]) => point.value,
+                    (None, _) => f64::NAN,
+                };
+                Ok(Instant::scalar(value))
+            }
+            Expr::Clamp { expr, min, max } => {
+                let instant = self.eval(expr, at_ms)?;
+                let min = self.scalar_of(min, at_ms)?;
+                let max = self.scalar_of(max, at_ms)?;
+                let mut vector = Vector::default();
+                // `max < min` is an empty result, not the untouched input. A
+                // NaN bound is not less than anything, so — as in Go — it
+                // proceeds and turns every sample into NaN.
+                let inverted = max < min;
+                if !inverted {
+                    let points = match instant.scalar {
+                        Some(value) => {
+                            let mut one = Vector::default();
+                            one.push(BTreeMap::new(), value);
+                            one
+                        }
+                        None => instant.vector,
+                    };
+                    for point in points.0 {
+                        let value = go_max(min, go_min(point.value, max));
+                        let mut labels = point.labels;
+                        labels.remove("__name__");
+                        vector.push(labels, value);
+                    }
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
+            Expr::DateFunc { func, expr } => {
+                let mut vector = Vector::default();
+                let Some(expr) = expr else {
+                    // No argument: one label-less sample from the evaluation
+                    // instant (Prometheus' `time.UnixMilli(enh.Ts)`).
+                    vector.push(BTreeMap::new(), func.of(at_ms as f64 / 1_000.0));
+                    return Ok(Instant {
+                        vector,
+                        scalar: None,
+                    });
+                };
+                let instant = self.eval(expr, at_ms)?;
+                // The argument's *value* is the timestamp; the sample's own
+                // timestamp plays no part. Prometheus drops `__name__`.
+                let points = match instant.scalar {
+                    Some(value) => {
+                        let mut one = Vector::default();
+                        one.push(BTreeMap::new(), value);
+                        one
+                    }
+                    None => instant.vector,
+                };
+                for point in points.0 {
+                    let mut labels = point.labels;
+                    labels.remove("__name__");
+                    vector.push(labels, func.of(point.value));
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
             Expr::LabelReplace {
                 expr,
                 dst,
@@ -2491,12 +2780,18 @@ impl<'a> Evaluator<'a> {
         };
 
         if op.takes_param() {
-            let k = match param {
+            let param = match param {
                 Some(param) => self.scalar_of(param, at_ms)?,
                 None => return bad(format!("{} needs a parameter", op.name())),
             };
+            if op == AggOp::Quantile {
+                return Ok(Instant {
+                    vector: quantile_agg(&values, param, grouping),
+                    scalar: None,
+                });
+            }
             return Ok(Instant {
-                vector: topk(op, &values, k as usize, grouping),
+                vector: topk(op, &values, param as usize, grouping),
                 scalar: None,
             });
         }
@@ -2546,7 +2841,10 @@ impl<'a> Evaluator<'a> {
             return bad("quantile_over_time needs a quantile parameter");
         }
         if let RangeFunc::AggrOverTime(op) = func {
-            if matches!(op, AggOp::Topk | AggOp::Bottomk | AggOp::Group) {
+            if matches!(
+                op,
+                AggOp::Topk | AggOp::Bottomk | AggOp::Group | AggOp::Quantile
+            ) {
                 return bad(format!(
                     "`{}` is not an aggregation over_time accepts",
                     op.name()
@@ -2649,8 +2947,8 @@ impl<'a> Evaluator<'a> {
                 let mut out = Vector::default();
                 for point in &instant.vector.0 {
                     let value = match func {
-                        MathFunc::ClampMin => point.value.max(bound),
-                        _ => point.value.min(bound),
+                        MathFunc::ClampMin => go_max(point.value, bound),
+                        _ => go_min(point.value, bound),
                     };
                     let mut labels = point.labels.clone();
                     labels.remove("__name__");
@@ -2745,7 +3043,7 @@ fn aggregate_values(op: AggOp, values: &[f64]) -> f64 {
             values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
         }
         // Handled by the caller, which needs the whole vector.
-        AggOp::Topk | AggOp::Bottomk => f64::NAN,
+        AggOp::Topk | AggOp::Bottomk | AggOp::Quantile => f64::NAN,
     }
 }
 
@@ -2769,6 +3067,26 @@ fn topk(op: AggOp, values: &Vector, k: usize, grouping: Option<&Grouping>) -> Ve
         for point in group.into_iter().take(k) {
             out.push(point.labels.clone(), point.value);
         }
+    }
+    out
+}
+
+/// `quantile(q, v)`, grouped like the other aggregations.
+///
+/// Each group's values are sorted and interpolated by `quantile_of`, the same
+/// helper `quantile_over_time` uses.
+fn quantile_agg(values: &Vector, quantile: f64, grouping: Option<&Grouping>) -> Vector {
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<f64>> = BTreeMap::new();
+    for point in &values.0 {
+        groups
+            .entry(group_key(&point.labels, grouping))
+            .or_default()
+            .push(point.value);
+    }
+    let mut out = Vector::default();
+    for (key, mut group) in groups {
+        group.sort_by(|a, b| a.total_cmp(b));
+        out.push(key.into_iter().collect(), quantile_of(&group, quantile));
     }
     out
 }
@@ -2903,26 +3221,56 @@ fn apply_range_func(
         // the last sample (least squares, as Prometheus does).
         RangeFunc::PredictLinear => {
             let horizon = param?;
-            let n = samples.len() as f64;
-            let t_mean = samples
-                .iter()
-                .map(|s| s.timestamp as f64 / 1_000.0)
-                .sum::<f64>()
-                / n;
-            let v_mean = samples.iter().map(|s| s.value).sum::<f64>() / n;
-            let mut num = 0.0;
-            let mut den = 0.0;
-            for sample in samples {
-                let dt = sample.timestamp as f64 / 1_000.0 - t_mean;
-                num += dt * (sample.value - v_mean);
-                den += dt * dt;
-            }
-            let slope = if den == 0.0 { 0.0 } else { num / den };
-            let intercept = v_mean - slope * t_mean;
-            let last = samples.last()?.timestamp as f64 / 1_000.0;
+            let origin = samples[0].timestamp;
+            let (slope, intercept) = linear_regression(samples, origin);
+            // `intercept` is the fit's value at `origin`, so the last sample is
+            // `(last - origin)` seconds along the line.
+            let last = (samples.last()?.timestamp - origin) as f64 / 1_000.0;
             Some(intercept + slope * (last + horizon))
         }
+        // `deriv` is the slope alone; ≤1 sample has no slope at all.
+        RangeFunc::Deriv => {
+            if samples.len() < 2 {
+                return None;
+            }
+            let (slope, _) = linear_regression(samples, samples[0].timestamp);
+            Some(slope)
+        }
     }
+}
+
+/// Least squares fit of `samples`, with `x` in seconds from `origin_ms`.
+///
+/// Mirrors Prometheus' `linearRegression`, including its short cut for a
+/// constant series: floating-point noise in the sums could otherwise turn
+/// "all values equal" into a tiny non-zero slope.
+fn linear_regression(samples: &[SamplePoint], origin_ms: i64) -> (f64, f64) {
+    let n = samples.len() as f64;
+    let first = samples[0].value;
+    if samples.iter().all(|sample| sample.value == first) {
+        // A constant series has slope 0 — unless the constant is infinite, in
+        // which case Prometheus reports NaN for both.
+        return if first.is_infinite() {
+            (f64::NAN, f64::NAN)
+        } else {
+            (0.0, first)
+        };
+    }
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_xy = 0.0;
+    let mut sum_x2 = 0.0;
+    for sample in samples {
+        let x = (sample.timestamp - origin_ms) as f64 / 1_000.0;
+        sum_x += x;
+        sum_y += sample.value;
+        sum_xy += x * sample.value;
+        sum_x2 += x * x;
+    }
+    let cov_xy = sum_xy - sum_x * sum_y / n;
+    let var_x = sum_x2 - sum_x * sum_x / n;
+    let slope = if var_x == 0.0 { 0.0 } else { cov_xy / var_x };
+    (slope, sum_y / n - slope * sum_x / n)
 }
 
 /// Evaluates a binary operation between two instant vectors.
@@ -3265,6 +3613,24 @@ fn label_string(labels: &LabelSet) -> String {
     format!("{{{body}}}")
 }
 
+/// Go's `math.Min`: NaN wins over any number, unlike Rust's `f64::min`.
+fn go_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
+    }
+}
+
+/// Go's `math.Max`: NaN wins over any number, unlike Rust's `f64::max`.
+fn go_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
+
 /// Prometheus' interpolation between the two neighbouring order statistics.
 fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
     if sorted.is_empty() || quantile.is_nan() {
@@ -3563,6 +3929,14 @@ mod tests {
             "avg_over_time(http_requests[5m])",
             "quantile_over_time(0.9, http_requests[5m])",
             "clamp_min(http_requests, 0)",
+            "clamp(http_requests, 0, 10)",
+            "scalar(http_requests)",
+            "deriv(http_requests[5m])",
+            "year(http_requests)",
+            "year()",
+            "days_in_month(http_requests)",
+            "quantile(0.9, http_requests)",
+            "quantile by (job) (0.5, http_requests)",
             "round(http_requests, 0.5)",
             r#"rate(http_requests{job="api"}[5m] offset 1h)"#,
             "sort_desc(http_requests)",
@@ -3599,7 +3973,8 @@ mod tests {
         // Errors name the problem.
         assert!(parse_err("aggr_over_time(5, m[5m])").contains("aggregation name"));
         assert!(parse_err("aggr_over_time(nonsense, m[5m])").contains("not an aggregation"));
-        assert!(parse_err("aggr_over_time(topk, m[5m])").contains("no parameter"));
+        assert!(parse_err("aggr_over_time(topk, m[5m])").contains("takes a parameter"));
+        assert!(parse_err("aggr_over_time(quantile, m[5m])").contains("takes a parameter"));
         assert!(parse_err("predict_linear(m[5m])").contains("expected Comma but found"));
     }
 
@@ -3652,6 +4027,190 @@ mod tests {
             .expect("predict_linear returns a value");
         assert!((predicted - 4.0 / 3.0).abs() < 1e-9, "got {predicted}");
         assert!(values.len() == 3);
+    }
+
+    #[test]
+    fn test_clamp_skips_an_inverted_range() {
+        let series = synthetic_labeled("m", &[("job", "api")], &[(0, 5.0)]);
+        let run = |query: &str| eval_synthetic(series.clone(), "m", query, 0);
+        // Inside the range the value is untouched, outside it is pinned; the
+        // metric name is dropped like every derived value.
+        assert_eq!(
+            run("clamp(m, 3, 4)"),
+            vec![("{job=\"api\"}".to_string(), 4.0)]
+        );
+        assert_eq!(
+            run("clamp(m, 6, 9)"),
+            vec![("{job=\"api\"}".to_string(), 6.0)]
+        );
+        assert_eq!(
+            run("clamp(m, 1, 9)"),
+            vec![("{job=\"api\"}".to_string(), 5.0)]
+        );
+        // `max < min` is an empty result, not the untouched input.
+        assert!(run("clamp(m, 9, 1)").is_empty());
+        // NaN propagates through Go's math.Min/math.Max, so the sample stays
+        // NaN instead of becoming a bound.
+        let nan = synthetic("m", &[(0, f64::NAN)]);
+        assert!(eval_synthetic(nan, "m", "clamp(m, 1, 9)", 0)[0].1.is_nan());
+    }
+
+    #[test]
+    fn test_scalar_counts_float_samples() {
+        let one = synthetic("m", &[(0, 7.0)]);
+        assert_eq!(
+            eval_series(vec![one], "m", "scalar(m)", 0).scalar,
+            Some(7.0)
+        );
+        // No series and two series both yield NaN, per `funcScalar`.
+        assert!(eval_series(Vec::new(), "m", "scalar(m)", 0)
+            .scalar
+            .unwrap()
+            .is_nan());
+        let two = vec![synthetic("m", &[(0, 1.0)]), synthetic("m", &[(0, 2.0)])];
+        assert!(eval_series(two, "m", "scalar(m)", 0)
+            .scalar
+            .unwrap()
+            .is_nan());
+        // A scalar argument is already a single sample.
+        assert_eq!(
+            eval_series(Vec::new(), "m", "scalar(3)", 0).scalar,
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn test_deriv_is_a_least_squares_slope() {
+        let samples = [
+            SamplePoint {
+                timestamp: 0,
+                value: 2.0,
+            },
+            SamplePoint {
+                timestamp: 1_000,
+                value: 4.0,
+            },
+            SamplePoint {
+                timestamp: 2_000,
+                value: 1.0,
+            },
+        ];
+        // The same fit `predict_linear` uses: slope -0.5 per second.
+        let slope = apply_range_func(RangeFunc::Deriv, &samples, 3_000, None).unwrap();
+        assert!((slope + 0.5).abs() < 1e-9, "got {slope}");
+        // A constant series is exactly zero, not floating-point noise.
+        let flat = [
+            SamplePoint {
+                timestamp: 0,
+                value: 3.0,
+            },
+            SamplePoint {
+                timestamp: 1_000,
+                value: 3.0,
+            },
+        ];
+        assert_eq!(
+            apply_range_func(RangeFunc::Deriv, &flat, 3_000, None),
+            Some(0.0)
+        );
+        // One sample has no slope at all, so the series disappears.
+        assert_eq!(
+            apply_range_func(RangeFunc::Deriv, &samples[..1], 3_000, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_deriv_matches_predict_linear_slope() {
+        let series = synthetic("m", &[(0, 10.0), (10_000, 20.0), (20_000, 30.0)]);
+        let slope = eval_synthetic(series.clone(), "m", "deriv(m[60s])", 20_000);
+        assert_eq!(slope.len(), 1);
+        assert!((slope[0].1 - 1.0).abs() < 1e-12, "got {}", slope[0].1);
+        // Two seconds ahead of the last sample on the same line: 32.
+        let predicted = eval_synthetic(series, "m", "predict_linear(m[60s], 2)", 20_000);
+        assert!((predicted[0].1 - 32.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_date_functions_read_sample_values_as_unix_seconds() {
+        // 2024-02-29T13:45:00Z — a leap day, so `days_in_month` and
+        // `day_of_year` are both exercised.
+        let leap = 1_709_214_300.0;
+        let series = synthetic_labeled("m", &[("job", "api")], &[(0, leap)]);
+        let run = |query: &str| eval_synthetic(series.clone(), "m", query, 0);
+        assert_eq!(run("year(m)"), vec![("{job=\"api\"}".into(), 2024.0)]);
+        assert_eq!(run("month(m)"), vec![("{job=\"api\"}".into(), 2.0)]);
+        assert_eq!(run("day_of_month(m)"), vec![("{job=\"api\"}".into(), 29.0)]);
+        // Thursday, with Sunday as 0 as in Go's `time.Weekday`.
+        assert_eq!(run("day_of_week(m)"), vec![("{job=\"api\"}".into(), 4.0)]);
+        // 31 + 29 = 60.
+        assert_eq!(run("day_of_year(m)"), vec![("{job=\"api\"}".into(), 60.0)]);
+        assert_eq!(
+            run("days_in_month(m)"),
+            vec![("{job=\"api\"}".into(), 29.0)]
+        );
+        assert_eq!(run("hour(m)"), vec![("{job=\"api\"}".into(), 13.0)]);
+        assert_eq!(run("minute(m)"), vec![("{job=\"api\"}".into(), 45.0)]);
+        // Without an argument the evaluation instant is used: 0 is the epoch,
+        // a Thursday in January 1970.
+        let at_zero = synthetic_labeled("m", &[("job", "api")], &[(0, leap)]);
+        assert_eq!(
+            eval_synthetic(at_zero, "m", "year()", 0),
+            vec![("{}".to_string(), 1970.0)]
+        );
+        // Non-finite values have no date: they are read as the epoch instead of
+        // hitting the unspecified integer conversion.
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let odd = synthetic_labeled("m", &[("job", "api")], &[(0, value)]);
+            assert_eq!(
+                eval_synthetic(odd, "m", "year(m)", 0),
+                vec![("{job=\"api\"}".to_string(), 1970.0)]
+            );
+        }
+        // An absurd timestamp is clamped rather than overflowing the calendar
+        // arithmetic.
+        let huge = synthetic_labeled("m", &[("job", "api")], &[(0, 1e30)]);
+        let year = eval_synthetic(huge, "m", "year(m)", 0)[0].1;
+        assert!(year.is_finite() && year > 1_000_000.0, "got {year}");
+    }
+
+    #[test]
+    fn test_quantile_aggregation_groups_and_interpolates() {
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "api")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 10.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 20.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        // Without `by` every sample is one group: [1, 2, 10, 20] interpolates
+        // to 6 at the median.
+        assert_eq!(run("quantile(0.5, m)"), vec![("{}".to_string(), 6.0)]);
+        assert_eq!(
+            run("quantile by (job) (0.5, m)"),
+            vec![
+                ("{job=\"api\"}".to_string(), 1.5),
+                ("{job=\"db\"}".to_string(), 15.0)
+            ]
+        );
+        // Out-of-range quantiles follow Prometheus: ±Inf, NaN for NaN.
+        assert_eq!(
+            run("quantile by (job) (2, m)"),
+            vec![
+                ("{job=\"api\"}".to_string(), f64::INFINITY),
+                ("{job=\"db\"}".to_string(), f64::INFINITY)
+            ]
+        );
+        assert_eq!(
+            run("quantile by (job) (-1, m)"),
+            vec![
+                ("{job=\"api\"}".to_string(), f64::NEG_INFINITY),
+                ("{job=\"db\"}".to_string(), f64::NEG_INFINITY)
+            ]
+        );
+        assert!(run("quantile by (job) (0.0/0.0, m)")[0].1.is_nan());
+        // The quantile is a required parameter, and it comes before the vector.
+        assert!(parse_err("quantile(m)").contains("expected Comma but found"));
     }
 
     #[test]
@@ -3756,6 +4315,27 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{query:?} failed: {e:?}"))
                 .vector,
         )
+    }
+
+    /// Evaluates `query` over several synthetic series and returns the whole
+    /// instant, so scalar results are visible too.
+    fn eval_series(
+        series: Vec<SeriesSamples>,
+        selector_query: &str,
+        query: &str,
+        at_ms: i64,
+    ) -> Instant {
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector(selector_query)), series);
+        let expr = parse_ok(query);
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: at_ms,
+            query_end_ms: at_ms,
+        };
+        evaluator
+            .eval(&expr, at_ms)
+            .unwrap_or_else(|e| panic!("{query:?} failed: {e:?}"))
     }
 
     #[test]
