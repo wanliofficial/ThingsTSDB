@@ -601,6 +601,8 @@ pub enum BinaryOp {
     Div,
     Mod,
     Pow,
+    /// `atan2` — the trigonometric binary operator (precedence of `*`).
+    Atan2,
     Eq,
     Neq,
     Gt,
@@ -621,6 +623,7 @@ impl BinaryOp {
             BinaryOp::Div => "/",
             BinaryOp::Mod => "%",
             BinaryOp::Pow => "^",
+            BinaryOp::Atan2 => "atan2",
             BinaryOp::Eq => "==",
             BinaryOp::Neq => "!=",
             BinaryOp::Gt => ">",
@@ -657,6 +660,7 @@ impl BinaryOp {
             BinaryOp::Div => lhs / rhs,
             BinaryOp::Mod => lhs % rhs,
             BinaryOp::Pow => lhs.powf(rhs),
+            BinaryOp::Atan2 => lhs.atan2(rhs),
             BinaryOp::Eq => f64::from(lhs == rhs),
             BinaryOp::Neq => f64::from(lhs != rhs),
             BinaryOp::Gt => f64::from(lhs > rhs),
@@ -1341,6 +1345,7 @@ fn precedence(op: &str) -> Option<(u8, BinaryOp)> {
         "*" => (5, BinaryOp::Mul),
         "/" => (5, BinaryOp::Div),
         "%" => (5, BinaryOp::Mod),
+        "atan2" => (5, BinaryOp::Atan2),
         "^" => (6, BinaryOp::Pow),
         _ => return None,
     })
@@ -1420,8 +1425,8 @@ impl Parser {
             } else {
                 false
             };
-            if is_ident && !op.is_set() {
-                unreachable!("only set operators are spelled with words");
+            if is_ident && !op.is_set() && op != BinaryOp::Atan2 {
+                unreachable!("only set operators and atan2 are spelled with words");
             }
             let matching = self.bin_modifier(op)?;
             let rhs = self.expression(bp + 1)?;
@@ -3613,6 +3618,7 @@ fn changes_metric_schema(op: BinaryOp) -> bool {
             | BinaryOp::Div
             | BinaryOp::Mod
             | BinaryOp::Pow
+            | BinaryOp::Atan2
     )
 }
 
@@ -4232,6 +4238,78 @@ mod tests {
                 ..
             }
         ));
+        // `atan2` shares the precedence of `*`, so `2 + 3 atan2 4` is
+        // `2 + (3 atan2 4)` and `2 * 3 atan2 4` is left-associative.
+        match parse_ok("2 + 3 atan2 4") {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                rhs,
+                ..
+            } => assert!(matches!(
+                *rhs,
+                Expr::Binary {
+                    op: BinaryOp::Atan2,
+                    ..
+                }
+            )),
+            other => panic!("wrong shape: {other:?}"),
+        }
+        match parse_ok("2 * 3 atan2 4") {
+            Expr::Binary {
+                op: BinaryOp::Atan2,
+                lhs,
+                ..
+            } => assert!(matches!(
+                *lhs,
+                Expr::Binary {
+                    op: BinaryOp::Mul,
+                    ..
+                }
+            )),
+            other => panic!("wrong shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_atan2_binary_operator() {
+        let series = [
+            synthetic_labeled("a", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("b", &[("job", "api")], &[(0, 1.0)]),
+        ];
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector("a")), vec![series[0].clone()]);
+        fetched.insert(selector_key(&selector("b")), vec![series[1].clone()]);
+        let run = |query: &str| {
+            let expr = parse_ok(query);
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: 0,
+                query_end_ms: 0,
+            };
+            rendered(&evaluator.eval(&expr, 0).unwrap().vector)
+        };
+        // atan2(1, 1) is pi/4, and like every arithmetic operator the result
+        // loses `__name__`.
+        assert_eq!(
+            run("a atan2 b"),
+            vec![("{job=\"api\"}".to_string(), std::f64::consts::FRAC_PI_4)]
+        );
+        // The operand order is `lhs atan2 rhs`, not the reverse. Scalar-scalar
+        // results land in `Instant::scalar`, not the vector.
+        let scalar = |query: &str, want: f64| {
+            let expr = parse_ok(query);
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: 0,
+                query_end_ms: 0,
+            };
+            let value = evaluator.eval(&expr, 0).unwrap().scalar.unwrap();
+            assert!((value - want).abs() < 1e-12, "{query} gave {value}");
+        };
+        scalar("1 atan2 1", std::f64::consts::FRAC_PI_4);
+        // atan2(0, -1) is pi, whereas atan2(-1, 0) is -pi/2.
+        scalar("0 atan2 -1", std::f64::consts::PI);
+        scalar("-1 atan2 0", -std::f64::consts::FRAC_PI_2);
     }
 
     #[test]
