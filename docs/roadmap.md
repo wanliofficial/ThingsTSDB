@@ -233,7 +233,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `time()`、`pi()`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`；
     （`histogram_quantile` 见下面单独一条）
-  - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile`，支持
+  - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
+    count_values`，支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
     并保留分组标签，与 Prometheus 一致。不写 `by`/`without` 时按官方文档「聚合
     全部标签维度」处理，即整个向量并成一条无标签序列（`sum(m)` 只有一个
@@ -415,6 +416,21 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   并成一条无标签序列，`without ()` 才是「除 `__name__` 外全标签分组」。代码原本
   已是前者，这一轮补上回归测试 `test_default_aggregation_collapses_to_one_series`
   与文档说明，避免再被误改成 `without ()`。
+- 已完成（2026-11-13）：`count_values("label", v)` 聚合。
+  - 输出「每个不同的样本值一条序列」：值按 Go 的
+    `strconv.FormatFloat(v, 'f', -1, 64)` 渲染（定点、无指数、最短往返，
+    `NaN`/`+Inf`/`-Inf` 用同名文本）写入给定标签，序列值是它出现的次数；
+  - 分组键**在写入值标签之后**计算，因此与 Prometheus 的
+    `aggregationCountValues` 一致：不写 `by`/`without` 时只按值标签分组
+    （结果只剩那一个标签）；`by (...)` 把值标签追加到 `by` 列表；`without (...)`
+    下值标签本来就在序列上，除非被点名删除；
+  - 参数必须是带引号的字符串且是合法标签名（`[A-Za-z_][A-Za-z0-9_]*`），
+    否则解析期报错；字符串字面量不能单独作为表达式（新增 `Expr::Str`，只作为
+    `count_values` 的标签参数出现，求值期若单独出现会报错）；
+  - `aggr_over_time` 继续拒绝 `count_values` 并点名（它不是 over-time 聚合）。
+  - 测试：默认分组、`by (job)`、`without (job)` 三种形态的计数与标签；
+    值渲染（`1`、`1.5`、`-2`、`0.30000000000000004`、`1e-10`、
+    `NaN`/`+Inf`/`-Inf`）；非字符串参数与非法标签名在解析期报错。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50

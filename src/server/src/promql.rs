@@ -682,6 +682,8 @@ pub enum AggOp {
     Topk,
     Bottomk,
     Quantile,
+    /// `count_values("label", v)` — one output series per distinct value.
+    CountValues,
 }
 
 impl AggOp {
@@ -698,6 +700,7 @@ impl AggOp {
             AggOp::Topk => "topk",
             AggOp::Bottomk => "bottomk",
             AggOp::Quantile => "quantile",
+            AggOp::CountValues => "count_values",
         }
     }
 
@@ -714,13 +717,23 @@ impl AggOp {
             "topk" => AggOp::Topk,
             "bottomk" => AggOp::Bottomk,
             "quantile" => AggOp::Quantile,
+            "count_values" => AggOp::CountValues,
             _ => return None,
         })
     }
 
-    /// `topk` / `bottomk` / `quantile` take a parameter before the vector.
+    /// `topk` / `bottomk` / `quantile` take a numeric parameter before the
+    /// vector, `count_values` a label name.
     fn takes_param(self) -> bool {
-        matches!(self, AggOp::Topk | AggOp::Bottomk | AggOp::Quantile)
+        matches!(
+            self,
+            AggOp::Topk | AggOp::Bottomk | AggOp::Quantile | AggOp::CountValues
+        )
+    }
+
+    /// True when the parameter is a quoted label name rather than a scalar.
+    fn takes_label_param(self) -> bool {
+        self == AggOp::CountValues
     }
 }
 
@@ -981,6 +994,9 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(f64),
+    /// A bare string literal. Only `count_values` accepts one, as the name of
+    /// the label it writes the distinct values into.
+    Str(String),
     /// A selector, with an optional `offset` (milliseconds) and `@` (ms).
     Selector {
         selector: Selector,
@@ -1086,7 +1102,7 @@ impl Expr {
     /// for each one's samples once per request.
     pub fn selectors(&self, out: &mut Vec<Selector>) {
         match self {
-            Expr::Number(_) | Expr::Time => {}
+            Expr::Number(_) | Expr::Str(_) | Expr::Time => {}
             Expr::Selector { selector, .. } | Expr::Range { selector, .. } => {
                 out.push(selector.clone())
             }
@@ -1148,7 +1164,7 @@ impl Expr {
 
     fn widen_window(&self, query_start_ms: i64, query_end_ms: i64, start: &mut i64, end: &mut i64) {
         match self {
-            Expr::Number(_) | Expr::Time => {}
+            Expr::Number(_) | Expr::Str(_) | Expr::Time => {}
             Expr::Selector {
                 offset_ms,
                 at,
@@ -1691,7 +1707,7 @@ impl Parser {
                     self.expect(Token::LParen)?;
                     // `topk` / `bottomk` / `quantile` carry a parameter first.
                     let param = if op.takes_param() {
-                        let param = self.expression(0)?;
+                        let param = self.aggregation_param(op)?;
                         self.expect(Token::Comma)?;
                         Some(Box::new(param))
                     } else {
@@ -1721,6 +1737,20 @@ impl Parser {
                 describe(other)
             )),
         }
+    }
+
+    /// Parses the parameter that precedes an aggregation's vector argument.
+    ///
+    /// `topk` / `bottomk` / `quantile` take a scalar expression, while
+    /// `count_values` takes a quoted label name — the label the distinct sample
+    /// values are written into.
+    fn aggregation_param(&mut self, op: AggOp) -> Result<Expr> {
+        if op.takes_label_param() {
+            let label = self.string_argument(op.name())?;
+            validate_label_name(&label, op.name())?;
+            return Ok(Expr::Str(label));
+        }
+        self.expression(0)
     }
 
     /// Parses `by (a, b)` / `without (a)` if present.
@@ -1873,7 +1903,7 @@ impl Parser {
         // Aggregations may carry a parameter first (`topk(5, expr)`).
         if let Some(op) = AggOp::parse(name) {
             if op.takes_param() {
-                let param = self.expression(0)?;
+                let param = self.aggregation_param(op)?;
                 self.expect(Token::Comma)?;
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
@@ -2151,6 +2181,7 @@ fn describe(token: Option<Token>) -> String {
 fn render(expr: &Expr) -> String {
     match expr {
         Expr::Number(value) => format_value(*value),
+        Expr::Str(value) => format!("{value:?}"),
         Expr::Selector { selector, .. } => selector.metric.clone(),
         Expr::Range { selector, .. } => format!("{}[...]", selector.metric),
         Expr::Subquery { expr, .. } => format!("{}[...:...]", render(expr)),
@@ -2309,6 +2340,9 @@ impl<'a> Evaluator<'a> {
     fn eval(&self, expr: &Expr, at_ms: i64) -> Result<Instant> {
         match expr {
             Expr::Number(value) => Ok(Instant::scalar(*value)),
+            Expr::Str(_) => {
+                bad("a string literal is only valid as the label argument of count_values")
+            }
             Expr::Time => Ok(Instant::scalar(at_ms as f64 / 1_000.0)),
             Expr::Vector(inner) => {
                 let value = self.scalar_of(inner, at_ms)?;
@@ -2788,6 +2822,15 @@ impl<'a> Evaluator<'a> {
             instant.vector
         };
 
+        if op == AggOp::CountValues {
+            let Some(Expr::Str(label)) = param else {
+                return bad("count_values needs a quoted label name");
+            };
+            return Ok(Instant {
+                vector: count_values(&values, label, grouping),
+                scalar: None,
+            });
+        }
         if op.takes_param() {
             let param = match param {
                 Some(param) => self.scalar_of(param, at_ms)?,
@@ -2805,7 +2848,6 @@ impl<'a> Evaluator<'a> {
             });
         }
         if param.is_some() {
-            // `count_values` etc. would land here; they are not parsed.
             return bad(format!("{} does not take a parameter", op.name()));
         }
 
@@ -2852,7 +2894,7 @@ impl<'a> Evaluator<'a> {
         if let RangeFunc::AggrOverTime(op) = func {
             if matches!(
                 op,
-                AggOp::Topk | AggOp::Bottomk | AggOp::Group | AggOp::Quantile
+                AggOp::Topk | AggOp::Bottomk | AggOp::Group | AggOp::Quantile | AggOp::CountValues
             ) {
                 return bad(format!(
                     "`{}` is not an aggregation over_time accepts",
@@ -3052,7 +3094,7 @@ fn aggregate_values(op: AggOp, values: &[f64]) -> f64 {
             values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
         }
         // Handled by the caller, which needs the whole vector.
-        AggOp::Topk | AggOp::Bottomk | AggOp::Quantile => f64::NAN,
+        AggOp::Topk | AggOp::Bottomk | AggOp::Quantile | AggOp::CountValues => f64::NAN,
     }
 }
 
@@ -3100,10 +3142,60 @@ fn quantile_agg(values: &Vector, quantile: f64, grouping: Option<&Grouping>) -> 
     out
 }
 
-/// Evaluates one range function over a series' samples.
+/// `count_values("label", v)` — one output series per distinct sample value.
 ///
-/// Returns `None` when the series cannot produce a value (fewer than two
-/// samples for the slope functions, none for the aggregates).
+/// Following Prometheus' `aggregationCountValues`: the value is rendered with
+/// Go's `strconv.FormatFloat(f, 'f', -1, 64)` and written into `label`, and the
+/// grouping key is then computed with that label included:
+///
+/// - no `by`/`without` → group by the value label alone (Prometheus appends it
+///   to the empty grouping list), so the result is one series per value with
+///   only that label;
+/// - `by (...)` → the value label is appended to the `by` list;
+/// - `without (...)` → the value label is already part of the metric, so it
+///   survives unless it was named in the `without` list.
+fn count_values(values: &Vector, label: &str, grouping: Option<&Grouping>) -> Vector {
+    let grouped = match grouping {
+        Some(Grouping::Without(names)) => Grouping::Without(names.clone()),
+        Some(Grouping::By(names)) => {
+            let mut names = names.clone();
+            names.push(label.to_string());
+            Grouping::By(names)
+        }
+        None => Grouping::By(vec![label.to_string()]),
+    };
+    let mut counts: BTreeMap<Vec<(String, String)>, usize> = BTreeMap::new();
+    for point in &values.0 {
+        let mut labels = point.labels.clone();
+        labels.insert(label.to_string(), format_float_g(point.value));
+        counts
+            .entry(group_key(&labels, Some(&grouped)))
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+    let mut out = Vector::default();
+    for (key, count) in counts {
+        out.push(key.into_iter().collect(), count as f64);
+    }
+    out
+}
+
+/// Go's `strconv.FormatFloat(v, 'f', -1, 64)`: fixed-point notation, the
+/// shortest representation that round-trips, and `NaN` / `+Inf` / `-Inf`.
+fn format_float_g(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-Inf".to_string()
+        } else {
+            "+Inf".to_string()
+        };
+    }
+    format!("{value}")
+}
+
 fn apply_range_func(
     func: RangeFunc,
     samples: &[SamplePoint],
@@ -4578,6 +4670,62 @@ mod tests {
                 ("{job=\"db\"}".to_string(), 10.0)
             ]
         );
+    }
+
+    #[test]
+    fn test_count_values_counts_distinct_values() {
+        // Prometheus' `count_values("v", m)`: one output series per distinct
+        // sample value, with the value rendered into the given label and the
+        // count as the sample value. The grouping key includes that label, so
+        // without `by`/`without` the only output label is the value label.
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 2.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        assert_eq!(
+            run("count_values(\"v\", m)"),
+            vec![
+                ("{v=\"1\"}".to_string(), 2.0),
+                ("{v=\"2\"}".to_string(), 1.0)
+            ]
+        );
+        // `by (job)` appends the value label to the grouping list.
+        assert_eq!(
+            run("count_values by (job) (\"v\", m)"),
+            vec![
+                ("{job=\"api\",v=\"1\"}".to_string(), 2.0),
+                ("{job=\"db\",v=\"2\"}".to_string(), 1.0)
+            ]
+        );
+        // `without (...)` keeps the other labels and the value label.
+        assert_eq!(
+            run("count_values without (job) (\"v\", m)"),
+            vec![
+                ("{v=\"1\"}".to_string(), 2.0),
+                ("{v=\"2\"}".to_string(), 1.0)
+            ]
+        );
+        // The value label must be a quoted string and a valid label name.
+        assert!(parse_err("count_values(v, m)").contains("quoted string"));
+        assert!(parse_err("count_values(\"1v\", m)").contains("invalid label name"));
+        // A string literal is not an expression on its own.
+        assert!(parse_err("\"v\"").contains("expected a metric name"));
+    }
+
+    #[test]
+    fn test_count_values_renders_values_like_go() {
+        // Go's `strconv.FormatFloat(v, 'f', -1, 64)` never uses exponent
+        // notation and prints `NaN` / `+Inf` / `-Inf`.
+        assert_eq!(format_float_g(1.0), "1");
+        assert_eq!(format_float_g(1.5), "1.5");
+        assert_eq!(format_float_g(-2.0), "-2");
+        assert_eq!(format_float_g(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(format_float_g(1e-10), "0.0000000001");
+        assert_eq!(format_float_g(f64::NAN), "NaN");
+        assert_eq!(format_float_g(f64::INFINITY), "+Inf");
+        assert_eq!(format_float_g(f64::NEG_INFINITY), "-Inf");
     }
 
     #[test]
