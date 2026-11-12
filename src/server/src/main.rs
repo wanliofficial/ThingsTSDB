@@ -1104,6 +1104,21 @@ mod tests {
             samples
         };
         backend.write(extra).await.unwrap();
+        // A series aligned to the 10 s grid: a subquery's steps are anchored at
+        // absolute multiples of the step, so only aligned samples land exactly
+        // on the grid and give predictable sums.
+        let base = now - now % 10_000;
+        let aligned: Vec<Sample> = (0..4)
+            .map(|t| Sample {
+                name: b"subq_requests".to_vec(),
+                labels: Vec::new(),
+                timestamp: base - (3 - t) * 10_000,
+                value: t as f64,
+                name_id: None,
+                series_id: None,
+            })
+            .collect();
+        backend.write(aligned).await.unwrap();
         backend.flush_all().await.unwrap();
 
         let app = actix_web::test::init_service(
@@ -1121,6 +1136,8 @@ mod tests {
         let start_s = (now - 60_000) as f64 / 1_000.0;
         let time = now_s.to_string();
         let start = start_s.to_string();
+        let base = base as f64 / 1_000.0;
+        let base_s = base.to_string();
 
         // Instant query: one series, `vector` shape, value as a string.
         let body: Value = actix_web::test::call_and_read_body_json(
@@ -1227,8 +1244,9 @@ mod tests {
         assert_eq!(result.len(), 1, "an aggregation collapses to one series");
         assert_eq!(result[0]["metric"], serde_json::json!({}));
 
-        // An unsupported construct is a `bad_data` error naming the gap, not a
-        // wrong answer.
+        // A subquery outside a range function is a type error (a range vector
+        // cannot be an instant vector), reported as `bad_data` rather than
+        // silently ignored.
         let response = actix_web::test::call_service(
             &app,
             actix_web::test::TestRequest::get()
@@ -1243,7 +1261,92 @@ mod tests {
         let body: Value = actix_web::test::read_body_json(response).await;
         assert_eq!(body["status"], "error");
         assert_eq!(body["errorType"], "bad_data");
-        assert!(body["error"].as_str().unwrap().contains("subqueries"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("only valid as a function argument"));
+
+        // A subquery as the only argument of a range function: `subq_requests`
+        // has 0,1,2,3 at base-30s ... base, and the window `(base-30s, base]`
+        // holds the grid points base-20s, base-10s and base. The step itself
+        // is what makes the lower boundary exclusive, so the sample at
+        // base-30s must not be added.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "sum_over_time(subq_requests[30s:10s])"),
+                        ("time", &base_s),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert!((value - 6.0).abs() < 1e-9, "got {value}");
+
+        // `offset` shifts the fixed window back by the same amount: asked at
+        // base+10s with `offset 10s` the window is the same as above.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        ("query", "sum_over_time(subq_requests[30s:10s] offset 10s)"),
+                        ("time", &(base + 10.0).to_string()),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert!((value - 6.0).abs() < 1e-9, "offset: got {value}");
+
+        // A pinned `@` makes the answer independent of the query instant.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        (
+                            "query",
+                            &format!("sum_over_time(subq_requests[30s:10s] @ {base})")
+                        ),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert!((value - 6.0).abs() < 1e-9, "@: got {value}");
+
+        // `rate` over a subquery uses the grid timestamps: (3 - 1) over the
+        // 20 s from base-20s to base.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[("query", "rate(subq_requests[30s:10s])"), ("time", &base_s),])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1);
+        let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
+        assert!((value - 0.1).abs() < 1e-9, "got {value}");
 
         // `rate` over a range selector, and a `by` aggregation: these are the
         // two shapes most dashboard panels use.

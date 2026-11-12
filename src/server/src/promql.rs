@@ -21,6 +21,8 @@
 //!
 //! * instant selectors, with `offset` and `@`;
 //! * range selectors `[5m]` as function arguments;
+//! * subqueries `expr[5m:1m]` (and `[5m:]`, which uses the default one-minute
+//!   step) as function arguments, including nested ones;
 //! * range functions — `rate`, `irate`, `increase`, `delta`, `idelta`,
 //!   `changes`, `resets`, `*_over_time`;
 //! * instant functions — math (`abs`, `ceil`, `clamp_min`, ...), `timestamp`,
@@ -50,11 +52,17 @@
 //! is an error telling the caller to add `group_left`/`group_right`. Arithmetic
 //! and `bool` comparisons drop `__name__`; a filtering comparison keeps it.
 //!
-//! Deliberately **not** implemented: subqueries `[...:...]` and the string
-//! functions (`label_replace`, `label_join`). Those are rejected with a
-//! message naming the gap: a panel that silently receives an approximated
-//! answer where it asked for something else would draw a wrong line, which is
-//! worse than an error.
+//! Subqueries follow Prometheus' `subqueryEvaluationTimes`: the step grid is
+//! anchored at absolute multiples of the step, the first point is strictly
+//! after `at - offset - range`, and points continue up to `at - offset`. Each
+//! point is an ordinary instant evaluation, and the resulting samples carry the
+//! grid timestamp — which is why `rate(m[20s:5s])` extrapolates over the grid
+//! span and not over the raw sample times.
+//!
+//! Deliberately **not** implemented: the string functions (`label_replace`,
+//! `label_join`). Those are rejected with a message naming the gap: a panel
+//! that silently receives an approximated answer where it asked for something
+//! else would draw a wrong line, which is worse than an error.
 //!
 //! Evaluation asks the engine for each selector's raw samples over the union
 //! window once, then evaluates the expression per step. One scan per selector
@@ -78,6 +86,20 @@ pub const LOOKBACK_MS: i64 = 5 * 60 * 1_000;
 
 /// Prometheus refuses more than 11k points per time series in a range query.
 pub const MAX_STEPS: i64 = 11_000;
+
+/// The step a subquery uses when its `:` is not followed by one. Prometheus
+/// falls back to the configured global evaluation interval, which is one
+/// minute by default.
+pub const DEFAULT_SUBQUERY_STEP_MS: i64 = 60_000;
+
+/// The step a subquery actually evaluates at (`[5m:]` means the default).
+fn subquery_step(step_ms: i64) -> i64 {
+    if step_ms > 0 {
+        step_ms
+    } else {
+        DEFAULT_SUBQUERY_STEP_MS
+    }
+}
 
 /// A query error: `Bad` is the caller's fault (`bad_data`), `Exec` is ours
 /// (`execution`).
@@ -720,6 +742,16 @@ pub enum Expr {
         offset_ms: i64,
         at: Option<AtModifier>,
     },
+    /// `expr[5m:1m]` — a range vector built by evaluating `expr` every
+    /// `step_ms` inside `(at - offset - range, at - offset]`. Only valid as a
+    /// range-function argument, like `Range`.
+    Subquery {
+        expr: Box<Expr>,
+        range_ms: i64,
+        step_ms: i64,
+        offset_ms: i64,
+        at: Option<AtModifier>,
+    },
     Unary {
         negate: bool,
         expr: Box<Expr>,
@@ -741,10 +773,12 @@ pub enum Expr {
         param: Option<Box<Expr>>,
         grouping: Option<Grouping>,
     },
+    /// A function over a range vector. `expr` is an `Expr::Range` or an
+    /// `Expr::Subquery`; the range is carried by that node so `rate(a[5m])` and
+    /// `rate(a[5m:1m])` share one path.
     RangeFunc {
         func: RangeFunc,
         expr: Box<Expr>,
-        range_ms: i64,
         param: Option<Box<Expr>>,
     },
     MathFunc {
@@ -772,6 +806,7 @@ impl Expr {
             Expr::Selector { selector, .. } | Expr::Range { selector, .. } => {
                 out.push(selector.clone())
             }
+            Expr::Subquery { expr, .. } => expr.selectors(out),
             Expr::Unary { expr, .. } => expr.selectors(out),
             Expr::Binary { lhs, rhs, .. } => {
                 lhs.selectors(out);
@@ -844,6 +879,31 @@ impl Expr {
                 *start = (*start).min(lowest - offset_ms - span - LOOKBACK_MS);
                 *end = (*end).max(highest - offset_ms + 1);
             }
+            Expr::Subquery {
+                expr,
+                range_ms,
+                step_ms,
+                offset_ms,
+                at,
+            } => {
+                // The inner expression is evaluated on the subquery's step
+                // grid, which starts after `lowest - offset - range`; widen by
+                // one step to be sure every grid point is covered even when
+                // the alignment rounds down.
+                let step = subquery_step(*step_ms);
+                let (lowest, highest) = match at {
+                    Some(modifier) => {
+                        let at = modifier.resolve(query_start_ms, query_end_ms);
+                        (at, at)
+                    }
+                    None => (query_start_ms, query_end_ms),
+                };
+                let inner_start = lowest - offset_ms - range_ms - step;
+                let inner_end = highest - offset_ms;
+                expr.widen_window(inner_start, inner_end, start, end);
+                *start = (*start).min(inner_start - LOOKBACK_MS);
+                *end = (*end).max(inner_end + 1);
+            }
             Expr::Unary { expr, .. } => expr.widen_window(query_start_ms, query_end_ms, start, end),
             Expr::Binary { lhs, rhs, .. } => {
                 lhs.widen_window(query_start_ms, query_end_ms, start, end);
@@ -855,14 +915,8 @@ impl Expr {
                     param.widen_window(query_start_ms, query_end_ms, start, end);
                 }
             }
-            Expr::RangeFunc {
-                expr,
-                range_ms,
-                param,
-                ..
-            } => {
+            Expr::RangeFunc { expr, param, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
-                *start = (*start).min(query_start_ms - range_ms - LOOKBACK_MS);
                 if let Some(param) = param {
                     param.widen_window(query_start_ms, query_end_ms, start, end);
                 }
@@ -1128,64 +1182,65 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// Applies `[range]`, `offset d` and `@ t` to a primary expression.
+    /// Applies `[range]`, `[range:step]`, `offset d` and `@ t` to a primary
+    /// expression.
     fn postfix(&mut self) -> Result<Expr> {
-        let mut expr = self.primary()?;
-        let mut offset_ms = 0;
+        let expr = self.primary()?;
+        let mut offset_ms: i64 = 0;
         let mut at: Option<AtModifier> = None;
-        let mut range_ms: Option<i64> = None;
+        // `(range_ms, step_ms)`: a `None` step is `metric[5m]` (raw samples), a
+        // `Some` one is `expr[5m:1m]` (a subquery; 0 means the default step).
+        let mut range: Option<(i64, Option<i64>)> = None;
         loop {
             match self.peek() {
                 Some(Token::LBracket) => {
                     self.pos += 1;
-                    let range = match self.next() {
-                        Some(Token::Duration(ms)) => ms,
-                        other => {
-                            return bad(format!(
-                                "expected a duration inside [ ] but found {}",
-                                describe(other)
-                            ))
+                    let range_ms = self.duration("inside [ ]")?;
+                    let step = if self.eat(&Token::Op(":")) {
+                        // `[5m:]` leaves the step out and uses the default
+                        // evaluation interval, like Prometheus.
+                        if matches!(self.peek(), Some(Token::RBracket)) {
+                            Some(0)
+                        } else {
+                            let step = self.duration("after ':' in a subquery")?;
+                            if step <= 0 {
+                                return bad("a subquery step must be positive");
+                            }
+                            Some(step)
                         }
+                    } else {
+                        None
                     };
-                    // A `:` before the closing bracket makes this a subquery
-                    // `[...:...]`, which the evaluator does not implement.
-                    // Refusing at parse time keeps the error about the query
-                    // the user actually wrote.
-                    if !self.eat(&Token::RBracket) {
-                        return bad(
-                            "subqueries (`[...:...]`) are not supported; use a plain range \
-                             selector such as `metric[5m]`",
-                        );
+                    self.expect(Token::RBracket)?;
+                    if range.is_some() {
+                        return bad("a range selector may only be applied once; put the inner \
+                             expression in parentheses for a subquery");
                     }
-                    range_ms = Some(range);
+                    if range_ms <= 0 {
+                        return bad("a range must be positive");
+                    }
+                    range = Some((range_ms, step));
                 }
                 Some(Token::Ident(word)) if word == "offset" => {
                     self.pos += 1;
-                    match self.next() {
-                        Some(Token::Duration(ms)) => offset_ms = ms,
-                        other => {
-                            return bad(format!(
-                                "expected a duration after 'offset' but found {}",
-                                describe(other)
-                            ))
-                        }
-                    }
+                    let shift = self.duration("after 'offset'")?;
+                    offset_ms = offset_ms
+                        .checked_add(shift)
+                        .ok_or_else(|| Error::Bad("offset overflows".to_string()))?;
                 }
                 Some(Token::Op("@")) => {
                     self.pos += 1;
-                    match self.next() {
-                        Some(Token::Number(value)) => {
-                            at = Some(AtModifier::At((value * 1_000.0) as i64))
-                        }
+                    let modifier = match self.next() {
+                        Some(Token::Number(value)) => AtModifier::At((value * 1_000.0) as i64),
                         Some(Token::Ident(word)) if word == "start" => {
                             self.expect(Token::LParen)?;
                             self.expect(Token::RParen)?;
-                            at = Some(AtModifier::Start);
+                            AtModifier::Start
                         }
                         Some(Token::Ident(word)) if word == "end" => {
                             self.expect(Token::LParen)?;
                             self.expect(Token::RParen)?;
-                            at = Some(AtModifier::End);
+                            AtModifier::End
                         }
                         other => {
                             return bad(format!(
@@ -1193,51 +1248,100 @@ impl Parser {
                                 describe(other)
                             ))
                         }
+                    };
+                    if at.is_some() {
+                        return bad("the `@` modifier may only be set once");
                     }
+                    at = Some(modifier);
                 }
                 _ => break,
             }
         }
-        if offset_ms != 0 || at.is_some() || range_ms.is_some() {
-            expr = match expr {
+        match (expr, range) {
+            (
                 Expr::Selector {
                     selector,
                     offset_ms: inner_offset,
                     at: inner_at,
-                } => {
-                    let offset_ms = inner_offset
-                        .checked_add(offset_ms)
-                        .ok_or_else(|| Error::Bad("offset overflows".to_string()))?;
-                    if range_ms.is_some() {
-                        Expr::Range {
-                            selector,
-                            range_ms: range_ms.expect("checked above"),
-                            offset_ms,
-                            at: at.or(inner_at),
-                        }
-                    } else {
-                        Expr::Selector {
-                            selector,
-                            offset_ms,
-                            at: at.or(inner_at),
-                        }
-                    }
+                },
+                None,
+            ) => {
+                let offset_ms = inner_offset
+                    .checked_add(offset_ms)
+                    .ok_or_else(|| Error::Bad("offset overflows".to_string()))?;
+                Ok(Expr::Selector {
+                    selector,
+                    offset_ms,
+                    at: at.or(inner_at),
+                })
+            }
+            (
+                Expr::Selector {
+                    selector,
+                    offset_ms: inner_offset,
+                    at: inner_at,
+                },
+                Some((range_ms, None)),
+            ) => {
+                let offset_ms = inner_offset
+                    .checked_add(offset_ms)
+                    .ok_or_else(|| Error::Bad("offset overflows".to_string()))?;
+                Ok(Expr::Range {
+                    selector,
+                    range_ms,
+                    offset_ms,
+                    at: at.or(inner_at),
+                })
+            }
+            (inner, Some((range_ms, Some(step_ms)))) => {
+                // A subquery needs an instant vector inside it; a scalar or a
+                // range vector has no per-step value to sample.
+                if matches!(inner, Expr::Number(_) | Expr::Time) {
+                    return bad("subquery is only allowed on instant vector, got scalar instead");
                 }
-                other => {
-                    if range_ms.is_some() {
-                        return bad("a range selector needs a plain metric name");
-                    }
-                    // `(expr) offset 5m` is legal PromQL, but only shifts the
-                    // evaluation instant; refuse rather than ignore it.
+                if matches!(inner, Expr::Range { .. } | Expr::Subquery { .. }) {
+                    return bad(
+                        "subquery is only allowed on instant vector, got range vector instead",
+                    );
+                }
+                Ok(Expr::Subquery {
+                    expr: Box::new(inner),
+                    range_ms,
+                    step_ms,
+                    offset_ms,
+                    at,
+                })
+            }
+            (other, Some((_, None))) => bad(format!(
+                "a range selector needs a plain metric name, got {}",
+                render(&other)
+            )),
+            (other, None) => {
+                if offset_ms != 0 || at.is_some() {
+                    // `(expr) offset 5m` is legal PromQL only for selectors
+                    // and subqueries; refuse rather than ignore the shift.
                     return bad(format!(
-                        "`offset` and `@` are only supported on a plain selector, \
+                        "`offset` and `@` are only supported on a selector or a subquery, \
                          not on this expression ({})",
                         render(&other)
                     ));
                 }
-            };
+                Ok(other)
+            }
         }
-        Ok(expr)
+    }
+
+    /// A duration argument: a unit-suffixed duration, or a bare number of
+    /// seconds as Prometheus accepts inside `[ ]` and after `offset`.
+    fn duration(&mut self, context: &str) -> Result<i64> {
+        match self.next() {
+            Some(Token::Duration(ms)) => Ok(ms),
+            Some(Token::Number(seconds)) if seconds >= 0.0 => Ok((seconds * 1_000.0) as i64),
+            other => bad(format!(
+                "expected a duration {context} but found {}",
+                describe(other)
+            )),
+        }
     }
 
     fn primary(&mut self) -> Result<Expr> {
@@ -1370,12 +1474,11 @@ impl Parser {
                     ));
                 }
                 self.expect(Token::Comma)?;
-                let (inner, range_ms) = self.range_argument("aggr_over_time")?;
+                let inner = self.range_argument("aggr_over_time")?;
                 self.expect(Token::RParen)?;
                 return Ok(Expr::RangeFunc {
                     func: RangeFunc::AggrOverTime(op),
                     expr: Box::new(inner),
-                    range_ms,
                     param: None,
                 });
             }
@@ -1384,14 +1487,13 @@ impl Parser {
             // functions, so it is dispatched separately too.
             "predict_linear" => {
                 self.expect(Token::LParen)?;
-                let (inner, range_ms) = self.range_argument(name)?;
+                let inner = self.range_argument(name)?;
                 self.expect(Token::Comma)?;
                 let param = self.expression(0)?;
                 self.expect(Token::RParen)?;
                 return Ok(Expr::RangeFunc {
                     func: RangeFunc::PredictLinear,
                     expr: Box::new(inner),
-                    range_ms,
                     param: Some(Box::new(param)),
                 });
             }
@@ -1427,21 +1529,19 @@ impl Parser {
             if func.takes_param() {
                 let param = self.expression(0)?;
                 self.expect(Token::Comma)?;
-                let (inner, range_ms) = self.range_argument(name)?;
+                let inner = self.range_argument(name)?;
                 self.expect(Token::RParen)?;
                 return Ok(Expr::RangeFunc {
                     func,
                     expr: Box::new(inner),
-                    range_ms,
                     param: Some(Box::new(param)),
                 });
             }
-            let (inner, range_ms) = self.range_argument(name)?;
+            let inner = self.range_argument(name)?;
             self.expect(Token::RParen)?;
             return Ok(Expr::RangeFunc {
                 func,
                 expr: Box::new(inner),
-                range_ms,
                 param: None,
             });
         }
@@ -1537,27 +1637,14 @@ impl Parser {
         }
     }
 
-    /// Parses a function argument that must be a range vector, and returns it
-    /// with its range. Prometheus accepts `metric[5m]` only.
-    fn range_argument(&mut self, name: &str) -> Result<(Expr, i64)> {
+    /// Parses a range-vector argument: `metric[5m]` or `expr[5m:1m]`.
+    fn range_argument(&mut self, name: &str) -> Result<Expr> {
         // Only a unary-level argument: `rate(a[5m]) * 2` must stop at the
         // closing parenthesis, not swallow the `* 2` into the argument (which
         // would then fail the range-vector check with a confusing message).
         let inner = self.expression(7)?;
         match inner {
-            Expr::Range {
-                selector,
-                range_ms,
-                offset_ms,
-                at,
-            } => Ok((
-                Expr::Selector {
-                    selector,
-                    offset_ms,
-                    at,
-                },
-                range_ms,
-            )),
+            Expr::Range { .. } | Expr::Subquery { .. } => Ok(inner),
             other => bad(format!(
                 "{name}(...) needs a range vector such as `metric[5m]`, got {}",
                 render(&other)
@@ -1651,6 +1738,7 @@ fn render(expr: &Expr) -> String {
         Expr::Number(value) => format_value(*value),
         Expr::Selector { selector, .. } => selector.metric.clone(),
         Expr::Range { selector, .. } => format!("{}[...]", selector.metric),
+        Expr::Subquery { expr, .. } => format!("{}[...:...]", render(expr)),
         _ => "expression".to_string(),
     }
 }
@@ -1828,6 +1916,7 @@ impl<'a> Evaluator<'a> {
                 })
             }
             Expr::Range { .. } => bad("a range vector is only valid as a function argument"),
+            Expr::Subquery { .. } => bad("a subquery is only valid as a function argument"),
             Expr::Unary { negate, expr } => {
                 if *negate {
                     let mut instant = self.eval(expr, at_ms)?;
@@ -1855,12 +1944,9 @@ impl<'a> Evaluator<'a> {
                 param,
                 grouping,
             } => self.aggregate(*op, expr, param.as_deref(), grouping.as_ref(), at_ms),
-            Expr::RangeFunc {
-                func,
-                expr,
-                range_ms,
-                param,
-            } => self.range_func(*func, expr, *range_ms, param.as_deref(), at_ms),
+            Expr::RangeFunc { func, expr, param } => {
+                self.range_func(*func, expr, param.as_deref(), at_ms)
+            }
             Expr::MathFunc { func, param, expr } => {
                 self.math_func(*func, expr, param.as_deref(), at_ms)
             }
@@ -1968,22 +2054,81 @@ impl<'a> Evaluator<'a> {
         matrix
     }
 
-    fn matrix_of(&self, expr: &Expr, range_ms: i64, at_ms: i64) -> Result<Matrix> {
-        match expr {
-            Expr::Selector {
+    /// The samples of a range-vector argument: a raw range selector
+    /// (`metric[5m]`) or a subquery (`expr[5m:1m]`).
+    fn matrix_of(&self, arg: &Expr, at_ms: i64) -> Result<Matrix> {
+        match arg {
+            Expr::Range {
                 selector,
+                range_ms,
                 offset_ms,
                 at: pinned,
             } => {
                 let at = self.resolve_at(*pinned, at_ms) - offset_ms;
-                Ok(self.select_range(selector, at, range_ms))
+                Ok(self.select_range(selector, at, *range_ms))
             }
-            Expr::Range { .. } => bad("a range vector is only valid as a function argument"),
+            Expr::Subquery {
+                expr,
+                range_ms,
+                step_ms,
+                offset_ms,
+                at: pinned,
+            } => self.subquery_matrix(expr, *range_ms, *step_ms, *offset_ms, *pinned, at_ms),
             other => bad(format!(
                 "expected a range vector such as `metric[5m]`, got {}",
                 render(other)
             )),
         }
+    }
+
+    /// Evaluates a subquery `expr[range:step]` on its own step grid and folds
+    /// the per-step vectors into one matrix, following Prometheus'
+    /// `subqueryEvaluationTimes`: the grid is anchored at absolute multiples of
+    /// the step, starts strictly after `end - range`, and runs up to the
+    /// evaluation instant (or up to the `@` instant when one is pinned).
+    ///
+    /// Each grid point is an ordinary instant evaluation, so the inner
+    /// selectors use the same lookback as anywhere else. The matrix samples
+    /// carry the *grid* timestamp, not the timestamp of the sample they were
+    /// derived from, which is what makes `rate()` over a subquery use the
+    /// requested step.
+    fn subquery_matrix(
+        &self,
+        expr: &Expr,
+        range_ms: i64,
+        step_ms: i64,
+        offset_ms: i64,
+        pinned: Option<AtModifier>,
+        at_ms: i64,
+    ) -> Result<Matrix> {
+        let step = subquery_step(step_ms);
+        let end = self.resolve_at(pinned, at_ms) - offset_ms;
+        let from = end - range_ms;
+        // Rust and Go both truncate integer division toward zero, so this is
+        // the same grid Prometheus computes.
+        let mut ts = step * (from / step);
+        if ts <= from {
+            ts += step;
+        }
+        let mut rows: BTreeMap<LabelSet, Vec<SamplePoint>> = BTreeMap::new();
+        while ts <= end {
+            let instant = self.eval(expr, ts)?;
+            if instant.scalar.is_some() {
+                return bad("subquery is only allowed on instant vector, got scalar instead");
+            }
+            for point in instant.vector.0 {
+                rows.entry(point.labels).or_default().push(SamplePoint {
+                    timestamp: ts,
+                    value: point.value,
+                });
+            }
+            ts += step;
+        }
+        Ok(Matrix(
+            rows.into_iter()
+                .map(|(labels, samples)| RangeSeries { labels, samples })
+                .collect(),
+        ))
     }
 
     fn binary(
@@ -2129,11 +2274,16 @@ impl<'a> Evaluator<'a> {
         &self,
         func: RangeFunc,
         expr: &Expr,
-        range_ms: i64,
         param: Option<&Expr>,
         at_ms: i64,
     ) -> Result<Instant> {
-        let matrix = self.matrix_of(expr, range_ms, at_ms)?;
+        let matrix = self.matrix_of(expr, at_ms)?;
+        // The range of the range vector: `rate(a[5m])` and `rate(a[5m:1m])`
+        // both use 5m for their extrapolation and for `count`-style averages.
+        let range_ms = match expr {
+            Expr::Range { range_ms, .. } | Expr::Subquery { range_ms, .. } => *range_ms,
+            _ => 0,
+        };
         let param = match param {
             Some(param) => Some(self.scalar_of(param, at_ms)?),
             None => None,
@@ -3252,7 +3402,6 @@ mod tests {
     fn test_unsupported_constructs_are_named() {
         // Each message must say what is missing, not just "invalid".
         assert!(parse_err(r#"label_replace(a, "x", "$1", "y", "(.*)")"#).contains("label_replace"));
-        assert!(parse_err("a[5m:1m]").contains("subquer"));
         assert!(parse_err("nonsense_func(a)").contains("unknown function"));
         assert!(parse_err("rate(a)").contains("range vector"));
         assert!(parse_err("a{").contains("label name"));
@@ -3261,6 +3410,201 @@ mod tests {
         assert!(parse_err("a and on(x) group_left b").contains("no grouping allowed"));
         // Prometheus' `fill` family is named rather than misparsed.
         assert!(parse_err("a + fill(0) b").contains("`fill` vector matching"));
+    }
+
+    #[test]
+    fn test_subquery_parse() {
+        // A plain range selector stays a `Range`, with `[5m:]` and `[5m:1m]`
+        // becoming subqueries.
+        assert!(matches!(parse_ok("a[5m]"), Expr::Range { .. }));
+        match parse_ok("a[5m:1m]") {
+            Expr::Subquery {
+                range_ms, step_ms, ..
+            } => {
+                assert_eq!(range_ms, 5 * 60 * 1_000);
+                assert_eq!(step_ms, 60 * 1_000);
+            }
+            other => panic!("a[5m:1m] parsed as {other:?}"),
+        }
+        match parse_ok("sum_over_time(a[5m:])") {
+            Expr::RangeFunc { expr, .. } => {
+                assert!(matches!(*expr, Expr::Subquery { step_ms: 0, .. }))
+            }
+            other => panic!("sum_over_time(a[5m:]) parsed as {other:?}"),
+        }
+        // Bare seconds and an offset after the subquery, as in Prometheus.
+        match parse_ok("sum_over_time(a[30:10] offset 3s)") {
+            Expr::RangeFunc { expr, .. } => match *expr {
+                Expr::Subquery {
+                    range_ms,
+                    step_ms,
+                    offset_ms,
+                    ..
+                } => {
+                    assert_eq!((range_ms, step_ms, offset_ms), (30_000, 10_000, 3_000));
+                }
+                other => panic!("expected a subquery, got {other:?}"),
+            },
+            other => panic!("unexpected shape: {other:?}"),
+        }
+        // `@` on a subquery pins its evaluation instant.
+        assert!(matches!(
+            parse_ok("rate(a[5m:1m] @ 100)"),
+            Expr::RangeFunc { .. }
+        ));
+        // Nested subqueries are allowed; a subquery of a range selector or of a
+        // scalar is not.
+        parse_ok("rate(sum_over_time(a[30s:10s])[50s:10s])");
+        assert!(parse_err("5[5m:1m]").contains("instant vector, got scalar"));
+        assert!(parse_err("(a[5m])[1m:1m]").contains("instant vector, got range vector"));
+        assert!(parse_err("a[5m:0s]").contains("step must be positive"));
+        assert!(parse_err("a[5m:1m][1m:1m]").contains("only be applied once"));
+        // `offset` still needs a selector or a subquery, not a binary
+        // expression.
+        assert!(parse_err("(a + b) offset 5m").contains("selector or a subquery"));
+    }
+
+    /// One series with `samples`, ready for an `Evaluator` that never touches
+    /// a backend.
+    fn synthetic(metric: &str, samples: &[(i64, f64)]) -> SeriesSamples {
+        SeriesSamples {
+            metric_name: metric.as_bytes().to_vec(),
+            labels: Vec::new(),
+            samples: samples
+                .iter()
+                .map(|(timestamp, value)| SamplePoint {
+                    timestamp: *timestamp,
+                    value: *value,
+                })
+                .collect(),
+        }
+    }
+
+    /// Evaluates `query` over one synthetic series at `at_ms`.
+    fn eval_synthetic(
+        series: SeriesSamples,
+        selector_query: &str,
+        query: &str,
+        at_ms: i64,
+    ) -> Vec<(String, f64)> {
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector(selector_query)), vec![series]);
+        let expr = parse_ok(query);
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: at_ms,
+            query_end_ms: at_ms,
+        };
+        rendered(
+            &evaluator
+                .eval(&expr, at_ms)
+                .unwrap_or_else(|e| panic!("{query:?} failed: {e:?}"))
+                .vector,
+        )
+    }
+
+    #[test]
+    fn test_subquery_alignment_and_range_functions() {
+        // The scratch data from Prometheus' `subquery.test`: samples at 0s and
+        // 10s only.
+        let total = || synthetic("metric_total", &[(0, 1.0), (10_000, 2.0)]);
+        let run = |query: &str, at: i64| eval_synthetic(total(), "metric_total", query, at);
+        // The grid starts strictly after `at - range`; points before the first
+        // sample contribute nothing.
+        assert_eq!(
+            run("sum_over_time(metric_total[50s:10s])", 10_000),
+            vec![("{}".to_string(), 3.0)]
+        );
+        assert_eq!(
+            run("sum_over_time(metric_total[50s:5s])", 10_000),
+            vec![("{}".to_string(), 4.0)]
+        );
+        // Five grid points at 260..300, each seeing the last value (2).
+        assert_eq!(
+            run("sum_over_time(metric_total[50s:10s])", 300_000),
+            vec![("{}".to_string(), 10.0)]
+        );
+        // `rate` uses the grid timestamps: (2 - 1) over the 10s span.
+        let rate = run("rate(metric_total[20s:10s])", 10_000);
+        assert_eq!(rate.len(), 1);
+        assert!((rate[0].1 - 0.1).abs() < 1e-12, "got {rate:?}");
+        // Grid points 5,10,15,20 with values 1,2,2,2: delta 1 over 15s.
+        let rate = run("rate(metric_total[20s:5s])", 20_000);
+        assert_eq!(rate.len(), 1);
+        assert!((rate[0].1 - 1.0 / 15.0).abs() < 1e-12, "got {rate:?}");
+    }
+
+    #[test]
+    fn test_subquery_offset_and_default_step() {
+        // `metric1_total 0+1x1000` at 10s: value = t / 10s, up to 1000s.
+        let samples: Vec<(i64, f64)> = (0..=100).map(|i| (i as i64 * 10_000, i as f64)).collect();
+        let metric = || synthetic("metric1_total", &samples);
+        let run = |query: &str, at: i64| eval_synthetic(metric(), "metric1_total", query, at);
+        // Window (970, 1000]: 980, 990, 1000 → 98 + 99 + 100.
+        assert_eq!(
+            run("sum_over_time(metric1_total[30s:10s])", 1_000_000),
+            vec![("{}".to_string(), 297.0)]
+        );
+        // The offset shifts the grid to absolute multiples of the step, so
+        // these all see the same three points.
+        for offset in ["10s", "9s", "7s", "5s", "3s"] {
+            let query = format!("sum_over_time(metric1_total[30s:10s] offset {offset})");
+            assert_eq!(
+                run(&query, 1_010_000),
+                vec![("{}".to_string(), 297.0)],
+                "{query}"
+            );
+        }
+        // Bare seconds and a parenthesised inner expression parse to the same
+        // query.
+        assert_eq!(
+            run("sum_over_time((metric1_total)[30:10] offset 3)", 1_010_000),
+            vec![("{}".to_string(), 297.0)]
+        );
+        // `[3m:]` uses the default one-minute step: 60, 120, 180.
+        assert_eq!(
+            run("count_over_time(metric1_total[3m:])", 180_000),
+            vec![("{}".to_string(), 3.0)]
+        );
+        // An `@` pins the subquery even when the parent instant is far away.
+        assert_eq!(
+            run("sum_over_time(metric1_total[30s:10s] @ 1000)", 5_000_000),
+            vec![("{}".to_string(), 297.0)]
+        );
+    }
+
+    #[test]
+    fn test_nested_subquery() {
+        let samples: Vec<(i64, f64)> = (0..=100).map(|i| (i as i64 * 10_000, i as f64)).collect();
+        let series = synthetic("metric1_total", &samples);
+        // From `subquery.test`: rate over the sum over 30s, both sampled every
+        // 10s, is 0.3.
+        let result = eval_synthetic(
+            series,
+            "metric1_total",
+            "rate(sum_over_time(metric1_total[30s:10s])[50s:10s])",
+            1_000_000,
+        );
+        assert_eq!(result.len(), 1);
+        assert!((result[0].1 - 0.3).abs() < 1e-12, "got {result:?}");
+    }
+
+    #[test]
+    fn test_subquery_scan_window() {
+        // The scan must reach `at - range - step` (the first grid point, with
+        // one step of alignment slack) minus the lookback, so every grid
+        // point's selector has all the samples it can use.
+        let expr = parse_ok("sum_over_time(metric1_total[5m:1m])");
+        let selectors = {
+            let mut out = Vec::new();
+            expr.selectors(&mut out);
+            out
+        };
+        assert_eq!(selectors.len(), 1);
+        assert_eq!(selectors[0].metric, "metric1_total");
+        let (start, end) = expr.scan_window(10_000, 10_000);
+        assert_eq!(start, 10_000 - 300_000 - 60_000 - LOOKBACK_MS);
+        assert_eq!(end, 10_001);
     }
 
     #[test]

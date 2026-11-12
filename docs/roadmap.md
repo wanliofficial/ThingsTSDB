@@ -254,9 +254,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
       并保留 `__name__`；
     - 标量一侧带匹配修饰符、集合运算用于标量表达式，都报错而不是静默忽略；
       Prometheus 的 `fill`/`fill_left`/`fill_right` 明确点名不支持。
-  - **明确不实现**并以 `errorType=bad_data` 点名的能力：子查询 `[...:...]`、
-    `label_replace`/`label_join`。理由写在模块文档里：这些能力若被静默近似，
-    画出的线是错的，比直接报错更糟。
+  - **明确不实现**并以 `errorType=bad_data` 点名的能力：`label_replace`/`label_join`。
+    理由写在模块文档里：这些能力若被静默近似，画出的线是错的，比直接报错更糟。
   - **求值策略**：每个选择器只向引擎要一次**原始样本**，窗口由表达式里最远的
     `offset`/`@`/range 推出（`Expr::scan_window`），之后每个 step 在内存里按
     Prometheus 的取点规则求值（即时选择器取 5 分钟回看内的最后一个样本，区间向量
@@ -281,8 +280,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     算术丢弃 `__name__`、`http_requests / on(job) http_retries` 得到 1.5/3.25、
     `group_left(zone)` 把 `zone` 带到三条 `errors` 序列上、`on(job)` 匹配
     两条同 `job` 序列时返回 400 并报 `found duplicate series`、
-    `and on(job)` 保留 `__name__`，以及子查询与 `rate(裸选择器)` 返回 400
-    `bad_data`。
+    `and on(job)` 保留 `__name__`，以及 `rate(裸选择器)` 返回 400 `bad_data`。
   - 已有 `/api/v1/query`、`/api/v1/last`、`/api/v1/query_range` 保持原有的引擎形状
     响应不变（ADR §12.5、roadmap 均按该形状描述），新接口挂独立前缀。
 - 已完成（2026-11-11）：MetricsQL 子集（同一个 `server::promql` 求值器）。
@@ -323,6 +321,31 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     按标签分组与标签裁剪、缺 `le` 的报错；端到端（actix 路由 + 真实引擎）写入
     1/2/3/4 四个桶后断言 `histogram_quantile(0.5, http_latency_bucket)` 是单条
     无标签的 `0.5`，缺 `le` 的 `histogram_quantile(0.5, http_requests)` 返回 400。
+- 已完成（2026-11-12）：PromQL 子查询 `expr[range:step]`（此前解析期直接拒绝）。
+  语义照抄 Prometheus 的 `subqueryEvaluationTimes` / `runSubquery`：
+  - step 栅格锚定在**绝对**的 step 整数倍上，起点是严格晚于 `at - offset - range`
+    的第一个栅格点，终点是父求值时刻（有 `@` 时是 `@` 时刻）减去 `offset`；
+    因此 `metric[50s:10s]` 在 10 s 处只取 0 s、10 s 两个点，而不是从 0 起再往前
+    多取几个空点；
+  - step 省略（`[5m:]`）时用默认 1 分钟求值间隔，与 Prometheus 的
+    `noStepSubqueryIntervalFn` 默认值一致；
+  - 每个栅格点都是一次普通的即时常量求值（即时选择器仍用 5 分钟回看），矩阵样本
+    的时间戳是**栅格时刻**而不是底层样本时刻——这正是 `rate(m[20s:5s])` 按请求的
+    step 外推、`irate`/`timestamp` 看到 step 时间的原因；
+  - `[30:10]` 这类裸秒数、`offset`、`@` 都支持，`offset`/`@` 可以落在子查询本身；
+    任意即时向量表达式都可以做子查询（`(a)[5m:1m]`、`sum_over_time(...)[...]`、
+    `a + b` 整体），嵌套子查询也可用；标量或区间向量做子查询、写两个 `[ ]`、
+    `[5m:0s]` 都在解析期点名拒绝；
+  - 扫描窗口按 `range + step` 与 `offset`/`@` 推算，仍是一次取原始样本、内存里
+    逐点求值；每个父 step 会重算该子查询（Prometheus 是整段父区间算一次再切窗口，
+    数值一致，代价是重复的纯计算，原始样本仍只取一次）；这条路径同样不走 rollup。
+  - 测试：解析形状（`[5m]` 仍是 `Range`、`[5m:]` 的 step 为 0、`offset`/`@` 落在
+    子查询上、裸秒数、嵌套子查询、各种拒绝），求值对照 Prometheus 官方
+    `subquery.test`（`sum_over_time(m[50s:10s])`=3、`[50s:5s]`=4、5 分钟处=10、
+    `rate(m[20s:10s])`=0.1、`rate(m[20s:5s])`=1/15、offset 5/7/9/10 s 与
+    `[30:10] offset 3` 均为 297、`[3m:]` 的默认 step 产生 3 个点、`@ 1000` 固定
+    窗口、嵌套 `rate(sum_over_time(...)[...])`=0.3），以及 `scan_window` 覆盖
+    `at - range - step - lookback`。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
