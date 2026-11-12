@@ -231,7 +231,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp/clamp_min/
     clamp_max/timestamp/scalar`，三角函数与双曲函数
     `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/deg/rad`，
-    以及 `sort`、`sort_desc`、`absent`、`vector()`、
+    以及 `sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`、`absent`、`vector()`、
     `time()`、`pi()`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`；
     （`histogram_quantile` 见下面单独一条）
@@ -440,6 +440,21 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   IEEE 结果原样透传（`asin(2)` / `acos(2)` / `acosh(0.5)` / `atanh(2)` 是 NaN，
   `atanh(±1)` 是 ±Inf），标量参数返回单条无标签样本。`atan2` 是二元运算符而非
   函数，不在本项范围内。
+- 已完成（2026-11-13）：`sort_by_label(v, "label", ...)` / `sort_by_label_desc`。
+  - 按给定标签依次比较，第一个不同的标签按 `facette/natsort` 的
+    `Compare` 比较（把字符串切成 `\d+` 与 `\D+` 的块，两块都是数字时按整数比，
+    否则按字符串比 —— 所以 `node2 < node10`）；全部给定标签相同时用完整标签集
+    字典序打破平局（`labels.Compare`），`_desc` 连同平局一起反向，与
+    Prometheus 的 `funcSortByLabel`/`funcSortByLabelDesc` 一致；
+  - 参考实现的 `Compare` 并非严格全序（相等字符串与 `"2"`/`"02"` 这类
+    数字相等的块两个方向都返回 true），直接塞进 Rust 的排序比较器会让顺序依赖
+    输入顺序甚至触发 panic。这里的实现两个方向都问一次，只在结论一致时采用，
+    否则退回完整标签集比较，保证确定的全序；
+  - 标签参数必填且须是带引号、合法的标签名；缺失、未加引号、非法名称都在解析期
+    报错。只改变顺序，样本值与标签原样保留。
+  - 测试：用 `facette/natsort` README 的整份样例与它文档给出的排序结果逐项对照、
+    `node1/node2/node10` 的自然序与倒序、多标签与平局下的确定性，以及三种解析期
+    错误。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50

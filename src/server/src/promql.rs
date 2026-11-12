@@ -1108,6 +1108,13 @@ pub enum Expr {
         dir: SortDir,
         expr: Box<Expr>,
     },
+    /// `sort_by_label(v, "a", "b", ...)` — natural-order sort on the named
+    /// labels, with the full labelset as a tiebreak.
+    SortByLabel {
+        desc: bool,
+        labels: Vec<String>,
+        expr: Box<Expr>,
+    },
     Absent(Box<Expr>),
     /// `vector(scalar)` lifts a scalar into a one-sample vector.
     Vector(Box<Expr>),
@@ -1163,9 +1170,10 @@ impl Expr {
                 }
                 expr.selectors(out);
             }
-            Expr::Sort { expr, .. } | Expr::Absent(expr) | Expr::Vector(expr) => {
-                expr.selectors(out)
-            }
+            Expr::Sort { expr, .. }
+            | Expr::SortByLabel { expr, .. }
+            | Expr::Absent(expr)
+            | Expr::Vector(expr) => expr.selectors(out),
             Expr::Scalar(expr) => expr.selectors(out),
             Expr::Clamp { expr, min, max } => {
                 expr.selectors(out);
@@ -1272,9 +1280,10 @@ impl Expr {
                 }
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
             }
-            Expr::Sort { expr, .. } | Expr::Absent(expr) | Expr::Vector(expr) => {
-                expr.widen_window(query_start_ms, query_end_ms, start, end)
-            }
+            Expr::Sort { expr, .. }
+            | Expr::SortByLabel { expr, .. }
+            | Expr::Absent(expr)
+            | Expr::Vector(expr) => expr.widen_window(query_start_ms, query_end_ms, start, end),
             Expr::Scalar(expr) => expr.widen_window(query_start_ms, query_end_ms, start, end),
             Expr::Clamp { expr, min, max } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
@@ -2061,6 +2070,24 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            "sort_by_label" | "sort_by_label_desc" => {
+                let expr = self.expression(0)?;
+                let mut labels = Vec::new();
+                while self.eat(&Token::Comma) {
+                    let label = self.string_argument(name)?;
+                    validate_label_name(&label, name)?;
+                    labels.push(label);
+                }
+                self.expect(Token::RParen)?;
+                if labels.is_empty() {
+                    return bad(format!("{name} needs at least one label name"));
+                }
+                Ok(Expr::SortByLabel {
+                    desc: name == "sort_by_label_desc",
+                    labels,
+                    expr: Box::new(expr),
+                })
+            }
             "absent" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
@@ -2099,8 +2126,8 @@ impl Parser {
                  clamp, clamp_min, clamp_max, scalar, timestamp, the trigonometric and \
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
-                 day_of_year, days_in_month, hour, minute, month, year, and the label \
-                 functions label_replace and label_join"
+                 day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
+                 sort_by_label_desc, and the label functions label_replace and label_join"
             )),
         }
     }
@@ -2444,6 +2471,18 @@ impl<'a> Evaluator<'a> {
                         instant.vector.0.sort_by(|a, b| b.value.total_cmp(&a.value));
                     }
                 }
+                Ok(instant)
+            }
+            Expr::SortByLabel { desc, labels, expr } => {
+                let mut instant = self.eval(expr, at_ms)?;
+                instant.vector.0.sort_by(|a, b| {
+                    let order = sort_by_label_order(&a.labels, &b.labels, labels);
+                    if *desc {
+                        order.reverse()
+                    } else {
+                        order
+                    }
+                });
                 Ok(instant)
             }
             Expr::Absent(expr) => {
@@ -3757,6 +3796,129 @@ fn bucket_quantile(quantile: f64, buckets: &mut [(f64, f64)]) -> f64 {
     }
 }
 
+/// Orders two label sets for `sort_by_label` / `sort_by_label_desc`.
+///
+/// Follows Prometheus' `funcSortByLabel`: walk the requested labels in order,
+/// skipping ones whose values are equal; the first difference is decided by
+/// `natsort.Compare`. When every requested label matches, the full label set
+/// breaks the tie (lexicographically, as `labels.Compare` does), which keeps
+/// the order deterministic under an unstable sort. `desc` reverses the whole
+/// comparison — including the tiebreak, as Prometheus negates it.
+fn sort_by_label_order(a: &LabelSet, b: &LabelSet, labels: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for label in labels {
+        let left = a.get(label).map(String::as_str).unwrap_or("");
+        let right = b.get(label).map(String::as_str).unwrap_or("");
+        if left == right {
+            continue;
+        }
+        // `natsort.Compare` is not a total order (see below), so ask it both
+        // ways and only trust it when the two directions agree. A pathological
+        // pair like "2" vs "02" precedes both ways; the full labelset then
+        // decides, which is deterministic where Prometheus' unstable sort is
+        // arbitrary.
+        let forward = natsort_compare(left, right);
+        let backward = natsort_compare(right, left);
+        if forward && !backward {
+            return Ordering::Less;
+        }
+        if backward && !forward {
+            return Ordering::Greater;
+        }
+        break;
+    }
+    labels_compare(a, b)
+}
+
+/// `facette/natsort`.Compare`: chunk both strings into digit and non-digit runs
+/// (Go's `(\d+|\D+)` over UTF-8) and compare chunk by chunk, numerically when
+/// both chunks are numbers.
+///
+/// Note this is not a total order — that is what Prometheus uses, and the
+/// full-labelset tiebreak in the caller makes the result deterministic.
+fn natsort_compare(a: &str, b: &str) -> bool {
+    let chunks_a = natsort_chunks(a);
+    let chunks_b = natsort_chunks(b);
+    for (i, chunk_a) in chunks_a.iter().enumerate() {
+        if i >= chunks_b.len() {
+            return false;
+        }
+        let chunk_b = &chunks_b[i];
+        let int_a = chunk_a.parse::<i64>().ok().filter(|_| is_digits(chunk_a));
+        let int_b = chunk_b.parse::<i64>().ok().filter(|_| is_digits(chunk_b));
+        if let (Some(int_a), Some(int_b)) = (int_a, int_b) {
+            if int_a == int_b {
+                if i == chunks_a.len() - 1 {
+                    return true;
+                } else if i == chunks_b.len() - 1 {
+                    return false;
+                }
+                continue;
+            }
+            return int_a < int_b;
+        }
+        if chunk_a == chunk_b {
+            if i == chunks_a.len() - 1 {
+                return true;
+            } else if i == chunks_b.len() - 1 {
+                return false;
+            }
+            continue;
+        }
+        return chunk_a < chunk_b;
+    }
+    false
+}
+
+fn is_digits(chunk: &str) -> bool {
+    !chunk.is_empty() && chunk.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Splits into runs of ASCII digits and runs of everything else, matching Go's
+/// `\d+|\D+`. A very long digit run still yields one chunk; it simply fails the
+/// `i64` parse and falls back to string comparison, as Go's `strconv.Atoi`
+/// error does.
+fn natsort_chunks(value: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_digit = None;
+    for ch in value.chars() {
+        let digit = ch.is_ascii_digit();
+        if let Some(previous) = current_digit {
+            if previous != digit {
+                chunks.push(std::mem::take(&mut current));
+            }
+        }
+        current_digit = Some(digit);
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// `labels.Compare` from Prometheus: lexicographic on (name, value) pairs. The
+/// label sets here are `BTreeMap`s, so the iteration order is the sorted one.
+fn labels_compare(a: &LabelSet, b: &LabelSet) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut left = a.iter();
+    let mut right = b.iter();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some((name_a, value_a)), Some((name_b, value_b))) => {
+                match name_a.cmp(name_b).then_with(|| value_a.cmp(value_b)) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+        }
+    }
+}
+
 /// Renders a label set for an error message, e.g. `{job="api"}`.
 fn label_string(labels: &LabelSet) -> String {
     let body = labels
@@ -4319,6 +4481,167 @@ mod tests {
         // functions.
         let scalar = eval_synthetic(synthetic("m", &[(0, 0.0)]), "m", "sin(0)", 0);
         assert_eq!(scalar, vec![("{}".to_string(), 0.0)]);
+    }
+
+    #[test]
+    fn test_natsort_matches_the_reference_implementation() {
+        // The sample list from facette/natsort's README, with its documented
+        // sorted order.
+        let mut values = vec![
+            "1000X Radonius Maximus",
+            "10X Radonius",
+            "200X Radonius",
+            "20X Radonius",
+            "20X Radonius Prime",
+            "30X Radonius",
+            "40X Radonius",
+            "Allegia 50 Clasteron",
+            "Allegia 500 Clasteron",
+            "Allegia 50B Clasteron",
+            "Allegia 51 Clasteron",
+            "Allegia 6R Clasteron",
+            "Alpha 100",
+            "Alpha 2",
+            "Alpha 200",
+            "Alpha 2A",
+            "Alpha 2A-8000",
+            "Alpha 2A-900",
+            "Callisto Morphamax",
+            "Callisto Morphamax 500",
+            "Callisto Morphamax 5000",
+            "Callisto Morphamax 600",
+            "Callisto Morphamax 6000 SE",
+            "Callisto Morphamax 6000 SE2",
+            "Callisto Morphamax 700",
+            "Callisto Morphamax 7000",
+            "Xiph Xlater 10000",
+            "Xiph Xlater 2000",
+            "Xiph Xlater 300",
+            "Xiph Xlater 40",
+            "Xiph Xlater 5",
+            "Xiph Xlater 50",
+            "Xiph Xlater 500",
+            "Xiph Xlater 5000",
+            "Xiph Xlater 58",
+        ];
+        values.sort_by(|left, right| {
+            if natsort_compare(left, right) {
+                std::cmp::Ordering::Less
+            } else if natsort_compare(right, left) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        assert_eq!(
+            values,
+            vec![
+                "10X Radonius",
+                "20X Radonius",
+                "20X Radonius Prime",
+                "30X Radonius",
+                "40X Radonius",
+                "200X Radonius",
+                "1000X Radonius Maximus",
+                "Allegia 6R Clasteron",
+                "Allegia 50 Clasteron",
+                "Allegia 50B Clasteron",
+                "Allegia 51 Clasteron",
+                "Allegia 500 Clasteron",
+                "Alpha 2",
+                "Alpha 2A",
+                "Alpha 2A-900",
+                "Alpha 2A-8000",
+                "Alpha 100",
+                "Alpha 200",
+                "Callisto Morphamax",
+                "Callisto Morphamax 500",
+                "Callisto Morphamax 600",
+                "Callisto Morphamax 700",
+                "Callisto Morphamax 5000",
+                "Callisto Morphamax 6000 SE",
+                "Callisto Morphamax 6000 SE2",
+                "Callisto Morphamax 7000",
+                "Xiph Xlater 5",
+                "Xiph Xlater 40",
+                "Xiph Xlater 50",
+                "Xiph Xlater 58",
+                "Xiph Xlater 300",
+                "Xiph Xlater 500",
+                "Xiph Xlater 2000",
+                "Xiph Xlater 5000",
+                "Xiph Xlater 10000",
+            ]
+        );
+        // The reference implementation reports "precedes" even for equal
+        // strings: when the last chunk matches it returns true. That is why
+        // `sort_by_label_order` asks both directions instead of trusting it.
+        assert!(natsort_compare("abc", "abc"));
+        // Chunks are compared as integers, so `"02"` and `"2"` are equal and
+        // the reference implementation reports "precedes" in both directions.
+        assert!(natsort_compare("2", "02"));
+        assert!(natsort_compare("02", "2"));
+        // Empty strings have no chunks and precede nothing.
+        assert!(!natsort_compare("", ""));
+    }
+
+    #[test]
+    fn test_sort_by_label_orders_series_naturally() {
+        let series = vec![
+            synthetic_labeled("m", &[("instance", "node10")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("instance", "node2")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("instance", "node1")], &[(0, 3.0)]),
+        ];
+        let labels = |query: &str| -> Vec<String> {
+            eval_series(series.clone(), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.labels["instance"].clone())
+                .collect()
+        };
+        // Natural order: node1, node2, node10 — not node1, node10, node2.
+        assert_eq!(
+            labels("sort_by_label(m, \"instance\")"),
+            vec!["node1", "node2", "node10"]
+        );
+        assert_eq!(
+            labels("sort_by_label_desc(m, \"instance\")"),
+            vec!["node10", "node2", "node1"]
+        );
+        // Multiple labels are tried in order; values are untouched.
+        let values: Vec<f64> =
+            eval_series(series.clone(), "m", "sort_by_label(m, \"instance\")", 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.value)
+                .collect();
+        assert_eq!(values, vec![3.0, 2.0, 1.0]);
+        // The label argument is required and must be a valid name.
+        assert!(parse_err("sort_by_label(m)").contains("at least one label name"));
+        assert!(parse_err("sort_by_label(m, instance)").contains("quoted string"));
+        assert!(parse_err("sort_by_label(m, \"1x\")").contains("invalid label name"));
+    }
+
+    #[test]
+    fn test_sort_by_label_tiebreak_is_the_full_labelset() {
+        // Two series sharing the sorted-on value: the full labelset decides, so
+        // the order is deterministic in both directions.
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api"), ("instance", "b")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "api"), ("instance", "a")], &[(0, 2.0)]),
+        ];
+        let order = |query: &str| -> Vec<String> {
+            eval_series(series.clone(), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.labels["instance"].clone())
+                .collect()
+        };
+        assert_eq!(order("sort_by_label(m, \"job\")"), vec!["a", "b"]);
+        assert_eq!(order("sort_by_label_desc(m, \"job\")"), vec!["b", "a"]);
     }
 
     #[test]
