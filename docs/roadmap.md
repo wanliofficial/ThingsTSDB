@@ -224,10 +224,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - **选择器**：`metric`、`metric{a="v",b!="v",c=~"re",d!~"re"}`、`{__name__="metric"}`，
     支持 `offset 5m` 与 `@ <ts>` / `@ start()` / `@ end()`；
   - **区间向量** `metric[5m]` 与区间函数：`rate`、`irate`、`increase`、`delta`、
-    `idelta`、`changes`、`resets`、`deriv`、`*_over_time`（`avg/min/max/sum/count/
-    last/stddev/stdvar/quantile`）。`rate`/`increase` 按 Prometheus 规则处理计数器
-    回绕（下降视为归零后继续累加），单位是「每秒」；`deriv` 是最小二乘斜率
-    （每秒），只有 1 个样本时该序列不出现；
+    `idelta`、`changes`、`resets`、`deriv`、`present_over_time`、`mad_over_time`、
+    `*_over_time`（`avg/min/max/sum/count/last/stddev/stdvar/quantile`）。
+    `rate`/`increase` 按 Prometheus 规则处理计数器回绕（下降视为归零后继续累加），
+    单位是「每秒」；`deriv` 是最小二乘斜率（每秒），只有 1 个样本时该序列不出现；
   - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp/clamp_min/
     clamp_max/timestamp/scalar`，以及 `sort`、`sort_desc`、`absent`、`vector()`、
     `time()`、`pi()`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
@@ -396,6 +396,16 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `predict_linear` 的斜率一致；日期函数在闰日 2024-02-29T13:45:00Z 上的
     全部分量与 `year()` 的求值时刻语义；`quantile` 的插值、分组、越界与 NaN；
     解析测试覆盖全部新函数。
+- 已完成（2026-11-12）：`present_over_time` 与 `mad_over_time`（PromQL 区间函数）。
+  - `present_over_time(v[range])`：区间内只要有一条样本就返回 `1`（值本身不参与，
+    NaN 也算存在）；区间为空时该序列不出现。标签与 `__name__` 原样保留，与
+    Prometheus 的 `funcPresentOverTime` 一致；
+  - `mad_over_time(v[range])`：中位数绝对偏差，即 `median(|v - median(v)|)`，复用
+    `quantile_of` 的排序插值；任一样本为 NaN 时整个结果是 NaN（NaN 会让两个中位数
+    都失去意义，Prometheus 也显式传播而不是丢弃该样本）；单样本的偏差为 `0`。
+  - 测试：`present_over_time` 对普通序列与全 NaN 序列都返回 1、空区间不出现；
+    `mad_over_time` 对 `[1,2,3,4]` 得 1、单样本得 0、含 NaN 得 NaN；解析测试
+    覆盖两个新函数名。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50

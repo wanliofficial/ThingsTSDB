@@ -40,6 +40,9 @@
 //!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`, and
 //!   `predict_linear(v[range], t)`.
 //!
+//! Prometheus' `present_over_time` and `mad_over_time` are part of the range
+//! function set above.
+//!
 //! MetricsQL is what VictoriaMetrics' Grafana datasource sends, so these are
 //! accepted alongside PromQL; they reuse the same evaluator and are refused
 //! with the same care (see below). The `rollup_*` family is intentionally
@@ -747,6 +750,10 @@ pub enum RangeFunc {
     /// `tmin_over_time` / `tmax_over_time`.
     TMinOverTime,
     TMaxOverTime,
+    /// `present_over_time(v[range])` — 1 for any series with a sample.
+    PresentOverTime,
+    /// `mad_over_time(v[range])` — median absolute deviation.
+    MadOverTime,
     /// `predict_linear(v[range], t)`.
     PredictLinear,
     /// `deriv(v[range])` — the least-squares slope, in per-second units.
@@ -775,6 +782,8 @@ impl RangeFunc {
             "absent_over_time" => RangeFunc::AbsentOverTime,
             "tmin_over_time" => RangeFunc::TMinOverTime,
             "tmax_over_time" => RangeFunc::TMaxOverTime,
+            "present_over_time" => RangeFunc::PresentOverTime,
+            "mad_over_time" => RangeFunc::MadOverTime,
             "deriv" => RangeFunc::Deriv,
             // `predict_linear` takes its range vector first, so it is
             // dispatched by name in `call` rather than through `parse`.
@@ -3217,6 +3226,24 @@ fn apply_range_func(
             .iter()
             .max_by(|a, b| a.value.total_cmp(&b.value))
             .map(|s| s.timestamp as f64 / 1_000.0),
+        // A series only reaches this arm when it has at least one sample, so
+        // the answer is always 1 (Prometheus' `funcPresentOverTime`).
+        RangeFunc::PresentOverTime => Some(1.0),
+        // Median absolute deviation: median(|v - median(v)|). Prometheus
+        // propagates NaN rather than dropping those samples, because a NaN
+        // makes both medians undefined.
+        RangeFunc::MadOverTime => {
+            let mut values = values(samples);
+            if values.iter().any(|value| value.is_nan()) {
+                return Some(f64::NAN);
+            }
+            values.sort_by(|a, b| a.total_cmp(b));
+            let median = quantile_of(&values, 0.5);
+            let mut deviations: Vec<f64> =
+                values.iter().map(|value| (value - median).abs()).collect();
+            deviations.sort_by(|a, b| a.total_cmp(b));
+            Some(quantile_of(&deviations, 0.5))
+        }
         // Linear extrapolation over the range, evaluated `horizon` seconds past
         // the last sample (least squares, as Prometheus does).
         RangeFunc::PredictLinear => {
@@ -3965,6 +3992,8 @@ mod tests {
         parse_ok("absent_over_time(m[5m])");
         parse_ok("tmin_over_time(m[5m])");
         parse_ok("tmax_over_time(m[5m])");
+        parse_ok("present_over_time(m[5m])");
+        parse_ok("mad_over_time(m[5m])");
         // `predict_linear` puts the range vector first.
         parse_ok("predict_linear(m[5m], 3600)");
         // `default(v, x)`.
@@ -4027,6 +4056,54 @@ mod tests {
             .expect("predict_linear returns a value");
         assert!((predicted - 4.0 / 3.0).abs() < 1e-9, "got {predicted}");
         assert!(values.len() == 3);
+    }
+
+    #[test]
+    fn test_present_and_mad_over_time() {
+        let samples = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+                .collect()
+        };
+        // `present_over_time` is 1 for any series that has a sample, whatever
+        // the values are.
+        let evident = samples(&[(0, 2.0), (1_000, 4.0)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::PresentOverTime, &evident, 3_000, None),
+            Some(1.0)
+        );
+        let all_nan = samples(&[(0, f64::NAN)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::PresentOverTime, &all_nan, 3_000, None),
+            Some(1.0)
+        );
+        // An empty series never reaches the function, but it must not report
+        // presence either.
+        assert_eq!(
+            apply_range_func(RangeFunc::PresentOverTime, &[], 3_000, None),
+            None
+        );
+        // mad = median(|v - median|): [1,2,3,4] has median 2.5 and deviations
+        // [1.5,0.5,0.5,1.5], whose median is 1.
+        let symmetric = samples(&[(0, 1.0), (1_000, 2.0), (2_000, 3.0), (3_000, 4.0)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::MadOverTime, &symmetric, 4_000, None),
+            Some(1.0)
+        );
+        // A single sample deviates from its own median by 0.
+        assert_eq!(
+            apply_range_func(RangeFunc::MadOverTime, &samples(&[(0, 7.0)]), 1_000, None),
+            Some(0.0)
+        );
+        // NaN makes both medians undefined, so the whole result is NaN instead
+        // of silently dropping the sample.
+        let with_nan = samples(&[(0, 1.0), (1_000, f64::NAN), (2_000, 3.0)]);
+        assert!(
+            apply_range_func(RangeFunc::MadOverTime, &with_nan, 3_000, None)
+                .unwrap()
+                .is_nan()
+        );
     }
 
     #[test]
