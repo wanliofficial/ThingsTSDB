@@ -828,6 +828,25 @@ pub enum MathFunc {
     /// `histogram_quantile(q, v)` over classic `le` buckets.
     HistogramQuantile,
     Timestamp,
+    // Trigonometric, hyperbolic and degree/radian helpers. All of them are
+    // Prometheus' `simpleFloatFunc`: map the value, drop `__name__`, and let
+    // the IEEE result (NaN, ±Inf) through unchanged.
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    /// `deg(v)` — radians to degrees.
+    Deg,
+    /// `rad(v)` — degrees to radians.
+    Rad,
 }
 
 impl MathFunc {
@@ -849,6 +868,20 @@ impl MathFunc {
             "default" => MathFunc::Default,
             "histogram_quantile" => MathFunc::HistogramQuantile,
             "timestamp" => MathFunc::Timestamp,
+            "sin" => MathFunc::Sin,
+            "cos" => MathFunc::Cos,
+            "tan" => MathFunc::Tan,
+            "asin" => MathFunc::Asin,
+            "acos" => MathFunc::Acos,
+            "atan" => MathFunc::Atan,
+            "sinh" => MathFunc::Sinh,
+            "cosh" => MathFunc::Cosh,
+            "tanh" => MathFunc::Tanh,
+            "asinh" => MathFunc::Asinh,
+            "acosh" => MathFunc::Acosh,
+            "atanh" => MathFunc::Atanh,
+            "deg" => MathFunc::Deg,
+            "rad" => MathFunc::Rad,
             _ => return None,
         })
     }
@@ -2063,9 +2096,11 @@ impl Parser {
                 "unknown function {other:?}; supported range functions are rate, irate, \
                  increase, delta, idelta, deriv, changes, resets and *_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
-                 clamp, clamp_min, clamp_max, scalar, timestamp, the date functions \
-                 day_of_month, day_of_week, day_of_year, days_in_month, hour, minute, \
-                 month, year, and the label functions label_replace and label_join"
+                 clamp, clamp_min, clamp_max, scalar, timestamp, the trigonometric and \
+                 hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
+                 asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
+                 day_of_year, days_in_month, hour, minute, month, year, and the label \
+                 functions label_replace and label_join"
             )),
         }
     }
@@ -3796,6 +3831,20 @@ fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
                 (value / to_nearest).round() * to_nearest
             }
         }
+        MathFunc::Sin => value.sin(),
+        MathFunc::Cos => value.cos(),
+        MathFunc::Tan => value.tan(),
+        MathFunc::Asin => value.asin(),
+        MathFunc::Acos => value.acos(),
+        MathFunc::Atan => value.atan(),
+        MathFunc::Sinh => value.sinh(),
+        MathFunc::Cosh => value.cosh(),
+        MathFunc::Tanh => value.tanh(),
+        MathFunc::Asinh => value.asinh(),
+        MathFunc::Acosh => value.acosh(),
+        MathFunc::Atanh => value.atanh(),
+        MathFunc::Deg => value * (180.0 / std::f64::consts::PI),
+        MathFunc::Rad => value * (std::f64::consts::PI / 180.0),
         // `timestamp` needs the sample's own timestamp, handled by the caller.
         // `default`, `histogram_quantile` and the clamps are handled before
         // they reach here.
@@ -4196,6 +4245,80 @@ mod tests {
                 .unwrap()
                 .is_nan()
         );
+    }
+
+    #[test]
+    fn test_trigonometric_and_hyperbolic_functions() {
+        // Each function is checked on a value inside its domain: `acosh` needs
+        // x >= 1, `atanh` needs |x| < 1.
+        let run = |value: f64, query: &str| {
+            eval_synthetic(
+                synthetic_labeled("m", &[("job", "api")], &[(0, value)]),
+                "m",
+                query,
+                0,
+            )
+        };
+        let expect = |value: f64, query: &str, want: f64| {
+            let got = run(value, query);
+            // Every one of these drops `__name__` and keeps the other labels.
+            assert_eq!(got.len(), 1, "{query} produced {got:?}");
+            assert_eq!(got[0].0, "{job=\"api\"}");
+            assert!(
+                (got[0].1 - want).abs() < 1e-12,
+                "{query} gave {} not {want}",
+                got[0].1
+            );
+        };
+        expect(0.5, "sin(m)", 0.5f64.sin());
+        expect(0.5, "cos(m)", 0.5f64.cos());
+        expect(0.5, "tan(m)", 0.5f64.tan());
+        expect(0.5, "asin(m)", 0.5f64.asin());
+        expect(0.5, "acos(m)", 0.5f64.acos());
+        expect(0.5, "atan(m)", 0.5f64.atan());
+        expect(0.5, "sinh(m)", 0.5f64.sinh());
+        expect(0.5, "cosh(m)", 0.5f64.cosh());
+        expect(0.5, "tanh(m)", 0.5f64.tanh());
+        expect(0.5, "asinh(m)", 0.5f64.asinh());
+        expect(2.0, "acosh(m)", 2.0f64.acosh());
+        expect(0.5, "atanh(m)", 0.5f64.atanh());
+        expect(0.5, "deg(m)", 0.5 * 180.0 / std::f64::consts::PI);
+        expect(0.5, "rad(m)", 0.5 * std::f64::consts::PI / 180.0);
+    }
+
+    #[test]
+    fn test_trigonometric_functions_follow_ieee() {
+        // Out-of-domain arguments produce NaN rather than an error, exactly as
+        // Go's `math.Asin` / `math.Acosh` / `math.Atanh` do.
+        let at = |value: f64| synthetic("m", &[(0, value)]);
+        for (query, value) in [
+            ("asin(m)", 2.0),
+            ("acos(m)", 2.0),
+            ("acosh(m)", 0.5),
+            ("atanh(m)", 2.0),
+        ] {
+            assert!(
+                eval_synthetic(at(value), "m", query, 0)[0].1.is_nan(),
+                "{query} of {value} should be NaN"
+            );
+        }
+        // `atanh(±1)` is ±Inf, and `deg`/`rad` keep the sign of ±Inf.
+        assert_eq!(
+            eval_synthetic(at(1.0), "m", "atanh(m)", 0)[0].1,
+            f64::INFINITY
+        );
+        assert_eq!(
+            eval_synthetic(at(-1.0), "m", "atanh(m)", 0)[0].1,
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            eval_synthetic(at(f64::INFINITY), "m", "deg(m)", 0)[0].1,
+            f64::INFINITY
+        );
+        // A scalar argument gives one label-less sample, like the other math
+        // functions.
+        let scalar = eval_synthetic(synthetic("m", &[(0, 0.0)]), "m", "sin(0)", 0);
+        assert_eq!(scalar, vec![("{}".to_string(), 0.0)]);
     }
 
     #[test]

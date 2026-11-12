@@ -229,7 +229,9 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `rate`/`increase` 按 Prometheus 规则处理计数器回绕（下降视为归零后继续累加），
     单位是「每秒」；`deriv` 是最小二乘斜率（每秒），只有 1 个样本时该序列不出现；
   - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp/clamp_min/
-    clamp_max/timestamp/scalar`，以及 `sort`、`sort_desc`、`absent`、`vector()`、
+    clamp_max/timestamp/scalar`，三角函数与双曲函数
+    `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/deg/rad`，
+    以及 `sort`、`sort_desc`、`absent`、`vector()`、
     `time()`、`pi()`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`；
     （`histogram_quantile` 见下面单独一条）
@@ -431,6 +433,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：默认分组、`by (job)`、`without (job)` 三种形态的计数与标签；
     值渲染（`1`、`1.5`、`-2`、`0.30000000000000004`、`1e-10`、
     `NaN`/`+Inf`/`-Inf`）；非字符串参数与非法标签名在解析期报错。
+- 已完成（2026-11-13）：三角函数与双曲函数
+  `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh`，以及
+  `deg`（弧度→角度）、`rad`（角度→弧度）。语义照抄 Prometheus 的
+  `simpleFloatFunc`：逐样本做一次标量运算、丢弃 `__name__`、保留其余标签；
+  IEEE 结果原样透传（`asin(2)` / `acos(2)` / `acosh(0.5)` / `atanh(2)` 是 NaN，
+  `atanh(±1)` 是 ±Inf），标量参数返回单条无标签样本。`atan2` 是二元运算符而非
+  函数，不在本项范围内。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
