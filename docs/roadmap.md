@@ -254,8 +254,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
       并保留 `__name__`；
     - 标量一侧带匹配修饰符、集合运算用于标量表达式，都报错而不是静默忽略；
       Prometheus 的 `fill`/`fill_left`/`fill_right` 明确点名不支持。
-  - **明确不实现**并以 `errorType=bad_data` 点名的能力：`label_replace`/`label_join`。
-    理由写在模块文档里：这些能力若被静默近似，画出的线是错的，比直接报错更糟。
+  - `label_replace` / `label_join`（2026-11-12 补齐，见下一条）只改标签、不动值与
+    时间戳，因此走普通的逐 step 求值，不需要额外的存储支撑。
   - **求值策略**：每个选择器只向引擎要一次**原始样本**，窗口由表达式里最远的
     `offset`/`@`/range 推出（`Expr::scan_window`），之后每个 step 在内存里按
     Prometheus 的取点规则求值（即时选择器取 5 分钟回看内的最后一个样本，区间向量
@@ -346,6 +346,25 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `[30:10] offset 3` 均为 297、`[3m:]` 的默认 step 产生 3 个点、`@ 1000` 固定
     窗口、嵌套 `rate(sum_over_time(...)[...])`=0.3），以及 `scan_window` 覆盖
     `at - range - step - lookback`。
+- 已完成（2026-11-12）：`label_replace` / `label_join`（此前解析期直接拒绝）。
+  两者只改标签、不改样本值与时间戳，因此走普通的逐 step 求值：
+  - `label_replace(v, dst, replacement, src, regex)`：pattern 按 Prometheus 的方式
+    锚定（`^(?s:...)$`），源标签值**整串**匹配才替换；`replacement` 用 Go
+    `ExpandString` 的语法展开（`$1`、`${name}`、`$$` 为字面 `$`、越界或未参与的
+    捕获组展开为空），展开为空则**删除**目标标签；不匹配的序列原样透传；
+  - `label_join(v, dst, separator, src...)`：把源标签按顺序用分隔符连接，缺失的源
+    标签按空串参与（分隔符仍出现），结果为空同样删除目标标签；
+  - 目标标签名（以及 `label_join` 的源标签名）在解析期按
+    `[A-Za-z_][A-Za-z0-9_]*` 校验；pattern 也在解析期编译，非法正则、非字符串参数、
+    `label_join` 没有源标签都返回 `bad_data` 并点名；标量作第一参数在求值期报
+    「expects an instant vector」；
+  - 写 `__name__` 即重命名指标，其余情况保留 `__name__`；两个序列改写后标签相同时
+    按 Prometheus 的逐 step 语义各留在结果里（不静默丢弃）。
+  - 测试：`$1`/`${1}`/`$$` 展开、锚定导致的不匹配原样透传、空展开删除标签、
+    未参与捕获组展开为空、`__name__` 重命名、`label_join` 的缺失源标签与空结果、
+    解析期错误（非法正则/标签名/非字符串参数/缺源标签）、标量参数求值错误；端到端
+    （actix 路由 + 真实引擎）覆盖 `label_replace` 派生 `instance` 且值不变、
+    `label_join` 拼接 `api/`、非法正则返回 400 `bad_data`。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50

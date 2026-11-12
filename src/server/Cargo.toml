@@ -37,6 +37,7 @@ object_store = { workspace = true }
 pb_types = { workspace = true }
 prost = { workspace = true }
 rand = "0.8"
+regex = "1.13.1"
 remote_write = { workspace = true }
 snap = { workspace = true }
 serde = { workspace = true }

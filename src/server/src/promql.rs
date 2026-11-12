@@ -26,8 +26,9 @@
 //! * range functions — `rate`, `irate`, `increase`, `delta`, `idelta`,
 //!   `changes`, `resets`, `*_over_time`;
 //! * instant functions — math (`abs`, `ceil`, `clamp_min`, ...), `timestamp`,
-//!   `sort`, `sort_desc`, `absent`, `histogram_quantile`, and the generators
-//!   `time`, `pi`, `vector`, plus MetricsQL's `default`;
+//!   `sort`, `sort_desc`, `absent`, `histogram_quantile`, `label_replace` /
+//!   `label_join`, and the generators `time`, `pi`, `vector`, plus MetricsQL's
+//!   `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
@@ -59,10 +60,12 @@
 //! grid timestamp — which is why `rate(m[20s:5s])` extrapolates over the grid
 //! span and not over the raw sample times.
 //!
-//! Deliberately **not** implemented: the string functions (`label_replace`,
-//! `label_join`). Those are rejected with a message naming the gap: a panel
-//! that silently receives an approximated answer where it asked for something
-//! else would draw a wrong line, which is worse than an error.
+//! `label_replace` / `label_join` rewrite one label per series and leave
+//! values and timestamps alone, so they ride on the ordinary per-step
+//! evaluation. `label_replace` anchors its pattern the way Prometheus does
+//! (`^(?s:...)$`) and expands `$1` / `${name}` / `$$` exactly like Go's
+//! `ExpandString`; a series whose source value does not match passes through
+//! unchanged, and an empty result deletes the destination label.
 //!
 //! Evaluation asks the engine for each selector's raw samples over the union
 //! window once, then evaluates the expression per step. One scan per selector
@@ -99,6 +102,108 @@ fn subquery_step(step_ms: i64) -> i64 {
     } else {
         DEFAULT_SUBQUERY_STEP_MS
     }
+}
+
+/// A compiled regular expression from `label_replace`.
+///
+/// `Expr` is compared in tests only, and a compiled regex has no useful
+/// equality of its own, so this compares the pattern source: two spellings of
+/// the same regex are the same expression.
+#[derive(Debug, Clone)]
+pub struct Pattern(regex::Regex);
+
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*`, the label names Prometheus accepts for the
+/// labels `label_replace` / `label_join` write.
+fn validate_label_name(name: &str, function: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let valid = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        bad(format!(
+            "invalid label name {name:?} in {function}: label names are \
+             [A-Za-z_][A-Za-z0-9_]*"
+        ))
+    }
+}
+
+/// Go's `regexp.ExpandString`: `$1` and `${name}` insert a capture, `$$` is a
+/// literal `$`, an out-of-range or unmatched capture inserts nothing, and a
+/// `$` that does not start a name is copied as-is. `label_replace` expands its
+/// replacement with exactly this function, so the same spellings work here.
+fn expand_replacement(template: &str, captures: &regex::Captures<'_>) -> String {
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &template[i..];
+        let Some(dollar) = rest.find('$') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..dollar]);
+        let after = i + dollar + 1;
+        if bytes.get(after) == Some(&b'$') {
+            out.push('$');
+            i = after + 1;
+            continue;
+        }
+        let (name, next) = if bytes.get(after) == Some(&b'{') {
+            // `${name}` — the brace must close. An empty `${}` names no group
+            // and therefore expands to nothing, as in Go.
+            let body = &template[after + 1..];
+            match body.find('}') {
+                Some(end) if body[..end].bytes().all(is_name_byte) => {
+                    (body[..end].to_string(), after + 1 + end + 1)
+                }
+                _ => {
+                    out.push('$');
+                    i = after;
+                    continue;
+                }
+            }
+        } else {
+            // `$name` — the name is the longest run of name bytes, so `$1x`
+            // means `${1x}` and not `${1}x`.
+            let start = after;
+            let mut end = after;
+            while end < bytes.len() && is_name_byte(bytes[end]) {
+                end += 1;
+            }
+            if end == start {
+                out.push('$');
+                i = start;
+                continue;
+            }
+            (template[start..end].to_string(), end)
+        };
+        // Digits name a capture by index (`$0` is the whole match), anything
+        // else by name; a name the regex does not declare expands to nothing.
+        let capture = match name.parse::<usize>() {
+            Ok(index) => captures.get(index),
+            Err(_) => captures.name(&name),
+        };
+        if let Some(capture) = capture {
+            out.push_str(capture.as_str());
+        }
+        i = next;
+    }
+    out
+}
+
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// A query error: `Bad` is the caller's fault (`bad_data`), `Exec` is ours
@@ -786,6 +891,23 @@ pub enum Expr {
         param: Option<Box<Expr>>,
         expr: Box<Expr>,
     },
+    /// `label_replace(v, dst, replacement, src, regex)` — rewrites one label of
+    /// each series, leaving series whose `src` value does not match untouched.
+    LabelReplace {
+        expr: Box<Expr>,
+        dst: String,
+        /// The `$1` / `${name}` template expanded with the regex's captures.
+        replacement: String,
+        src: String,
+        pattern: Pattern,
+    },
+    /// `label_join(v, dst, separator, src...)` — joins several labels into one.
+    LabelJoin {
+        expr: Box<Expr>,
+        dst: String,
+        separator: String,
+        srcs: Vec<String>,
+    },
     Sort {
         dir: SortDir,
         expr: Box<Expr>,
@@ -833,6 +955,7 @@ impl Expr {
             Expr::Sort { expr, .. } | Expr::Absent(expr) | Expr::Vector(expr) => {
                 expr.selectors(out)
             }
+            Expr::LabelReplace { expr, .. } | Expr::LabelJoin { expr, .. } => expr.selectors(out),
         }
     }
 
@@ -928,6 +1051,9 @@ impl Expr {
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
             }
             Expr::Sort { expr, .. } | Expr::Absent(expr) | Expr::Vector(expr) => {
+                expr.widen_window(query_start_ms, query_end_ms, start, end)
+            }
+            Expr::LabelReplace { expr, .. } | Expr::LabelJoin { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
             }
         }
@@ -1438,10 +1564,61 @@ impl Parser {
     /// Parses `name(args...)`, dispatching on the name.
     fn call(&mut self, name: &str) -> Result<Expr> {
         match name {
-            "label_replace" | "label_join" => {
-                return bad(format!(
-                    "`{name}` is not supported: this endpoint does not rewrite labels"
-                ))
+            // `label_replace` and `label_join` rewrite labels without touching
+            // values or timestamps, so they work per step like any other
+            // instant function.
+            "label_replace" => {
+                self.expect(Token::LParen)?;
+                let expr = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let dst = self.string_argument(name)?;
+                self.expect(Token::Comma)?;
+                let replacement = self.string_argument(name)?;
+                self.expect(Token::Comma)?;
+                let src = self.string_argument(name)?;
+                self.expect(Token::Comma)?;
+                let pattern = self.string_argument(name)?;
+                self.expect(Token::RParen)?;
+                validate_label_name(&dst, name)?;
+                // Prometheus anchors the pattern with dot-all, so `(.*)` covers
+                // a newline and `a` matches only the whole value.
+                let regex = regex::Regex::new(&format!("^(?s:{pattern})$")).map_err(|e| {
+                    Error::Bad(format!(
+                        "invalid regular expression in label_replace(): {pattern} ({e})"
+                    ))
+                })?;
+                return Ok(Expr::LabelReplace {
+                    expr: Box::new(expr),
+                    dst,
+                    replacement,
+                    src,
+                    pattern: Pattern(regex),
+                });
+            }
+            "label_join" => {
+                self.expect(Token::LParen)?;
+                let expr = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let dst = self.string_argument(name)?;
+                self.expect(Token::Comma)?;
+                let separator = self.string_argument(name)?;
+                let mut srcs = Vec::new();
+                while self.eat(&Token::Comma) {
+                    let src = self.string_argument(name)?;
+                    validate_label_name(&src, name)?;
+                    srcs.push(src);
+                }
+                self.expect(Token::RParen)?;
+                if srcs.is_empty() {
+                    return bad("label_join needs at least one source label");
+                }
+                validate_label_name(&dst, name)?;
+                return Ok(Expr::LabelJoin {
+                    expr: Box::new(expr),
+                    dst,
+                    separator,
+                    srcs,
+                });
             }
             // `aggr_over_time(avg, v[range])` names an aggregation where the
             // other range functions take a vector, so it is dispatched first.
@@ -1630,9 +1807,22 @@ impl Parser {
             }
             other => bad(format!(
                 "unknown function {other:?}; supported range functions are rate, irate, \
-                 increase, delta, idelta, changes, resets and *_over_time, and the math \
+                 increase, delta, idelta, changes, resets and *_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
-                 clamp_min, clamp_max, timestamp"
+                 clamp_min, clamp_max, timestamp, and the label functions label_replace \
+                 and label_join"
+            )),
+        }
+    }
+
+    /// Parses a quoted string argument, the only form `label_replace` and
+    /// `label_join` accept for label names, separators and patterns.
+    fn string_argument(&mut self, name: &str) -> Result<String> {
+        match self.next() {
+            Some(Token::Str(value)) => Ok(value),
+            other => bad(format!(
+                "{name}(...) needs a quoted string here, found {}",
+                describe(other)
             )),
         }
     }
@@ -1968,6 +2158,70 @@ impl<'a> Evaluator<'a> {
                 let mut vector = Vector::default();
                 if empty {
                     vector.push(BTreeMap::new(), 1.0);
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
+            Expr::LabelReplace {
+                expr,
+                dst,
+                replacement,
+                src,
+                pattern,
+            } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("label_replace expects an instant vector, got a scalar");
+                }
+                let mut vector = Vector::default();
+                for mut point in instant.vector.0 {
+                    let source = point.labels.get(src).map(String::as_str).unwrap_or("");
+                    // Like Prometheus, a series whose source value does not
+                    // match the pattern passes through unchanged, and an empty
+                    // expansion deletes the destination label.
+                    if let Some(captures) = pattern.0.captures(source) {
+                        let value = expand_replacement(replacement, &captures);
+                        if value.is_empty() {
+                            point.labels.remove(dst);
+                        } else {
+                            point.labels.insert(dst.clone(), value);
+                        }
+                    }
+                    vector.push_point(&point);
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
+            Expr::LabelJoin {
+                expr,
+                dst,
+                separator,
+                srcs,
+            } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("label_join expects an instant vector, got a scalar");
+                }
+                let mut vector = Vector::default();
+                for mut point in instant.vector.0 {
+                    // Missing labels join as empty strings, so the separator
+                    // still appears — `label_join(m, "x", "-", "a", "b")` on a
+                    // series with only `a="1"` gives `x="1-"`.
+                    let joined = srcs
+                        .iter()
+                        .map(|src| point.labels.get(src).map(String::as_str).unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join(separator);
+                    if joined.is_empty() {
+                        point.labels.remove(dst);
+                    } else {
+                        point.labels.insert(dst.clone(), joined);
+                    }
+                    vector.push_point(&point);
                 }
                 Ok(Instant {
                     vector,
@@ -3201,6 +3455,8 @@ fn label_object(labels: &BTreeMap<String, String>) -> serde_json::Map<String, se
 
 #[cfg(test)]
 mod tests {
+    use metric_engine::Label;
+
     use super::*;
 
     fn parse_ok(query: &str) -> Expr {
@@ -3401,7 +3657,6 @@ mod tests {
     #[test]
     fn test_unsupported_constructs_are_named() {
         // Each message must say what is missing, not just "invalid".
-        assert!(parse_err(r#"label_replace(a, "x", "$1", "y", "(.*)")"#).contains("label_replace"));
         assert!(parse_err("nonsense_func(a)").contains("unknown function"));
         assert!(parse_err("rate(a)").contains("range vector"));
         assert!(parse_err("a{").contains("label name"));
@@ -4204,7 +4459,187 @@ mod tests {
             vec![("{instance=\"i1\"}".to_string(), 1.0)]
         );
         // A filtering comparison that fails emits nothing.
-        let failed = binary_vectors(BinaryOp::Lt, &lhs, &rhs, false, &matching).unwrap();
+        let failed =
+            binary_vectors(BinaryOp::Lt, &lhs, &rhs, false, &VectorMatching::default()).unwrap();
         assert!(failed.is_empty());
+    }
+
+    /// One series with `labels`, ready for an `Evaluator` that never touches a
+    /// backend. `__name__` is not repeated here: the selector adds it.
+    fn synthetic_labeled(
+        metric: &str,
+        labels: &[(&str, &str)],
+        samples: &[(i64, f64)],
+    ) -> SeriesSamples {
+        SeriesSamples {
+            metric_name: metric.as_bytes().to_vec(),
+            labels: labels
+                .iter()
+                .map(|(name, value)| Label {
+                    name: name.as_bytes().to_vec(),
+                    value: value.as_bytes().to_vec(),
+                })
+                .collect(),
+            samples: samples
+                .iter()
+                .map(|(timestamp, value)| SamplePoint {
+                    timestamp: *timestamp,
+                    value: *value,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_label_replace_rewrites_one_label() {
+        let series = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("instance", "10.0.0.1:9090"), ("job", "api")],
+                &[(0, 1.0)],
+            )
+        };
+        let run = |query: &str| eval_synthetic(series(), "http_requests", query, 0);
+        // `$1` and `${1}` both expand the capture, and the rest of the label
+        // set (including `__name__`) is untouched.
+        for replacement in ["$1:9100", "${1}:9100"] {
+            let query = format!(
+                r#"label_replace(http_requests, "instance", "{replacement}", "instance", "(.*):(.*)")"#
+            );
+            assert_eq!(
+                run(&query),
+                vec![(
+                    "{__name__=\"http_requests\",instance=\"10.0.0.1:9100\",job=\"api\"}"
+                        .to_string(),
+                    1.0
+                )],
+                "{query}"
+            );
+        }
+        // `$$` is a literal dollar sign.
+        assert_eq!(
+            run(r#"label_replace(http_requests, "instance", "$$$1", "instance", "(.*):(.*)")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"$10.0.0.1\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // A value that does not match the (anchored) pattern passes through
+        // unchanged: the pattern must cover the whole label value.
+        assert_eq!(
+            run(r#"label_replace(http_requests, "job", "db", "job", "ap")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // An empty expansion deletes the destination label.
+        assert_eq!(
+            run(r#"label_replace(http_requests, "job", "", "job", ".*")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\"}".to_string(),
+                1.0
+            )]
+        );
+        // The pattern matches "api" here but its second group does not, and an
+        // unmatched group expands to nothing — so `$2` deletes `job`.
+        assert_eq!(
+            run(r#"label_replace(http_requests, "job", "$2", "job", "(a)(x)?pi")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\"}".to_string(),
+                1.0
+            )]
+        );
+        // Writing `__name__` renames the metric instead of adding a label.
+        assert_eq!(
+            run(
+                r#"label_replace(http_requests, "__name__", "renamed_$1", "__name__", "http_(.*)")"#
+            ),
+            vec![(
+                "{__name__=\"renamed_requests\",instance=\"10.0.0.1:9090\",job=\"api\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+    }
+
+    #[test]
+    fn test_label_join_joins_labels() {
+        let series = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("instance", "10.0.0.1"), ("job", "api")],
+                &[(0, 1.0)],
+            )
+        };
+        let run = |query: &str| eval_synthetic(series(), "http_requests", query, 0);
+        assert_eq!(
+            run(r#"label_join(http_requests, "target", "/", "job", "instance")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\",\
+                 target=\"api/10.0.0.1\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+        // A missing source label contributes an empty string, so the separator
+        // still appears (Prometheus joins the values unconditionally).
+        assert_eq!(
+            run(r#"label_join(http_requests, "target", "/", "job", "zone")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\",\
+                 target=\"api/\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+        // An empty join deletes the destination label, like Prometheus'
+        // `labels.Builder.Set` with an empty value.
+        assert_eq!(
+            run(r#"label_join(http_requests, "job", "/", "zone")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\"}".to_string(),
+                1.0
+            )]
+        );
+        // The last label wins when both source labels are the same.
+        assert_eq!(
+            run(r#"label_join(http_requests, "x", "-", "job", "job")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\",x=\"api-api\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+    }
+
+    #[test]
+    fn test_label_functions_parse_errors() {
+        // The regex is compiled at parse time, so a bad pattern names the
+        // function that carried it.
+        assert!(parse_err(r#"label_replace(m, "a", "$1", "b", "(")"#)
+            .contains("invalid regular expression in label_replace"));
+        // Label names are validated where Prometheus validates them: the
+        // destination of both functions and the sources of `label_join`.
+        assert!(parse_err(r#"label_replace(m, "1bad", "", "b", ".*")"#)
+            .contains("invalid label name \"1bad\" in label_replace"));
+        assert!(parse_err(r#"label_join(m, "a", "-", "b c")"#)
+            .contains("invalid label name \"b c\" in label_join"));
+        // Non-string arguments and missing labels are refused with a message
+        // about the shape of the call.
+        assert!(parse_err(r#"label_replace(m, 5, "", "b", ".*")"#).contains("quoted string"));
+        assert!(parse_err(r#"label_join(m, "a", "-")"#).contains("at least one source label"));
+        assert!(parse_err(r#"label_replace(m, "a", "$1", "b")"#).contains("expected Comma"));
+        // A scalar has no labels to rewrite; this is an evaluation error, not
+        // a parse error, so the shape still parses.
+        let expr = parse_ok(r#"label_replace(1, "a", "", "b", ".*")"#);
+        let fetched = HashMap::new();
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+        };
+        let error = evaluator.eval(&expr, 0).unwrap_err();
+        assert!(error.message().contains("instant vector, got a scalar"));
     }
 }

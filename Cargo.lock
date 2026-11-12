@@ -3430,6 +3430,7 @@ dependencies = [
  "pb_types",
  "prost",
  "rand",
+ "regex",
  "remote_write",
  "serde",
  "serde_json",

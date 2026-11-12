@@ -1538,6 +1538,86 @@ mod tests {
         .await;
         assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
 
+        // Label rewriting runs per step and only changes labels: the value and
+        // `__name__` stay, and a fresh `instance` is derived from `job`.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        (
+                            "query",
+                            r#"label_replace(http_requests, "instance", "$1:9100", "job", "(.*)")"#,
+                        ),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2);
+        for series in result {
+            let job = series["metric"]["job"].as_str().unwrap();
+            assert_eq!(series["metric"]["__name__"], "http_requests");
+            assert_eq!(series["metric"]["instance"], format!("{job}:9100"));
+            let expected = if job == "api" { 3.0 } else { 13.0 };
+            let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
+            assert!((value - expected).abs() < 1e-9, "got {value}");
+        }
+
+        // `label_join` joins the source labels in order; `instance` does not
+        // exist on these series, so it contributes an empty string.
+        let body: Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        (
+                            "query",
+                            r#"label_join(http_requests, "target", "/", "job", "instance")"#,
+                        ),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        let result = body["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2);
+        for series in result {
+            let job = series["metric"]["job"].as_str().unwrap();
+            assert_eq!(series["metric"]["target"], format!("{job}/"));
+        }
+
+        // A bad pattern is a `bad_data` error that names the function, not a
+        // silently unchanged series.
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/prom/api/v1/query?{}",
+                    qs(&[
+                        (
+                            "query",
+                            r#"label_replace(http_requests, "x", "$1", "job", "(")"#,
+                        ),
+                        ("time", &time),
+                    ])
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body: Value = actix_web::test::read_body_json(response).await;
+        assert_eq!(body["errorType"], "bad_data");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid regular expression in label_replace"));
+
         // Vector matching: `http_requests` and `http_retries` share only `job`,
         // so an unmodified `a / b` would not pair anything and `on(job)`
         // pairs them per job. At `now` the last samples are 3 and 13 for
