@@ -29,7 +29,8 @@
 //!   `scalar`, the date functions (`year`, `month`, `day_of_month`, ...),
 //!   `timestamp`, `sort`, `sort_desc`, `absent`, `histogram_quantile`,
 //!   `histogram_fraction`, `max_of` / `min_of`, `label_replace` / `label_join`,
-//!   and the generators `time`, `pi`, `vector`, plus MetricsQL's `default`;
+//!   the query-context scalars `start()`, `end()`, `range()`, `step()`, and the
+//!   generators `time`, `pi`, `vector`, plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, `quantile`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
@@ -1200,6 +1201,20 @@ pub enum Expr {
     },
     /// `time()` — the evaluation instant in seconds.
     Time,
+    /// `start()` / `end()` / `range()` / `step()` — the query's own time range
+    /// and step, as seconds. Prometheus folds them into number literals before
+    /// evaluation (`foldQueryContextFunctions`); an instant query has no step,
+    /// so `step()` is 0 there.
+    QueryContext(QueryContext),
+}
+
+/// The query-context scalars Prometheus folds into number literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryContext {
+    Start,
+    End,
+    Range,
+    Step,
 }
 
 impl Expr {
@@ -1207,7 +1222,7 @@ impl Expr {
     /// for each one's samples once per request.
     pub fn selectors(&self, out: &mut Vec<Selector>) {
         match self {
-            Expr::Number(_) | Expr::Str(_) | Expr::Time => {}
+            Expr::Number(_) | Expr::Str(_) | Expr::Time | Expr::QueryContext(_) => {}
             Expr::Selector { selector, .. } | Expr::Range { selector, .. } => {
                 out.push(selector.clone())
             }
@@ -1287,7 +1302,7 @@ impl Expr {
 
     fn widen_window(&self, query_start_ms: i64, query_end_ms: i64, start: &mut i64, end: &mut i64) {
         match self {
-            Expr::Number(_) | Expr::Str(_) | Expr::Time => {}
+            Expr::Number(_) | Expr::Str(_) | Expr::Time | Expr::QueryContext(_) => {}
             Expr::Selector {
                 offset_ms,
                 at,
@@ -1766,7 +1781,7 @@ impl Parser {
             (inner, Some((range_ms, Some(step_ms)))) => {
                 // A subquery needs an instant vector inside it; a scalar or a
                 // range vector has no per-step value to sample.
-                if matches!(inner, Expr::Number(_) | Expr::Time) {
+                if matches!(inner, Expr::Number(_) | Expr::Time | Expr::QueryContext(_)) {
                     return bad("subquery is only allowed on instant vector, got scalar instead");
                 }
                 if matches!(inner, Expr::Range { .. } | Expr::Subquery { .. }) {
@@ -2265,6 +2280,16 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(Expr::Time)
             }
+            "start" | "end" | "range" | "step" => {
+                self.expect(Token::RParen)?;
+                let context = match name {
+                    "start" => QueryContext::Start,
+                    "end" => QueryContext::End,
+                    "range" => QueryContext::Range,
+                    _ => QueryContext::Step,
+                };
+                Ok(Expr::QueryContext(context))
+            }
             "pi" => {
                 self.expect(Token::RParen)?;
                 Ok(Expr::Number(std::f64::consts::PI))
@@ -2293,8 +2318,9 @@ impl Parser {
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
-                 sort_by_label_desc, histogram_fraction, max_of, min_of, and the label \
-                 functions label_replace and label_join"
+                 sort_by_label_desc, histogram_fraction, max_of, min_of, the query-context \
+                 functions start, end, range, step, and the label functions label_replace \
+                 and label_join"
             )),
         }
     }
@@ -2563,6 +2589,9 @@ struct Evaluator<'a> {
     /// The query's own time range, so `@ start()` / `@ end()` resolve.
     query_start_ms: i64,
     query_end_ms: i64,
+    /// The range query's step, so `step()` can answer it; 0 for an instant
+    /// query, matching Prometheus' folding of `step()` to 0 there.
+    step_ms: i64,
 }
 
 impl<'a> Evaluator<'a> {
@@ -2573,6 +2602,18 @@ impl<'a> Evaluator<'a> {
                 bad("a string literal is only valid as the label argument of count_values")
             }
             Expr::Time => Ok(Instant::scalar(at_ms as f64 / 1_000.0)),
+            Expr::QueryContext(context) => {
+                // `step()` is only defined for a range query; Prometheus'
+                // `foldQueryContextFunctions` leaves it at 0 for an instant
+                // query, which is what an equal start/end means here.
+                let value = match context {
+                    QueryContext::Start => self.query_start_ms,
+                    QueryContext::End => self.query_end_ms,
+                    QueryContext::Range => self.query_end_ms - self.query_start_ms,
+                    QueryContext::Step => self.step_ms,
+                };
+                Ok(Instant::scalar(value as f64 / 1_000.0))
+            }
             Expr::Vector(inner) => {
                 let value = self.scalar_of(inner, at_ms)?;
                 let mut vector = Vector::default();
@@ -4548,6 +4589,7 @@ pub async fn instant_query(
         fetched: &fetched,
         query_start_ms: at_ms,
         query_end_ms: at_ms,
+        step_ms: 0,
     };
     let instant = evaluator.eval(expr, at_ms)?;
     if let Some(value) = instant.scalar {
@@ -4600,6 +4642,7 @@ pub async fn range_query(
         fetched: &fetched,
         query_start_ms: start_ms,
         query_end_ms: end_ms,
+        step_ms,
     };
 
     // Result series keyed by their exact label set, in first-seen order so the
@@ -4794,6 +4837,7 @@ mod tests {
                 fetched: &fetched,
                 query_start_ms: 0,
                 query_end_ms: 0,
+                step_ms: 0,
             };
             rendered(&evaluator.eval(&expr, 0).unwrap().vector)
         };
@@ -4811,6 +4855,7 @@ mod tests {
                 fetched: &fetched,
                 query_start_ms: 0,
                 query_end_ms: 0,
+                step_ms: 0,
             };
             let value = evaluator.eval(&expr, 0).unwrap().scalar.unwrap();
             assert!((value - want).abs() < 1e-12, "{query} gave {value}");
@@ -4819,6 +4864,48 @@ mod tests {
         // atan2(0, -1) is pi, whereas atan2(-1, 0) is -pi/2.
         scalar("0 atan2 -1", std::f64::consts::PI);
         scalar("-1 atan2 0", -std::f64::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn test_query_context_scalars() {
+        let fetched = HashMap::new();
+        // A range query from 100 s to 160 s in 15 s steps.
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 100_000,
+            query_end_ms: 160_000,
+            step_ms: 15_000,
+        };
+        let run = |query: &str| {
+            let expr = parse_ok(query);
+            evaluator.eval(&expr, 130_000).unwrap().scalar.unwrap()
+        };
+        assert_eq!(run("start()"), 100.0);
+        assert_eq!(run("end()"), 160.0);
+        assert_eq!(run("range()"), 60.0);
+        assert_eq!(run("step()"), 15.0);
+        // They are ordinary scalars, so arithmetic and `max_of` compose.
+        assert_eq!(run("end() - start()"), 60.0);
+        assert_eq!(run("max_of(step(), 20)"), 20.0);
+        // An instant query has no step, matching Prometheus folding `step()`
+        // to 0 when start equals end; `range()` is then 0 too.
+        let instant = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 42_000,
+            query_end_ms: 42_000,
+            step_ms: 0,
+        };
+        let at_instant = |query: &str| {
+            let expr = parse_ok(query);
+            instant.eval(&expr, 42_000).unwrap().scalar.unwrap()
+        };
+        assert_eq!(at_instant("start()"), 42.0);
+        assert_eq!(at_instant("end()"), 42.0);
+        assert_eq!(at_instant("range()"), 0.0);
+        assert_eq!(at_instant("step()"), 0.0);
+        // A scalar is not a valid subquery body; the parser rejects it.
+        let message = parse_err("start()[5m:1m]");
+        assert!(message.contains("instant vector, got scalar"));
     }
 
     #[test]
@@ -4873,6 +4960,11 @@ mod tests {
             "vector(1)",
             "time()",
             "pi()",
+            "start()",
+            "end()",
+            "range()",
+            "step()",
+            "max_of(start(), 5s)",
             "-(a + b)",
             "a and b",
             "a or b",
@@ -5865,6 +5957,7 @@ mod tests {
             fetched: &fetched,
             query_start_ms: at_ms,
             query_end_ms: at_ms,
+            step_ms: 0,
         };
         rendered(
             &evaluator
@@ -5884,6 +5977,7 @@ mod tests {
             fetched: &fetched,
             query_start_ms: at_ms,
             query_end_ms: at_ms,
+            step_ms: 0,
         };
         match evaluator.eval(&expr, at_ms) {
             Ok(instant) => panic!("{query:?} unexpectedly succeeded: {instant:?}"),
@@ -5907,6 +6001,7 @@ mod tests {
             fetched: &fetched,
             query_start_ms: at_ms,
             query_end_ms: at_ms,
+            step_ms: 0,
         };
         evaluator
             .eval(&expr, at_ms)
@@ -7033,6 +7128,7 @@ mod tests {
             fetched: &fetched,
             query_start_ms: 0,
             query_end_ms: 0,
+            step_ms: 0,
         };
         let error = evaluator.eval(&expr, 0).unwrap_err();
         assert!(error.message().contains("instant vector, got a scalar"));

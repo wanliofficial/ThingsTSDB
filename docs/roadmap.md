@@ -235,7 +235,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     clamp_max/timestamp/scalar`，三角函数与双曲函数
     `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/deg/rad`，
     以及 `sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`、`absent`、`vector()`、
-    `time()`、`pi()`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
+    `time()`、`pi()`，查询上下文标量 `start()`/`end()`/`range()`/`step()`、
+    `max_of`/`min_of`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`；
     （`histogram_quantile` / `histogram_fraction` 见下面单独两条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
@@ -550,6 +551,19 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   操作数按 `scalar_of` 读（标量本身，或单样本向量），结果恒为 `resultType=scalar`。
   - 测试：四种大小关系、负数、`±Inf`、单侧 NaN 被替换、双侧 NaN 为 NaN、
     结果是标量（向量为空），以及向量操作数取唯一值、参数多写一个时的解析报错。
+- 已完成（2026-11-13）：查询上下文标量 `start()` / `end()` / `range()` / `step()`
+  （Prometheus 的 `foldQueryContextFunctions` 在求值前把它们折成数字字面量）。
+  - `start()`/`end()` 是**查询区间**的首尾（不是当前 step），`range()` 是
+    `end - start`，都以秒为单位；
+  - `step()` 在区间查询里是请求的 step，即时时 Prometheus 只在 `start != end` 时
+    才给 step 值、否则折成 0（`foldQueryContextFunctions` 里那句 `if !start.Equal(end)`），
+    本服务即时查询的 `step_ms` 就是 0，语义一致；
+  - 它们本来就是标量，因此 `end() - start()`、`max_of(step(), 20)` 这类组合直接
+    可用（这也是 `max_of`/`min_of` 存在的理由）；标量做子查询体会照常报
+    「instant vector, got scalar」。
+  - 测试：区间查询下四个值（100/160/60/15）、算术与 `max_of` 组合、即时查询下
+    `step()`/`range()` 为 0、`start()[5m:1m]` 报错，并加入支持表达式清单。
+
 
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
