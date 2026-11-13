@@ -236,7 +236,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/deg/rad`，
     以及 `sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`、`absent`、`vector()`、
     `time()`、`pi()`，查询上下文标量 `start()`/`end()`/`range()`/`step()`、
-    `max_of`/`min_of`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
+    `max_of`/`min_of`，MetricsQL 的 `*_over_time` 家族（`range_over_time`、
+    `median_over_time`、`sum2_over_time`、`geomean_over_time`、`distinct_over_time`、
+    `mode_over_time`、`increases_over_time`、`decreases_over_time`、
+    `tfirst_over_time`、`tlast_over_time`），日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`；
     （`histogram_quantile` / `histogram_quantiles` / `histogram_fraction` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
@@ -309,11 +312,41 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     再外推 `t` 秒（与 Prometheus 的实现一致：拟合斜率而非取端点差）；
   - `default(v, x)`——结果为空时补一条无标签的 `x`，已有样本中的 `NaN` 也换成 `x`
     （MetricsQL 把 NaN 当缺失值）。
+  - `*_over_time` 家族（2026-11-13 补齐）：`range_over_time`（max-min）、
+    `median_over_time`（VM 的 `quantile(0.5, …)`，先丢 NaN 再排序，因此与
+    Prometheus 的 `quantile_over_time(0.5, …)` 在含 NaN 时结果不同）、
+    `sum2_over_time`（平方和）、`geomean_over_time`（`prod^(1/n)`）、
+    `distinct_over_time`（不同取值个数，`-0` 与 `0` 算同一个，照 Go map 的语义）、
+    `mode_over_time`（`modeNoNaNs`：排序后最长等值游程，
+    首个值按 VM 的 `prevValue` 逻辑参与）、`increases_over_time` /
+    `decreases_over_time`（后者就是 `rollupResets`）、以及 `ts_of_*` 的
+    MetricsQL 名字 `tfirst_over_time` / `tlast_over_time`。
+    全部按 `rollup.go` 逐条对照，包括 `math.Abs(v-prevValue) < 1e-12*math.Abs(v)`
+    的浮点噪声容忍。MetricsQL 把 NaN 当**缺口**：VM 在调用任何 rollup 之前先跑
+    `removeNanValues`，所以这些函数先丢掉 NaN 样本（`distinct_over_time` 因此不会
+    把 NaN 算成一个取值；整窗都是 NaN 时该序列不产出）；这正与 Prometheus 的
+    `*_over_time` 保留 NaN 传播的做法不同，两者各自照自己的上游。这些函数的
+    `prevValue` 恒为 NaN（上一窗口的样本不参与），与 VM 在序列起点的行为一致。
+    均丢弃 `__name__`：VM 的 `rollupFuncsKeepMetricName` 默认保留
+    名字（`avg_over_time`/`min_over_time`/`median_over_time`/`mode_over_time`
+    都在表里），而本服务走 Prometheus 语义——只有 `first_over_time` /
+    `last_over_time` 保名，其余 `*_over_time` 一律丢名，新函数沿用同一约定。
   - `rollup_*` 明确不做：它以 VictoriaMetrics 自己的 rollup 表为前提，而本服务的
     求值仍读原始样本，接受它会画出与 VM 不同的数——报错比给出错数好。
+  - 其余 MetricsQL rollup 也明确不做：`zscore_over_time`（要按 0.6 分位估计
+    scrape interval 再算 lag）、`integrate` / `lag` / `lifetime` /
+    `ascent_over_time` / `descent_over_time` / `tlast_change_over_time`（要窗口前
+    后之外的样本，也就是 VM 的 `prevValue` / `realNextValue`）、
+    `count_*_over_time` / `share_*_over_time` / `sum_*_over_time`（带第二个参数，
+    且其中几个要用 `prevValue` 把阈值比较折算成时长）、`duration_over_time` /
+    `scrape_interval` / `stale_samples_over_time`（要 VM 自己的 staleness 标记与
+    step 上下文）。这些缺的都是窗口外的数据，硬做只能给出近似值。
   - 测试：解析与求值单测（`aggr_over_time` 的六种聚合、`tmin/tmax` 的时间戳语义、
     线性拟合的期望值、`aggr_over_time(topk, ...)` 与缺 horizon 的 `predict_linear`
-    报错），以及走 actix 路由的端到端用例（`aggr_over_time(avg, ...)`=1.5、
+    报错、新 `*_over_time` 家族各一条：max-min、NaN 被当作缺口丢弃后的中位数与
+    整窗 NaN 的序列丢弃、平方和、几何平均、`-0`/`0` 的 distinct 计数、mode 的
+    并列与单样本、increases/decreases 与 1e-12 容差、`tfirst/tlast` 与
+    `ts_of_*` 等价），以及走 actix 路由的端到端用例（`aggr_over_time(avg, ...)`=1.5、
     `predict_linear(..., 3600)`=363、`default(不存在的指标, 7)` 单条无标签 7、
     `absent_over_time(不存在的指标[60s])`=1）。
 - 已完成（2026-11-11）：`histogram_quantile(q, v)`（经典直方图的 `le` 桶）。

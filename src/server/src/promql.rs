@@ -813,6 +813,28 @@ pub enum RangeFunc {
     DoubleExpSmoothing,
     /// `integral(v[range], strategy=2)` — the integral over time in seconds.
     Integral,
+    /// MetricsQL `range_over_time(v[range])` — `max - min`.
+    RangeOverTime,
+    /// MetricsQL `median_over_time(v[range])` — `quantile(0.5)`.
+    MedianOverTime,
+    /// MetricsQL `sum2_over_time(v[range])` — the sum of the squares.
+    Sum2OverTime,
+    /// MetricsQL `geomean_over_time(v[range])` — `prod ^ (1/n)`.
+    GeomeanOverTime,
+    /// MetricsQL `distinct_over_time(v[range])` — how many distinct values.
+    DistinctOverTime,
+    /// MetricsQL `mode_over_time(v[range])` — the most frequent value.
+    ModeOverTime,
+    /// MetricsQL `increases_over_time(v[range])`.
+    IncreasesOverTime,
+    /// MetricsQL `decreases_over_time(v[range])` — the same rule as `resets`.
+    DecreasesOverTime,
+    /// MetricsQL `tfirst_over_time(v[range])`, an alias of
+    /// `ts_of_first_over_time`.
+    TFirstOverTime,
+    /// MetricsQL `tlast_over_time(v[range])`, an alias of
+    /// `ts_of_last_over_time`.
+    TLastOverTime,
 }
 
 impl RangeFunc {
@@ -845,6 +867,18 @@ impl RangeFunc {
             "ts_of_last_over_time" => RangeFunc::TsOfLastOverTime,
             "ts_of_max_over_time" => RangeFunc::TsOfMaxOverTime,
             "ts_of_min_over_time" => RangeFunc::TsOfMinOverTime,
+            // MetricsQL aliases for the two above.
+            "tfirst_over_time" => RangeFunc::TFirstOverTime,
+            "tlast_over_time" => RangeFunc::TLastOverTime,
+            // MetricsQL rollups that are plain functions of the window.
+            "range_over_time" => RangeFunc::RangeOverTime,
+            "median_over_time" => RangeFunc::MedianOverTime,
+            "sum2_over_time" => RangeFunc::Sum2OverTime,
+            "geomean_over_time" => RangeFunc::GeomeanOverTime,
+            "distinct_over_time" => RangeFunc::DistinctOverTime,
+            "mode_over_time" => RangeFunc::ModeOverTime,
+            "increases_over_time" => RangeFunc::IncreasesOverTime,
+            "decreases_over_time" => RangeFunc::DecreasesOverTime,
             // `double_exponential_smoothing` and `predict_linear` take their
             // range vector first, so they are dispatched by name in `call`
             // rather than through `parse`.
@@ -854,6 +888,24 @@ impl RangeFunc {
 
     fn takes_param(self) -> bool {
         matches!(self, RangeFunc::QuantileOverTime | RangeFunc::PredictLinear)
+    }
+
+    /// The MetricsQL-only rollups, whose input VM cleans of NaNs first
+    /// (`removeNanValues` runs before every rollup function in `eval.go`).
+    fn is_metricsql_rollup(self) -> bool {
+        matches!(
+            self,
+            RangeFunc::RangeOverTime
+                | RangeFunc::MedianOverTime
+                | RangeFunc::Sum2OverTime
+                | RangeFunc::GeomeanOverTime
+                | RangeFunc::DistinctOverTime
+                | RangeFunc::ModeOverTime
+                | RangeFunc::IncreasesOverTime
+                | RangeFunc::DecreasesOverTime
+                | RangeFunc::TFirstOverTime
+                | RangeFunc::TLastOverTime
+        )
     }
 }
 
@@ -2367,7 +2419,10 @@ impl Parser {
                  increase, delta, idelta, deriv, changes, resets, first_over_time, \
                  ts_of_first_over_time, ts_of_last_over_time, ts_of_max_over_time, \
                  ts_of_min_over_time, predict_linear, double_exponential_smoothing, \
-                 integral and *_over_time, the math \
+                 integral and *_over_time, the MetricsQL rollups range_over_time, \
+                 median_over_time, sum2_over_time, geomean_over_time, distinct_over_time, \
+                 mode_over_time, increases_over_time, decreases_over_time, \
+                 tfirst_over_time, tlast_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
                  clamp, clamp_min, clamp_max, scalar, timestamp, the trigonometric and \
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
@@ -3727,6 +3782,30 @@ fn apply_range_func(
     if samples.is_empty() {
         return None;
     }
+    // MetricsQL treats NaN as a gap: VM runs `removeNanValues` over the input
+    // series before *every* rollup function, so none of the `vm_*` arms below
+    // ever sees one. Shadow `samples` with the filtered slice so each arm can
+    // stay a literal transcription of the Go code.
+    let vm_samples: Option<Vec<SamplePoint>> = if func.is_metricsql_rollup() {
+        Some(
+            samples
+                .iter()
+                .filter(|sample| !sample.value.is_nan())
+                .cloned()
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let samples: &[SamplePoint] = match &vm_samples {
+        Some(filtered) => {
+            if filtered.is_empty() {
+                return None;
+            }
+            filtered
+        }
+        None => samples,
+    };
     let first = samples.first()?;
     let last = samples.last()?;
     match func {
@@ -3981,7 +4060,122 @@ fn apply_range_func(
                 Some(sum + c)
             }
         }
+        // ---- MetricsQL rollups (VictoriaMetrics' `rollup.go`)
+        // ---------------- NaNs are already gone (`is_metricsql_rollup`
+        // filtered them), and VM never feeds the sample preceding the window
+        // into these, so `prevValue` is always NaN here — the case VM sees at
+        // the very start of a series.
+        RangeFunc::RangeOverTime => {
+            // `rollupMax` - `rollupMin`: seed with the first value, then
+            // compare.
+            let max = vm_extreme(samples, |current, best| current > best)?;
+            let min = vm_extreme(samples, |current, best| current < best)?;
+            Some(max - min)
+        }
+        RangeFunc::MedianOverTime => {
+            // `rollupMedian` -> `quantile(0.5, ...)`.
+            let mut values: Vec<f64> = samples.iter().map(|s| s.value).collect();
+            values.sort_by(|a, b| a.total_cmp(b));
+            Some(quantile_of(&values, 0.5))
+        }
+        RangeFunc::Sum2OverTime => Some(samples.iter().map(|s| s.value * s.value).sum()),
+        RangeFunc::GeomeanOverTime => {
+            let mut product = 1.0;
+            for sample in samples {
+                product *= sample.value;
+            }
+            Some(product.powf(1.0 / samples.len() as f64))
+        }
+        RangeFunc::DistinctOverTime => {
+            // VM uses `map[float64]struct{}`, and Go treats `-0` and `0` as
+            // the same key, so canonicalise zero before hashing.
+            let mut seen: Vec<u64> = Vec::with_capacity(samples.len());
+            for sample in samples {
+                let bits = if sample.value == 0.0 {
+                    0
+                } else {
+                    sample.value.to_bits()
+                };
+                if !seen.contains(&bits) {
+                    seen.push(bits);
+                }
+            }
+            Some(seen.len() as f64)
+        }
+        // `modeNoNaNs(NaN, values)`: the longest run of equal values after
+        // sorting, with VM's index bookkeeping transcribed as is.
+        RangeFunc::ModeOverTime => {
+            let mut values: Vec<f64> = samples.iter().map(|s| s.value).collect();
+            values.sort_by(|a, b| a.total_cmp(b));
+            let mut prev_value = f64::NAN;
+            let mut j: i64 = -1;
+            let mut max_run = 0i64;
+            let mut mode = f64::NAN;
+            for (i, value) in values.iter().copied().enumerate() {
+                let i = i as i64;
+                if prev_value == value {
+                    continue;
+                }
+                let run = i - j;
+                if run > max_run || mode.is_nan() {
+                    max_run = run;
+                    mode = prev_value;
+                }
+                j = i;
+                prev_value = value;
+            }
+            let run = values.len() as i64 - j;
+            if run > max_run || mode.is_nan() {
+                mode = prev_value;
+            }
+            Some(mode)
+        }
+        // `rollupIncreases`: like `changes`, but only upward steps count, with
+        // VM's 1e-12 relative tolerance for float noise. The first sample only
+        // seeds the comparison because `prevValue` is NaN.
+        RangeFunc::IncreasesOverTime => {
+            let mut count = 0.0;
+            let mut previous = samples[0].value;
+            for sample in &samples[1..] {
+                if sample.value > previous && !vm_is_rounding_noise(previous, sample.value) {
+                    count += 1.0;
+                }
+                previous = sample.value;
+            }
+            Some(count)
+        }
+        // `decreases_over_time` *is* `rollupResets`.
+        RangeFunc::DecreasesOverTime => Some(
+            samples
+                .windows(2)
+                .filter(|pair| {
+                    pair[1].value < pair[0].value
+                        && !vm_is_rounding_noise(pair[0].value, pair[1].value)
+                })
+                .count() as f64,
+        ),
+        // MetricsQL's names for the two `ts_of_*` functions.
+        RangeFunc::TFirstOverTime => samples.first().map(|s| s.timestamp as f64 / 1_000.0),
+        RangeFunc::TLastOverTime => samples.last().map(|s| s.timestamp as f64 / 1_000.0),
     }
+}
+
+/// VM's `math.Abs(v-prevValue) < 1e-12*math.Abs(v)`: a step that small is
+/// treated as floating-point noise rather than a real change.
+fn vm_is_rounding_noise(previous: f64, value: f64) -> bool {
+    (value - previous).abs() < 1e-12 * value.abs()
+}
+
+/// The value `samples` holds when comparing with `better` (VM's `rollupMax` /
+/// `rollupMin`): seed with the first value, then walk forward.
+fn vm_extreme(samples: &[SamplePoint], better: impl Fn(f64, f64) -> bool) -> Option<f64> {
+    let mut best = samples.first()?.value;
+    for sample in &samples[1..] {
+        if better(sample.value, best) {
+            best = sample.value;
+        }
+    }
+    Some(best)
 }
 
 /// Prometheus' `kahansum.Inc`: adds `inc` to `sum` with compensation `c`,
@@ -5157,6 +5351,16 @@ mod tests {
             "range()",
             "step()",
             "max_of(start(), 5s)",
+            "range_over_time(http_requests[5m])",
+            "median_over_time(http_requests[5m])",
+            "sum2_over_time(http_requests[5m])",
+            "geomean_over_time(http_requests[5m])",
+            "distinct_over_time(http_requests[5m])",
+            "mode_over_time(http_requests[5m])",
+            "increases_over_time(http_requests[5m])",
+            "decreases_over_time(http_requests[5m])",
+            "tfirst_over_time(http_requests[5m])",
+            "tlast_over_time(http_requests[5m])",
             "-(a + b)",
             "a and b",
             "a or b",
@@ -5554,6 +5758,132 @@ mod tests {
         };
         assert_eq!(order("sort_by_label(m, \"job\")"), vec!["a", "b"]);
         assert_eq!(order("sort_by_label_desc(m, \"job\")"), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn test_metricsql_over_time_rollups() {
+        let samples = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+                .collect()
+        };
+        let run = |func: RangeFunc, values: &[(i64, f64)]| {
+            apply_range_func(func, &samples(values), 60_000, None, None)
+        };
+        let values = [(0, 1.0), (10_000, 3.0), (20_000, 2.0)];
+        // `range_over_time` is max - min, so 3 - 1.
+        assert_eq!(run(RangeFunc::RangeOverTime, &values), Some(2.0));
+        // `median_over_time` is VM's `quantile(0.5, ...)`, i.e. the same
+        // interpolation Prometheus uses: rank 1 of 3 is the middle sample.
+        assert_eq!(run(RangeFunc::MedianOverTime, &values), Some(2.0));
+        // 1 + 9 + 4.
+        assert_eq!(run(RangeFunc::Sum2OverTime, &values), Some(14.0));
+        // cbrt(1 * 3 * 2).
+        let geomean = run(RangeFunc::GeomeanOverTime, &values).unwrap();
+        assert!((geomean - 6f64.powf(1.0 / 3.0)).abs() < 1e-12, "{geomean}");
+        // Three distinct values out of three samples.
+        assert_eq!(run(RangeFunc::DistinctOverTime, &values), Some(3.0));
+        assert_eq!(
+            run(RangeFunc::DistinctOverTime, &[(0, 1.0), (1, 1.0), (2, 3.0)]),
+            Some(2.0)
+        );
+        // `mode_over_time` picks the value with the longest run: 1, 1, 3 -> 1.
+        assert_eq!(
+            run(
+                RangeFunc::ModeOverTime,
+                &[(0, 1.0), (10_000, 3.0), (20_000, 1.0), (30_000, 1.0)]
+            ),
+            Some(1.0)
+        );
+        // A single sample is its own mode (VM's trailing-run branch).
+        assert_eq!(run(RangeFunc::ModeOverTime, &[(0, 5.0)]), Some(5.0));
+        // 1 -> 3 -> 2 has one increase (1 -> 3), and one decrease (3 -> 2).
+        assert_eq!(run(RangeFunc::IncreasesOverTime, &values), Some(1.0));
+        assert_eq!(run(RangeFunc::DecreasesOverTime, &values), Some(1.0));
+        // A flat series has neither.
+        let flat = [(0, 2.0), (10_000, 2.0), (20_000, 2.0)];
+        assert_eq!(run(RangeFunc::IncreasesOverTime, &flat), Some(0.0));
+        assert_eq!(run(RangeFunc::DecreasesOverTime, &flat), Some(0.0));
+        // The 1e-12 relative tolerance: a step that small is float noise, not
+        // an increase (VM issue #767).
+        assert_eq!(
+            run(
+                RangeFunc::IncreasesOverTime,
+                &[(0, 1e12), (10_000, 1e12 + 1.0)]
+            ),
+            Some(0.0)
+        );
+        // `tfirst_over_time` / `tlast_over_time` are the timestamps in
+        // seconds, exactly like `ts_of_first_over_time` /
+        // `ts_of_last_over_time`.
+        assert_eq!(
+            run(RangeFunc::TFirstOverTime, &values),
+            run(RangeFunc::TsOfFirstOverTime, &values)
+        );
+        assert_eq!(
+            run(RangeFunc::TLastOverTime, &values),
+            run(RangeFunc::TsOfLastOverTime, &values)
+        );
+        assert_eq!(run(RangeFunc::TFirstOverTime, &values), Some(0.0));
+        assert_eq!(run(RangeFunc::TLastOverTime, &values), Some(20.0));
+        // VM drops NaNs from the input series before running any rollup
+        // (`removeNanValues`), so a NaN is a gap here, not a value:
+        // `range_over_time` sees only 1 and 4.
+        let gappy = [(0, 1.0), (10_000, f64::NAN), (20_000, 4.0)];
+        assert_eq!(run(RangeFunc::RangeOverTime, &gappy), Some(3.0));
+        // A window holding nothing but NaNs has no samples left at all, so the
+        // series is dropped.
+        let poisoned = [(0, f64::NAN), (10_000, 4.0)];
+        assert_eq!(run(RangeFunc::RangeOverTime, &poisoned), Some(0.0));
+        assert_eq!(
+            run(
+                RangeFunc::RangeOverTime,
+                &[(0, f64::NAN), (10_000, f64::NAN)]
+            ),
+            None
+        );
+        // `median_over_time` therefore ignores NaNs too, unlike Prometheus'
+        // `quantile_over_time`, which lets them sort to the end.
+        assert_eq!(
+            run(
+                RangeFunc::MedianOverTime,
+                &[(0, 1.0), (10_000, f64::NAN), (20_000, 3.0), (30_000, 5.0)]
+            ),
+            Some(3.0)
+        );
+        // The mode sees the gaps removed as well.
+        assert_eq!(
+            run(
+                RangeFunc::ModeOverTime,
+                &[(0, 1.0), (10_000, f64::NAN), (20_000, 1.0), (30_000, 3.0)]
+            ),
+            Some(1.0)
+        );
+        // `-0` and `0` are the same Go map key.
+        assert_eq!(
+            run(RangeFunc::DistinctOverTime, &[(0, 0.0), (10_000, -0.0)]),
+            Some(1.0)
+        );
+
+        // End to end: the names are wired into the parser, and the range
+        // functions drop `__name__` (neither keeps it like
+        // `first_over_time`).
+        let series = synthetic("m", &[(0, 1.0), (10_000, 3.0), (20_000, 2.0)]);
+        assert_eq!(
+            eval_synthetic(series.clone(), "m", "range_over_time(m[60s])", 20_000),
+            vec![("{}".to_string(), 2.0)]
+        );
+        assert_eq!(
+            eval_synthetic(series.clone(), "m", "mode_over_time(m[60s])", 20_000),
+            // Every value appears once, and VM keeps the first candidate on a
+            // tie, which is the smallest value after sorting.
+            vec![("{}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            eval_synthetic(series, "m", "tlast_over_time(m[60s])", 20_000),
+            vec![("{}".to_string(), 20.0)]
+        );
     }
 
     #[test]
