@@ -787,6 +787,9 @@ pub enum RangeFunc {
     /// `ts_of_min_over_time(v[range])` — the *last* minimal sample's
     /// timestamp (Prometheus compares with `<=`).
     TsOfMinOverTime,
+    /// `double_exponential_smoothing(v[range], sf, tf)` — Holt's linear
+    /// smoothing (Prometheus V2 called it `holt_winters`).
+    DoubleExpSmoothing,
 }
 
 impl RangeFunc {
@@ -819,8 +822,9 @@ impl RangeFunc {
             "ts_of_last_over_time" => RangeFunc::TsOfLastOverTime,
             "ts_of_max_over_time" => RangeFunc::TsOfMaxOverTime,
             "ts_of_min_over_time" => RangeFunc::TsOfMinOverTime,
-            // `predict_linear` takes its range vector first, so it is
-            // dispatched by name in `call` rather than through `parse`.
+            // `double_exponential_smoothing` and `predict_linear` take their
+            // range vector first, so they are dispatched by name in `call`
+            // rather than through `parse`.
             _ => return None,
         })
     }
@@ -1102,6 +1106,10 @@ pub enum Expr {
         func: RangeFunc,
         expr: Box<Expr>,
         param: Option<Box<Expr>>,
+        /// The second scalar argument. Only `double_exponential_smoothing`
+        /// takes two (`sf` and `tf`); every other range function has one or
+        /// none.
+        param2: Option<Box<Expr>>,
     },
     MathFunc {
         func: MathFunc,
@@ -1179,10 +1187,18 @@ impl Expr {
                     param.selectors(out);
                 }
             }
-            Expr::RangeFunc { expr, param, .. } => {
+            Expr::RangeFunc {
+                expr,
+                param,
+                param2,
+                ..
+            } => {
                 expr.selectors(out);
                 if let Some(param) = param {
                     param.selectors(out);
+                }
+                if let Some(param2) = param2 {
+                    param2.selectors(out);
                 }
             }
             Expr::MathFunc { param, expr, .. } => {
@@ -1289,10 +1305,18 @@ impl Expr {
                     param.widen_window(query_start_ms, query_end_ms, start, end);
                 }
             }
-            Expr::RangeFunc { expr, param, .. } => {
+            Expr::RangeFunc {
+                expr,
+                param,
+                param2,
+                ..
+            } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
                 if let Some(param) = param {
                     param.widen_window(query_start_ms, query_end_ms, start, end);
+                }
+                if let Some(param2) = param2 {
+                    param2.widen_window(query_start_ms, query_end_ms, start, end);
                 }
             }
             Expr::MathFunc { param, expr, .. } => {
@@ -1944,21 +1968,35 @@ impl Parser {
                     func: RangeFunc::AggrOverTime(op),
                     expr: Box::new(inner),
                     param: None,
+                    param2: None,
                 });
             }
-            // `predict_linear(v[range], t)` puts the range vector first and the
-            // horizon after it, the reverse of the other parameterised range
-            // functions, so it is dispatched separately too.
-            "predict_linear" => {
+            // `predict_linear(v[range], t)` and
+            // `double_exponential_smoothing(v[range], sf, tf)` put the range
+            // vector first, the reverse of `quantile_over_time(0.9, v[range])`,
+            // so they are dispatched separately too.
+            "predict_linear" | "double_exponential_smoothing" => {
                 self.expect(Token::LParen)?;
                 let inner = self.range_argument(name)?;
                 self.expect(Token::Comma)?;
-                let param = self.expression(0)?;
+                let first = self.expression(0)?;
+                let second = if name == "double_exponential_smoothing" {
+                    self.expect(Token::Comma)?;
+                    Some(Box::new(self.expression(0)?))
+                } else {
+                    None
+                };
                 self.expect(Token::RParen)?;
+                let func = if name == "predict_linear" {
+                    RangeFunc::PredictLinear
+                } else {
+                    RangeFunc::DoubleExpSmoothing
+                };
                 return Ok(Expr::RangeFunc {
-                    func: RangeFunc::PredictLinear,
+                    func,
                     expr: Box::new(inner),
-                    param: Some(Box::new(param)),
+                    param: Some(Box::new(first)),
+                    param2: second,
                 });
             }
             _ => {}
@@ -1999,6 +2037,7 @@ impl Parser {
                     func,
                     expr: Box::new(inner),
                     param: Some(Box::new(param)),
+                    param2: None,
                 });
             }
             let inner = self.range_argument(name)?;
@@ -2007,6 +2046,7 @@ impl Parser {
                 func,
                 expr: Box::new(inner),
                 param: None,
+                param2: None,
             });
         }
         if let Some(func) = MathFunc::parse(name) {
@@ -2145,7 +2185,8 @@ impl Parser {
                 "unknown function {other:?}; supported range functions are rate, irate, \
                  increase, delta, idelta, deriv, changes, resets, first_over_time, \
                  ts_of_first_over_time, ts_of_last_over_time, ts_of_max_over_time, \
-                 ts_of_min_over_time and *_over_time, the math \
+                 ts_of_min_over_time, predict_linear, double_exponential_smoothing \
+                 and *_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
                  clamp, clamp_min, clamp_max, scalar, timestamp, the trigonometric and \
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
@@ -2479,9 +2520,12 @@ impl<'a> Evaluator<'a> {
                 param,
                 grouping,
             } => self.aggregate(*op, expr, param.as_deref(), grouping.as_ref(), at_ms),
-            Expr::RangeFunc { func, expr, param } => {
-                self.range_func(*func, expr, param.as_deref(), at_ms)
-            }
+            Expr::RangeFunc {
+                func,
+                expr,
+                param,
+                param2,
+            } => self.range_func(*func, expr, param.as_deref(), param2.as_deref(), at_ms),
             Expr::MathFunc { func, param, expr } => {
                 self.math_func(*func, expr, param.as_deref(), at_ms)
             }
@@ -2978,6 +3022,7 @@ impl<'a> Evaluator<'a> {
         func: RangeFunc,
         expr: &Expr,
         param: Option<&Expr>,
+        param2: Option<&Expr>,
         at_ms: i64,
     ) -> Result<Instant> {
         let matrix = self.matrix_of(expr, at_ms)?;
@@ -2989,6 +3034,10 @@ impl<'a> Evaluator<'a> {
         };
         let param = match param {
             Some(param) => Some(self.scalar_of(param, at_ms)?),
+            None => None,
+        };
+        let param2 = match param2 {
+            Some(param2) => Some(self.scalar_of(param2, at_ms)?),
             None => None,
         };
         if func == RangeFunc::QuantileOverTime && param.is_none() {
@@ -3008,6 +3057,29 @@ impl<'a> Evaluator<'a> {
         if func == RangeFunc::PredictLinear && param.is_none() {
             return bad("predict_linear needs a horizon in seconds");
         }
+        if func == RangeFunc::DoubleExpSmoothing {
+            // Prometheus panics on these; a 400 is the honest equivalent. The
+            // bounds are written as two comparisons so a NaN factor passes
+            // through (as it does in Go, where `NaN <= 0` and `NaN >= 1` are
+            // both false) and simply yields NaN results.
+            let (Some(sf), Some(tf)) = (param, param2) else {
+                return bad(
+                    "double_exponential_smoothing needs a smoothing factor and a trend factor",
+                );
+            };
+            if sf <= 0.0 || sf >= 1.0 {
+                return bad(format!(
+                    "invalid smoothing factor: expected 0 < sf < 1, got {}",
+                    format_float_g(sf)
+                ));
+            }
+            if tf <= 0.0 || tf >= 1.0 {
+                return bad(format!(
+                    "invalid trend factor: expected 0 < tf < 1, got {}",
+                    format_float_g(tf)
+                ));
+            }
+        }
         let mut vector = Vector::default();
         // `absent_over_time` is the one range function whose answer is "1" when
         // nothing matched: Prometheus returns a single label-less 1 for a
@@ -3022,7 +3094,7 @@ impl<'a> Evaluator<'a> {
             });
         }
         for series in &matrix.0 {
-            if let Some(value) = apply_range_func(func, &series.samples, range_ms, param) {
+            if let Some(value) = apply_range_func(func, &series.samples, range_ms, param, param2) {
                 let mut labels = series.labels.clone();
                 // `first_over_time` and `last_over_time` act like `offset`, so
                 // Prometheus keeps the metric name for them; every other range
@@ -3309,6 +3381,7 @@ fn apply_range_func(
     samples: &[SamplePoint],
     range_ms: i64,
     param: Option<f64>,
+    param2: Option<f64>,
 ) -> Option<f64> {
     if samples.is_empty() {
         return None;
@@ -3402,7 +3475,8 @@ fn apply_range_func(
             )
         }
         RangeFunc::StddevOverTime => {
-            let variance = apply_range_func(RangeFunc::StdvarOverTime, samples, range_ms, None)?;
+            let variance =
+                apply_range_func(RangeFunc::StdvarOverTime, samples, range_ms, None, None)?;
             Some(variance.sqrt())
         }
         RangeFunc::QuantileOverTime => {
@@ -3480,7 +3554,42 @@ fn apply_range_func(
             let (slope, _) = linear_regression(samples, samples[0].timestamp);
             Some(slope)
         }
+        // Holt's linear ("double exponential") smoothing, transcribed from
+        // Prometheus' `funcDoubleExponentialSmoothing`: seed the level with the
+        // first sample and the trend with the first difference, then walk the
+        // series forward. `calcTrendValue` keeps `b` unchanged on the very
+        // first step (its `i == 0` case), so a two-sample series reproduces the
+        // straight line through them. Fewer than two float samples has no
+        // smoothing to do and the series is dropped.
+        RangeFunc::DoubleExpSmoothing => {
+            let (sf, tf) = (param?, param2?);
+            if samples.len() < 2 {
+                return None;
+            }
+            let mut s0 = 0.0;
+            let mut s1 = samples[0].value;
+            let mut b = samples[1].value - samples[0].value;
+            for (i, sample) in samples.iter().enumerate().skip(1) {
+                let x = sf * sample.value;
+                b = calc_trend_value(i - 1, tf, s0, s1, b);
+                let y = (1.0 - sf) * (s1 + b);
+                s0 = s1;
+                s1 = x + y;
+            }
+            Some(s1)
+        }
     }
+}
+
+/// Prometheus' `calcTrendValue`: the damped trend, with `i == 0` meaning "the
+/// initial `b` stands".
+fn calc_trend_value(i: usize, tf: f64, s0: f64, s1: f64, b: f64) -> f64 {
+    if i == 0 {
+        return b;
+    }
+    let x = tf * (s1 - s0);
+    let y = (1.0 - tf) * b;
+    x + y
 }
 
 /// Least squares fit of `samples`, with `x` in seconds from `origin_ms`.
@@ -4469,34 +4578,59 @@ mod tests {
         let values = samples.iter().map(|s| s.value).collect::<Vec<f64>>();
         assert_eq!(values.len(), 3);
         assert_eq!(
-            apply_range_func(RangeFunc::AggrOverTime(AggOp::Sum), &samples, 3_000, None),
+            apply_range_func(
+                RangeFunc::AggrOverTime(AggOp::Sum),
+                &samples,
+                3_000,
+                None,
+                None
+            ),
             Some(7.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::AggrOverTime(AggOp::Avg), &samples, 3_000, None),
+            apply_range_func(
+                RangeFunc::AggrOverTime(AggOp::Avg),
+                &samples,
+                3_000,
+                None,
+                None
+            ),
             Some(7.0 / 3.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::AggrOverTime(AggOp::Max), &samples, 3_000, None),
+            apply_range_func(
+                RangeFunc::AggrOverTime(AggOp::Max),
+                &samples,
+                3_000,
+                None,
+                None
+            ),
             Some(4.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::AggrOverTime(AggOp::Min), &samples, 3_000, None),
+            apply_range_func(
+                RangeFunc::AggrOverTime(AggOp::Min),
+                &samples,
+                3_000,
+                None,
+                None
+            ),
             Some(1.0)
         );
         // The extreme value is 4 at ts 1 s and 1 at ts 2 s.
         assert_eq!(
-            apply_range_func(RangeFunc::TMinOverTime, &samples, 3_000, None),
+            apply_range_func(RangeFunc::TMinOverTime, &samples, 3_000, None, None),
             Some(2.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::TMaxOverTime, &samples, 3_000, None),
+            apply_range_func(RangeFunc::TMaxOverTime, &samples, 3_000, None, None),
             Some(1.0)
         );
         // Linear fit of (0,2),(1,4),(2,1): slope -0.5, mean 7/3 at t=1, so the
         // line is 17/6 - t/2 and the prediction at t = last + 1 = 3 is 4/3.
-        let predicted = apply_range_func(RangeFunc::PredictLinear, &samples, 3_000, Some(1.0))
-            .expect("predict_linear returns a value");
+        let predicted =
+            apply_range_func(RangeFunc::PredictLinear, &samples, 3_000, Some(1.0), None)
+                .expect("predict_linear returns a value");
         assert!((predicted - 4.0 / 3.0).abs() < 1e-9, "got {predicted}");
         assert!(values.len() == 3);
     }
@@ -4513,37 +4647,43 @@ mod tests {
         // the values are.
         let evident = samples(&[(0, 2.0), (1_000, 4.0)]);
         assert_eq!(
-            apply_range_func(RangeFunc::PresentOverTime, &evident, 3_000, None),
+            apply_range_func(RangeFunc::PresentOverTime, &evident, 3_000, None, None),
             Some(1.0)
         );
         let all_nan = samples(&[(0, f64::NAN)]);
         assert_eq!(
-            apply_range_func(RangeFunc::PresentOverTime, &all_nan, 3_000, None),
+            apply_range_func(RangeFunc::PresentOverTime, &all_nan, 3_000, None, None),
             Some(1.0)
         );
         // An empty series never reaches the function, but it must not report
         // presence either.
         assert_eq!(
-            apply_range_func(RangeFunc::PresentOverTime, &[], 3_000, None),
+            apply_range_func(RangeFunc::PresentOverTime, &[], 3_000, None, None),
             None
         );
         // mad = median(|v - median|): [1,2,3,4] has median 2.5 and deviations
         // [1.5,0.5,0.5,1.5], whose median is 1.
         let symmetric = samples(&[(0, 1.0), (1_000, 2.0), (2_000, 3.0), (3_000, 4.0)]);
         assert_eq!(
-            apply_range_func(RangeFunc::MadOverTime, &symmetric, 4_000, None),
+            apply_range_func(RangeFunc::MadOverTime, &symmetric, 4_000, None, None),
             Some(1.0)
         );
         // A single sample deviates from its own median by 0.
         assert_eq!(
-            apply_range_func(RangeFunc::MadOverTime, &samples(&[(0, 7.0)]), 1_000, None),
+            apply_range_func(
+                RangeFunc::MadOverTime,
+                &samples(&[(0, 7.0)]),
+                1_000,
+                None,
+                None
+            ),
             Some(0.0)
         );
         // NaN makes both medians undefined, so the whole result is NaN instead
         // of silently dropping the sample.
         let with_nan = samples(&[(0, 1.0), (1_000, f64::NAN), (2_000, 3.0)]);
         assert!(
-            apply_range_func(RangeFunc::MadOverTime, &with_nan, 3_000, None)
+            apply_range_func(RangeFunc::MadOverTime, &with_nan, 3_000, None, None)
                 .unwrap()
                 .is_nan()
         );
@@ -4785,6 +4925,99 @@ mod tests {
     }
 
     #[test]
+    fn test_double_exponential_smoothing() {
+        // A perfectly linear series stays on its line: the trend seeded from
+        // the first difference is exact, so every step reproduces `v[i]`.
+        let linear = synthetic("m", &[(0, 1.0), (10_000, 2.0), (20_000, 3.0)]);
+        assert_eq!(
+            eval_synthetic(
+                linear.clone(),
+                "m",
+                "double_exponential_smoothing(m[60s], 0.5, 0.5)",
+                20_000
+            ),
+            vec![("{}".to_string(), 3.0)]
+        );
+        // A constant series is reproduced exactly too.
+        let flat = synthetic("m", &[(0, 7.0), (10_000, 7.0), (20_000, 7.0)]);
+        assert_eq!(
+            eval_synthetic(
+                flat,
+                "m",
+                "double_exponential_smoothing(m[60s], 0.5, 0.5)",
+                20_000
+            ),
+            vec![("{}".to_string(), 7.0)]
+        );
+        // A two-sample series is the straight line through them, again because
+        // `calcTrendValue(0, ...)` returns the seeded `b` untouched:
+        // s1 = sf*v1 + (1-sf)*(v0 + (v1-v0)) = v1.
+        let two = synthetic("m", &[(0, 2.0), (10_000, 8.0)]);
+        assert_eq!(
+            eval_synthetic(
+                two,
+                "m",
+                "double_exponential_smoothing(m[60s], 0.9, 0.9)",
+                10_000
+            ),
+            vec![("{}".to_string(), 8.0)]
+        );
+        // A non-linear series exercises the damping: hand-worked with the same
+        // loop Prometheus runs (see the transcription in `apply_range_func`).
+        let bumpy = synthetic(
+            "m",
+            &[(0, 5.0), (10_000, 3.0), (20_000, 4.0), (30_000, 6.0)],
+        );
+        let got = eval_synthetic(
+            bumpy,
+            "m",
+            "double_exponential_smoothing(m[60s], 0.4, 0.6)",
+            30_000,
+        );
+        assert_eq!(got.len(), 1);
+        assert!(
+            (got[0].1 - 2.952).abs() < 1e-12,
+            "expected 2.952 for sf=0.4 tf=0.6, got {}",
+            got[0].1
+        );
+        // Fewer than two samples: Prometheus drops the series.
+        let single = synthetic("m", &[(0, 1.0)]);
+        assert!(eval_synthetic(
+            single,
+            "m",
+            "double_exponential_smoothing(m[60s], 0.5, 0.5)",
+            0
+        )
+        .is_empty());
+        // The factors must be strictly inside (0, 1); zero, one and
+        // out-of-range are 400s rather than silent garbage.
+        let series = synthetic("m", &[(0, 1.0), (10_000, 2.0)]);
+        for query in [
+            "double_exponential_smoothing(m[60s], 0, 0.5)",
+            "double_exponential_smoothing(m[60s], 1, 0.5)",
+            "double_exponential_smoothing(m[60s], 0.5, 0)",
+            "double_exponential_smoothing(m[60s], 0.5, 1.5)",
+        ] {
+            let err = eval_err(series.clone(), "m", query, 10_000);
+            assert!(
+                err.contains("invalid smoothing factor") || err.contains("invalid trend factor"),
+                "{query} gave {err}"
+            );
+        }
+        // Name is dropped like every other derived range function.
+        assert!(!eval_series(
+            vec![synthetic("m", &[(0, 1.0), (10_000, 2.0)])],
+            "m",
+            "double_exponential_smoothing(m[60s], 0.5, 0.5)",
+            10_000
+        )
+        .vector
+        .0[0]
+            .labels
+            .contains_key("__name__"));
+    }
+
+    #[test]
     fn test_first_and_ts_of_over_time() {
         // 10, 20, 30, 30 at 0/10/20/30 s: the duplicated maximum is what
         // distinguishes `ts_of_max_over_time` (`>=`, last one) from a
@@ -4967,7 +5200,7 @@ mod tests {
             },
         ];
         // The same fit `predict_linear` uses: slope -0.5 per second.
-        let slope = apply_range_func(RangeFunc::Deriv, &samples, 3_000, None).unwrap();
+        let slope = apply_range_func(RangeFunc::Deriv, &samples, 3_000, None, None).unwrap();
         assert!((slope + 0.5).abs() < 1e-9, "got {slope}");
         // A constant series is exactly zero, not floating-point noise.
         let flat = [
@@ -4981,12 +5214,12 @@ mod tests {
             },
         ];
         assert_eq!(
-            apply_range_func(RangeFunc::Deriv, &flat, 3_000, None),
+            apply_range_func(RangeFunc::Deriv, &flat, 3_000, None, None),
             Some(0.0)
         );
         // One sample has no slope at all, so the series disappears.
         assert_eq!(
-            apply_range_func(RangeFunc::Deriv, &samples[..1], 3_000, None),
+            apply_range_func(RangeFunc::Deriv, &samples[..1], 3_000, None, None),
             None
         );
     }
@@ -5186,6 +5419,24 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{query:?} failed: {e:?}"))
                 .vector,
         )
+    }
+
+    /// Evaluates `query` over one synthetic series and returns the error
+    /// message, panicking if it unexpectedly succeeds.
+    fn eval_err(series: SeriesSamples, selector_query: &str, query: &str, at_ms: i64) -> String {
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector(selector_query)), vec![series]);
+        let expr = parse_ok(query);
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: at_ms,
+            query_end_ms: at_ms,
+        };
+        match evaluator.eval(&expr, at_ms) {
+            Ok(instant) => panic!("{query:?} unexpectedly succeeded: {instant:?}"),
+            Err(Error::Bad(message)) => message,
+            Err(other) => panic!("{query:?} failed with an unexpected error: {other:?}"),
+        }
     }
 
     /// Evaluates `query` over several synthetic series and returns the whole
@@ -5466,30 +5717,30 @@ mod tests {
             },
         ];
         assert_eq!(
-            apply_range_func(RangeFunc::Increase, &samples, 4_000, None),
+            apply_range_func(RangeFunc::Increase, &samples, 4_000, None, None),
             Some(17.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::Delta, &samples, 4_000, None),
+            apply_range_func(RangeFunc::Delta, &samples, 4_000, None, None),
             Some(-3.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::Changes, &samples, 4_000, None),
+            apply_range_func(RangeFunc::Changes, &samples, 4_000, None, None),
             Some(3.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::Resets, &samples, 4_000, None),
+            apply_range_func(RangeFunc::Resets, &samples, 4_000, None, None),
             Some(1.0)
         );
         // Rate of the increase over three seconds.
-        let rate = apply_range_func(RangeFunc::Rate, &samples, 4_000, None).unwrap();
+        let rate = apply_range_func(RangeFunc::Rate, &samples, 4_000, None, None).unwrap();
         assert!((rate - 17.0 / 3.0).abs() < 1e-12);
         assert_eq!(
-            apply_range_func(RangeFunc::LastOverTime, &samples, 4_000, None),
+            apply_range_func(RangeFunc::LastOverTime, &samples, 4_000, None, None),
             Some(7.0)
         );
         assert_eq!(
-            apply_range_func(RangeFunc::CountOverTime, &samples, 4_000, None),
+            apply_range_func(RangeFunc::CountOverTime, &samples, 4_000, None, None),
             Some(4.0)
         );
     }

@@ -226,7 +226,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - **区间向量** `metric[5m]` 与区间函数：`rate`、`irate`、`increase`、`delta`、
     `idelta`、`changes`、`resets`、`deriv`、`present_over_time`、`mad_over_time`、
     `first_over_time`、`ts_of_first_over_time`、`ts_of_last_over_time`、
-    `ts_of_max_over_time`、`ts_of_min_over_time`、
+    `ts_of_max_over_time`、`ts_of_min_over_time`、`predict_linear`、
+    `double_exponential_smoothing`、
     `*_over_time`（`avg/min/max/sum/count/last/stddev/stdvar/quantile`）。
     `rate`/`increase` 按 Prometheus 规则处理计数器回绕（下降视为归零后继续累加），
     单位是「每秒」；`deriv` 是最小二乘斜率（每秒），只有 1 个样本时该序列不出现；
@@ -486,6 +487,21 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     这顺带修掉了 `last_over_time` 之前丢指标名的既有偏差，并且让原始区间选择器与
     子查询两条路径一致（`select_range` 现在把 `__name__` 一并放进
     `RangeSeries.labels`，由 range 函数决定去留）。
+- 已完成（2026-11-13）：`double_exponential_smoothing(v[range], sf, tf)`（Prometheus V2
+  里的 `holt_winters`）。逐行照抄 `funcDoubleExponentialSmoothing` 与
+  `calcTrendValue`：用第一个样本做水平初值 `s1`、用第一个差分做趋势初值 `b`，然后
+  按 `x = sf*v[i]`、`b = calcTrendValue(i-1, tf, s0, s1, b)`、`y = (1-sf)*(s1+b)`、
+  `s1 = x+y` 递推；`calcTrendValue` 的 `i == 0` 分支直接返回原 `b`，所以两样本序列
+  恰好还原为过这两点的直线，测试用这个性质与「严格线性序列原样复现」钉住。
+  - `sf` / `tf` 必须严格落在 `(0, 1)`；Prometheus 在越界时 panic，这里返回 400
+    并点名是哪个因子。NaN 因子按 Go 的比较语义放行（`NaN <= 0` 与 `NaN >= 1` 都为假），
+    结果自然是 NaN。
+  - 少于两个样本时该序列不出现（Prometheus 的 `l < 2` 分支）；
+  - 为此把 `Expr::RangeFunc` 的单参数扩成 `param` + `param2`，解析、`selectors`、
+    `scan_window` 的窗口推导与错误信息一并覆盖第二个参数。
+  - 测试：线性序列复现、常数序列、两样本等于端点、非线性序列（`5,3,4,6` 配
+    `sf=0.4 tf=0.6` 得 2.952）、单样本被丢弃、四种越界因子各自报错、以及
+    `__name__` 被丢弃。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
