@@ -42,7 +42,9 @@
 //!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`,
 //!   `predict_linear(v[range], t)`, the `*_over_time` family, the label helpers
 //!   `label_set` / `label_del` / `label_keep` / `label_copy` / `label_move` /
-//!   `label_value` / `alias`, and the classic-bucket summary functions
+//!   `label_value` / `alias`, the label transforms `label_map` /
+//!   `label_uppercase` / `label_lowercase` / `label_transform` / `label_match`
+//!   / `label_mismatch`, and the classic-bucket summary functions
 //!   `histogram_avg` / `histogram_stddev` / `histogram_stdvar`.
 //!
 //! The parameterised range functions that put the range vector first —
@@ -90,6 +92,14 @@
 //! destination, and `label_move` then deletes the source; `label_value`
 //! replaces every non-NaN value with the named label's text parsed as a
 //! float (NaN when it is not a number) and drops the metric name.
+//!
+//! `label_map` / `label_uppercase` / `label_lowercase` / `label_transform` /
+//! `label_match` / `label_mismatch` follow the same file: `label_map` replaces
+//! a listed value and leaves an unlisted one alone (a mapping to `""` deletes
+//! the label), the case functions only touch the labels they name, and
+//! `label_transform` replaces every (unanchored) regex match inside the value
+//! while `label_match` / `label_mismatch` anchor their regex and drop the
+//! series that (does not) match.
 //!
 //! `histogram_avg` / `histogram_stddev` / `histogram_stdvar` are
 //! VictoriaMetrics' classic-`le` versions, not Prometheus' native-histogram
@@ -1187,6 +1197,48 @@ impl LabelOp {
     }
 }
 
+/// MetricsQL's remaining per-series label transforms: value mapping, case
+/// conversion, regex rewriting and regex filtering.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LabelFilterOp {
+    /// `label_map(v, "label", "old", "new", ...)` — replaces the label's
+    /// value when it is one of the listed keys; an unmapped value is left
+    /// alone, and an empty result deletes the label.
+    Map {
+        label: String,
+        pairs: Vec<(String, String)>,
+    },
+    /// `label_uppercase(v, "label", ...)` / `label_lowercase(v, ...)`.
+    Case { upper: bool, labels: Vec<String> },
+    /// `label_transform(v, "label", "regex", "replacement")` — replaces every
+    /// match of the (unanchored) regex inside the label's value.
+    Transform {
+        label: String,
+        pattern: Pattern,
+        replacement: String,
+    },
+    /// `label_match(v, "label", "regex")` / `label_mismatch(v, ...)` — keeps
+    /// the series whose label value does (not) match the anchored regex.
+    Match {
+        label: String,
+        pattern: Pattern,
+        negate: bool,
+    },
+}
+
+impl LabelFilterOp {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LabelFilterOp::Map { .. } => "label_map",
+            LabelFilterOp::Case { upper: true, .. } => "label_uppercase",
+            LabelFilterOp::Case { upper: false, .. } => "label_lowercase",
+            LabelFilterOp::Transform { .. } => "label_transform",
+            LabelFilterOp::Match { negate: false, .. } => "label_match",
+            LabelFilterOp::Match { negate: true, .. } => "label_mismatch",
+        }
+    }
+}
+
 /// The MetricsQL summary functions over classic `le` buckets
 /// (`avgForLeTimeseries` / `stdvarForLeTimeseries` in `transform.go`).
 ///
@@ -1309,6 +1361,11 @@ pub enum Expr {
     /// `label_copy`, `label_move`, `label_value` and `alias`.
     LabelOp {
         op: LabelOp,
+        expr: Box<Expr>,
+    },
+    /// MetricsQL's value-mapping, case, rewrite and filter label functions.
+    LabelFilter {
+        op: LabelFilterOp,
         expr: Box<Expr>,
     },
     Sort {
@@ -1463,7 +1520,8 @@ impl Expr {
             }
             Expr::LabelReplace { expr, .. }
             | Expr::LabelJoin { expr, .. }
-            | Expr::LabelOp { expr, .. } => expr.selectors(out),
+            | Expr::LabelOp { expr, .. }
+            | Expr::LabelFilter { expr, .. } => expr.selectors(out),
         }
     }
 
@@ -1603,7 +1661,8 @@ impl Expr {
             }
             Expr::LabelReplace { expr, .. }
             | Expr::LabelJoin { expr, .. }
-            | Expr::LabelOp { expr, .. } => {
+            | Expr::LabelOp { expr, .. }
+            | Expr::LabelFilter { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
             }
         }
@@ -2202,6 +2261,8 @@ impl Parser {
             // `label_replace`.
             "label_set" | "label_del" | "label_keep" | "label_copy" | "label_move"
             | "label_value" | "alias" => return self.label_op(name),
+            "label_map" | "label_uppercase" | "label_lowercase" | "label_transform"
+            | "label_match" | "label_mismatch" => return self.label_filter(name),
             // `aggr_over_time(avg, v[range])` names an aggregation where the
             // other range functions take a vector, so it is dispatched first.
             "aggr_over_time" => {
@@ -2565,7 +2626,8 @@ impl Parser {
                  the query-context \
                  functions start, end, range, step, and the label functions label_replace, \
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
-                 label_value and alias"
+                 label_value, label_map, label_uppercase, label_lowercase, label_transform, \
+                 label_match, label_mismatch and alias"
             )),
         }
     }
@@ -2639,6 +2701,85 @@ impl Parser {
         }
         self.expect(Token::RParen)?;
         Ok(out)
+    }
+
+    /// Parses MetricsQL's value-mapping, case, rewrite and filter label
+    /// functions.
+    ///
+    /// `label_transform` and `label_match` compile their regex with Go's
+    /// `regexp.Compile`: `label_transform` replaces every (unanchored) match
+    /// inside the value, while `label_match` / `label_mismatch` anchor it,
+    /// exactly as `metricsql.CompileRegexp` and `CompileRegexpAnchored` do.
+    fn label_filter(&mut self, name: &str) -> Result<Expr> {
+        self.expect(Token::LParen)?;
+        let expr = self.expression(0)?;
+        let op = match name {
+            "label_map" => {
+                self.expect(Token::Comma)?;
+                let label = self.string_argument(name)?;
+                let strings = self.string_list(name)?;
+                if strings.len() % 2 != 0 {
+                    return bad(format!(
+                        "the number of string args to {name} must be even; got {}",
+                        strings.len()
+                    ));
+                }
+                let mut pairs = Vec::with_capacity(strings.len() / 2);
+                let mut strings = strings.into_iter();
+                while let (Some(key), Some(value)) = (strings.next(), strings.next()) {
+                    pairs.push((key, value));
+                }
+                LabelFilterOp::Map { label, pairs }
+            }
+            "label_uppercase" | "label_lowercase" => {
+                let labels = self.string_list(name)?;
+                if labels.is_empty() {
+                    return bad(format!("{name} needs at least one label name"));
+                }
+                LabelFilterOp::Case {
+                    upper: name == "label_uppercase",
+                    labels,
+                }
+            }
+            "label_transform" => {
+                self.expect(Token::Comma)?;
+                let label = self.string_argument(name)?;
+                self.expect(Token::Comma)?;
+                let pattern = self.string_argument(name)?;
+                self.expect(Token::Comma)?;
+                let replacement = self.string_argument(name)?;
+                self.expect(Token::RParen)?;
+                let regex = regex::Regex::new(&pattern).map_err(|e| {
+                    Error::Bad(format!("cannot compile regex {pattern:?} in {name}: {e}"))
+                })?;
+                LabelFilterOp::Transform {
+                    label,
+                    pattern: Pattern(regex),
+                    replacement,
+                }
+            }
+            _ => {
+                self.expect(Token::Comma)?;
+                let label = self.string_argument(name)?;
+                self.expect(Token::Comma)?;
+                let pattern = self.string_argument(name)?;
+                self.expect(Token::RParen)?;
+                // `label_match` is `^(?:pattern)$`, like Prometheus' label
+                // matchers and `label_replace`.
+                let regex = regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| {
+                    Error::Bad(format!("cannot compile regex {pattern:?} in {name}: {e}"))
+                })?;
+                LabelFilterOp::Match {
+                    label,
+                    pattern: Pattern(regex),
+                    negate: name == "label_mismatch",
+                }
+            }
+        };
+        Ok(Expr::LabelFilter {
+            op,
+            expr: Box::new(expr),
+        })
     }
 
     /// Parses a quoted string argument, the only form `label_replace` and
@@ -3097,6 +3238,87 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Instant {
                     vector: histogram_quantiles(&values, label, &instant.vector)?,
+                    scalar: None,
+                })
+            }
+            Expr::LabelFilter { op, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad(format!(
+                        "{} expects an instant vector, got a scalar",
+                        op.name()
+                    ));
+                }
+                let mut vector = Vector::default();
+                for mut point in instant.vector.0 {
+                    let keep = match op {
+                        LabelFilterOp::Map { label, pairs } => {
+                            // VM looks the current value up in a Go map built
+                            // from the pairs, so a repeated key keeps the last
+                            // mapping. A missing label is the empty string,
+                            // which means a mapping for `""` *creates* it.
+                            let current = point.labels.get(label).cloned().unwrap_or_default();
+                            let mapped = pairs
+                                .iter()
+                                .rev()
+                                .find(|(key, _)| *key == current)
+                                .map(|(_, value)| value.clone());
+                            let value = mapped.unwrap_or(current);
+                            // VM's `getDstValue` writes the result and then
+                            // drops the tag when it is empty.
+                            if value.is_empty() {
+                                point.labels.remove(label);
+                            } else {
+                                point.labels.insert(label.clone(), value);
+                            }
+                            true
+                        }
+                        LabelFilterOp::Case { upper, labels } => {
+                            // Go's `strings.ToUpper` / `ToLower` are Unicode
+                            // aware; Rust's `to_uppercase` / `to_lowercase`
+                            // agree on the mappings Golang applies.
+                            for name in labels {
+                                if let Some(value) = point.labels.get_mut(name) {
+                                    let mapped = if *upper {
+                                        value.to_uppercase()
+                                    } else {
+                                        value.to_lowercase()
+                                    };
+                                    *value = mapped;
+                                }
+                            }
+                            true
+                        }
+                        LabelFilterOp::Transform {
+                            label,
+                            pattern,
+                            replacement,
+                        } => {
+                            if let Some(value) = point.labels.get(label) {
+                                // Go's `ReplaceAll` expands `$1` / `${name}`
+                                // in the replacement and replaces every match;
+                                // `regex::Regex` does the same with
+                                // `replace_all`.
+                                let replaced = pattern.0.replace_all(value, replacement.as_str());
+                                point.labels.insert(label.clone(), replaced.into_owned());
+                            }
+                            true
+                        }
+                        LabelFilterOp::Match {
+                            label,
+                            pattern,
+                            negate,
+                        } => {
+                            let value = point.labels.get(label).map(String::as_str).unwrap_or("");
+                            pattern.0.is_match(value) != *negate
+                        }
+                    };
+                    if keep {
+                        vector.push_point(&point);
+                    }
+                }
+                Ok(Instant {
+                    vector,
                     scalar: None,
                 })
             }
@@ -5720,6 +5942,12 @@ mod tests {
             r#"label_move(http_requests, "a", "b")"#,
             r#"label_value(http_requests, "a")"#,
             r#"alias(http_requests, "name")"#,
+            r#"label_map(http_requests, "job", "api", "backend")"#,
+            r#"label_uppercase(http_requests, "job")"#,
+            r#"label_lowercase(http_requests, "job")"#,
+            r#"label_transform(http_requests, "job", "a", "b")"#,
+            r#"label_match(http_requests, "job", "api")"#,
+            r#"label_mismatch(http_requests, "job", "api")"#,
             "histogram_avg(http_latency_bucket)",
             "histogram_stddev(http_latency_bucket)",
             "histogram_stdvar(http_latency_bucket)",
@@ -8415,6 +8643,175 @@ mod tests {
         assert!(value_of(numeric(), r#"label_value(http_requests, "zone")"#).is_nan());
         let gappy = synthetic_labeled("http_requests", &[("port", "9090")], &[(0, f64::NAN)]);
         assert!(value_of(gappy, r#"label_value(http_requests, "port")"#).is_nan());
+    }
+
+    #[test]
+    fn test_metricsql_label_filters() {
+        let series = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("instance", "10.0.0.1"), ("job", "api")],
+                &[(0, 1.0)],
+            )
+        };
+        let run = |query: &str| eval_synthetic(series(), "http_requests", query, 0);
+        // A listed value is replaced; the pairs are a map, so only exact keys
+        // match.
+        assert_eq!(
+            run(r#"label_map(http_requests, "job", "api", "backend")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"backend\"}".to_string(),
+                1.0
+            )]
+        );
+        // An unlisted value passes through untouched.
+        assert_eq!(
+            run(r#"label_map(http_requests, "job", "db", "backend")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // A mapping to an empty string deletes the label (VM's `RemoveTag`).
+        assert_eq!(
+            run(r#"label_map(http_requests, "job", "api", "")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\"}".to_string(),
+                1.0
+            )]
+        );
+        // A repeated key keeps the last mapping, like VM's Go map.
+        assert_eq!(
+            run(r#"label_map(http_requests, "job", "api", "one", "api", "two")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"two\"}".to_string(),
+                1.0
+            )]
+        );
+        // A mapping for the empty string *creates* the label, since a missing
+        // label is the empty string in VM's `GetTagValue`.
+        assert_eq!(
+            run(r#"label_map(http_requests, "zone", "", "eu")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\",zone=\"eu\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+        // The case functions only touch the labels they name.
+        assert_eq!(
+            run(r#"label_uppercase(http_requests, "job")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"API\"}".to_string(),
+                1.0
+            )]
+        );
+        let mixed = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("job", "Api"), ("zone", "EU")],
+                &[(0, 1.0)],
+            )
+        };
+        assert_eq!(
+            eval_synthetic(
+                mixed(),
+                "http_requests",
+                r#"label_lowercase(http_requests, "job", "zone")"#,
+                0
+            ),
+            vec![(
+                "{__name__=\"http_requests\",job=\"api\",zone=\"eu\"}".to_string(),
+                1.0
+            )]
+        );
+        // `label_transform` rewrites the label in place with an unanchored
+        // regex: every `a` becomes `A`, not just a whole-value match.
+        assert_eq!(
+            run(r#"label_transform(http_requests, "job", "a", "A")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"Api\"}".to_string(),
+                1.0
+            )]
+        );
+        // Go's `ReplaceAll` expands `$1` and replaces every non-overlapping
+        // match, so "10.0.0.1" turns into "10-0" + "." + "0-1".
+        assert_eq!(
+            run(r#"label_transform(http_requests, "instance", "([0-9]+)\.([0-9]+)", "$1-$2")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10-0.0-1\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // `label_match` keeps matching series and drops the rest;
+        // `label_mismatch` is the complement. The regex is anchored, so `ap`
+        // does not match `api`.
+        assert_eq!(
+            run(r#"label_match(http_requests, "job", "api")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        assert!(run(r#"label_match(http_requests, "job", "ap")"#).is_empty());
+        assert!(run(r#"label_mismatch(http_requests, "job", "api")"#).is_empty());
+        assert_eq!(
+            run(r#"label_mismatch(http_requests, "job", "ap")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // A missing label counts as the empty string, so it matches `.*` and
+        // mismatches `.+`.
+        assert_eq!(run(r#"label_match(http_requests, "zone", ".*")"#).len(), 1);
+        assert!(run(r#"label_mismatch(http_requests, "zone", ".*")"#).is_empty());
+        // The whole point of filtering: applied to a vector, it keeps one of
+        // two series.
+        let two = vec![
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 2.0)]),
+        ];
+        let instant = eval_series(two.clone(), "m", r#"label_match(m, "job", "api")"#, 0);
+        // Filtering keeps the surviving series untouched, `__name__` included.
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{__name__=\"m\",job=\"api\"}".to_string(), 1.0)]
+        );
+    }
+
+    #[test]
+    fn test_metricsql_label_filters_parse_errors() {
+        // An odd number of mapping strings is refused, as for `label_set`.
+        assert!(parse_err(r#"label_map(m, "job", "api")"#)
+            .contains("number of string args to label_map"));
+        // The case functions need at least one label.
+        assert!(parse_err("label_uppercase(m)").contains("at least one label name"));
+        assert!(parse_err("label_lowercase(m)").contains("at least one label name"));
+        // Both regexes are compiled at parse time and the message names the
+        // function.
+        assert!(parse_err(r#"label_transform(m, "job", "(", "x")"#)
+            .contains("cannot compile regex \"(\" in label_transform"));
+        assert!(parse_err(r#"label_match(m, "job", "[")"#)
+            .contains("cannot compile regex \"[\" in label_match"));
+        assert!(parse_err(r#"label_match(m, "job")"#).contains("expected Comma"));
+        // A scalar has no labels: the shape parses, evaluation refuses it.
+        let expr = parse_ok(r#"label_uppercase(1, "job")"#);
+        let fetched = HashMap::new();
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+            step_ms: 0,
+        };
+        let error = evaluator.eval(&expr, 0).unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("label_uppercase expects an instant vector, got a scalar"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]

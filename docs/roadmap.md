@@ -369,6 +369,28 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `label_del`/`label_keep` 对 `__name__` 的处理、`label_copy` 的缺失源跳过、
     `label_move` 的同名不删、`label_value` 的数值/非数值/缺标签/NaN 四种情况，
     以及奇数个字符串参数、非字符串参数、标量输入的报错。
+- 已完成（2026-11-13）：MetricsQL 的另一批标签函数 `label_map` /
+  `label_uppercase` / `label_lowercase` / `label_transform` / `label_match` /
+  `label_mismatch`（同属 `transform.go`）：
+  - `label_map(v, "label", "old", "new", ...)` 把参数折成一张 map，**只替换命中
+    的取值**，未列出的取值原样保留；映射到空串时删除该标签（VM 的 `RemoveTag`）。
+    同一键出现两次时后者覆盖（VM 用 Go map 存这张表，后写覆盖先写），缺失的标签
+    按空串参与查表——所以 `"" -> "x"` 的映射会**新建**该标签，这同样是 VM 的
+    `getDstValue` 行为；
+  - `label_uppercase` / `label_lowercase` 只改点名的标签，其他标签不动；VM 至少
+    要求一个标签名（`not enough args`），这里同样拒绝零参数；
+  - `label_transform(v, "label", "regex", "replacement")` 用**未锚定**的 Go 正则
+    做 `ReplaceAll`：替换标签值里每一处匹配，替换串支持 `$1`/`${name}`；
+  - `label_match` / `label_mismatch` 用**锚定**正则（`^(?:re)$`）过滤序列——
+    匹配的留下 / 不匹配的留下，缺标签按空串处理，因此 `.*` 命中而 `.+` 不命中；
+  - 正则都在解析期编译，失败时报 `bad_data` 并点名函数（`label_transform` 与
+    `label_match` 的锚定差异照 `metricsql.CompileRegexp` /
+    `CompileRegexpAnchored`）。
+  - 测试：`label_map` 的命中/未命中/映射为空/同名键后写覆盖/`""→x` 新建标签、
+    大小写只动点名标签、`label_transform`
+    的逐处替换与捕获组展开、`label_match`/`label_mismatch` 的锚定语义与互补关系、
+    缺标签按空串匹配、向量过滤后只剩一条；以及奇数参数、零标签名、非法正则、
+    缺逗号、标量输入的报错。
 - 已完成（2026-11-13）：MetricsQL 经典桶的汇总函数 `histogram_avg` /
   `histogram_stddev` / `histogram_stdvar`（`transform.go` 的
   `avgForLeTimeseries` / `stdvarForLeTimeseries`）。同名函数在 Prometheus 里只读
