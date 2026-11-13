@@ -865,6 +865,33 @@ pub enum RangeFunc {
     /// MetricsQL `tlast_over_time(v[range])`, an alias of
     /// `ts_of_last_over_time`.
     TLastOverTime,
+    /// MetricsQL's threshold rollups, which take their bound *after* the range
+    /// vector: `count_le_over_time(v[range], le)` and friends.
+    FilterOverTime(FilterOp, FilterKind),
+    /// MetricsQL `duration_over_time(v[range], max_interval)` — the summed gap
+    /// between consecutive samples, ignoring gaps longer than `max_interval`
+    /// seconds.
+    DurationOverTime,
+}
+
+/// The comparison a threshold rollup applies to each sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Le,
+    Gt,
+    Ne,
+}
+
+/// What a threshold rollup computes from the matching samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterKind {
+    /// `count_*_over_time` — how many samples matched.
+    Count,
+    /// `share_*_over_time` — the matching fraction, `count / len`.
+    Share,
+    /// `sum_*_over_time` — the sum of the matching samples.
+    Sum,
 }
 
 impl RangeFunc {
@@ -916,6 +943,29 @@ impl RangeFunc {
         })
     }
 
+    /// The MetricsQL threshold rollups, which also put the range vector first
+    /// but take a required bound: `count_le_over_time(v[range], le)`,
+    /// `share_gt_over_time(v[range], gt)` and `sum_*_over_time`.
+    fn parse_filter(name: &str) -> Option<RangeFunc> {
+        let (kind, rest) = if let Some(rest) = name.strip_prefix("count_") {
+            (FilterKind::Count, rest)
+        } else if let Some(rest) = name.strip_prefix("share_") {
+            (FilterKind::Share, rest)
+        } else if let Some(rest) = name.strip_prefix("sum_") {
+            (FilterKind::Sum, rest)
+        } else {
+            return None;
+        };
+        let op = match rest {
+            "eq_over_time" => FilterOp::Eq,
+            "le_over_time" => FilterOp::Le,
+            "gt_over_time" => FilterOp::Gt,
+            "ne_over_time" if kind == FilterKind::Count => FilterOp::Ne,
+            _ => return None,
+        };
+        Some(RangeFunc::FilterOverTime(op, kind))
+    }
+
     fn takes_param(self) -> bool {
         matches!(self, RangeFunc::QuantileOverTime | RangeFunc::PredictLinear)
     }
@@ -935,6 +985,8 @@ impl RangeFunc {
                 | RangeFunc::DecreasesOverTime
                 | RangeFunc::TFirstOverTime
                 | RangeFunc::TLastOverTime
+                | RangeFunc::FilterOverTime(..)
+                | RangeFunc::DurationOverTime
         )
     }
 }
@@ -2477,7 +2529,27 @@ impl Parser {
                     param2: None,
                 });
             }
-            _ => {}
+            // MetricsQL's threshold rollups take the range vector first, with a
+            // required bound: `count_le_over_time(v[5m], 100)`, and so does
+            // `duration_over_time(v[5m], 10)`.
+            other => {
+                let func = RangeFunc::parse_filter(other).or_else(|| {
+                    (other == "duration_over_time").then_some(RangeFunc::DurationOverTime)
+                });
+                if let Some(func) = func {
+                    self.expect(Token::LParen)?;
+                    let inner = self.range_argument(name)?;
+                    self.expect(Token::Comma)?;
+                    let param = self.expression(0)?;
+                    self.expect(Token::RParen)?;
+                    return Ok(Expr::RangeFunc {
+                        func,
+                        expr: Box::new(inner),
+                        param: Some(Box::new(param)),
+                        param2: None,
+                    });
+                }
+            }
         }
         self.expect(Token::LParen)?;
         // Aggregations may carry a parameter first (`topk(5, expr)`).
@@ -2741,7 +2813,8 @@ impl Parser {
                  integral and *_over_time, the MetricsQL rollups range_over_time, \
                  median_over_time, sum2_over_time, geomean_over_time, distinct_over_time, \
                  mode_over_time, increases_over_time, decreases_over_time, \
-                 tfirst_over_time, tlast_over_time, the math \
+                 tfirst_over_time, tlast_over_time, count_*_over_time, share_*_over_time, \
+                 sum_*_over_time, duration_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
                  clamp, clamp_min, clamp_max, scalar, timestamp, the trigonometric and \
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
@@ -2753,7 +2826,8 @@ impl Parser {
                  functions start, end, range, step, and the label functions label_replace, \
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
                  label_value, label_map, label_uppercase, label_lowercase, label_transform, \
-                 label_match, label_mismatch and alias"
+                 label_match, label_mismatch, alias, drop_common_labels, drop_empty_series, \
+                 labels_equal, label_graphite_group and limit_offset"
             )),
         }
     }
@@ -4968,6 +5042,46 @@ fn apply_range_func(
         // MetricsQL's names for the two `ts_of_*` functions.
         RangeFunc::TFirstOverTime => samples.first().map(|s| s.timestamp as f64 / 1_000.0),
         RangeFunc::TLastOverTime => samples.last().map(|s| s.timestamp as f64 / 1_000.0),
+        // The threshold rollups compare each (NaN-free) sample with the bound
+        // and then count, average or sum the matches. `share_*` divides by the
+        // window's sample count, `sum_*` adds the samples themselves.
+        RangeFunc::FilterOverTime(op, kind) => {
+            let bound = param?;
+            let matches = |value: f64| match op {
+                FilterOp::Eq => value == bound,
+                FilterOp::Le => value <= bound,
+                FilterOp::Gt => value > bound,
+                FilterOp::Ne => value != bound,
+            };
+            Some(match kind {
+                FilterKind::Count => samples.iter().filter(|s| matches(s.value)).count() as f64,
+                FilterKind::Share => {
+                    samples.iter().filter(|s| matches(s.value)).count() as f64
+                        / samples.len() as f64
+                }
+                FilterKind::Sum => samples
+                    .iter()
+                    .filter(|s| matches(s.value))
+                    .map(|s| s.value)
+                    .sum(),
+            })
+        }
+        // `newRollupDurationOverTime`: sum the gaps between consecutive
+        // timestamps, ignoring a gap longer than the given maximum. The first
+        // gap is 0, so it only counts when the maximum is not negative.
+        RangeFunc::DurationOverTime => {
+            let max_gap = go_int64(param? * 1_000.0);
+            let mut previous = samples[0].timestamp;
+            let mut total = 0i64;
+            for sample in samples {
+                let gap = sample.timestamp - previous;
+                if gap <= max_gap {
+                    total += gap;
+                }
+                previous = sample.timestamp;
+            }
+            Some(total as f64 / 1_000.0)
+        }
     }
 }
 
@@ -5756,6 +5870,19 @@ fn float_to_int_bounded(value: f64) -> i64 {
         i64::MIN
     } else {
         // `as` truncates toward zero, like Go's conversion.
+        value as i64
+    }
+}
+
+/// Go's `int64(f)` on amd64: truncate toward zero, and map NaN and every value
+/// outside the `int64` range to `math.MinInt64` — the "integer indefinite"
+/// result of the hardware conversion, which is what VM's
+/// `int64(dMax * 1000)` actually yields there.
+fn go_int64(value: f64) -> i64 {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    if value.is_nan() || value >= LIMIT || value < -LIMIT {
+        i64::MIN
+    } else {
         value as i64
     }
 }
@@ -6790,6 +6917,209 @@ mod tests {
             eval_synthetic(series, "m", "tlast_over_time(m[60s])", 20_000),
             vec![("{}".to_string(), 20.0)]
         );
+    }
+
+    #[test]
+    fn test_metricsql_threshold_rollups() {
+        let samples = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+                .collect()
+        };
+        let run = |func: RangeFunc, values: &[(i64, f64)], bound: f64| {
+            apply_range_func(func, &samples(values), 60_000, Some(bound), None)
+        };
+        let values = [(0, 1.0), (10_000, 3.0), (20_000, 2.0)];
+        // Of 1, 3, 2: two are <= 2 (1 and 2), one is > 2 (3), one is == 2 and
+        // two are != 2.
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Le, FilterKind::Count),
+                &values,
+                2.0
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Gt, FilterKind::Count),
+                &values,
+                2.0
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Eq, FilterKind::Count),
+                &values,
+                2.0
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Ne, FilterKind::Count),
+                &values,
+                2.0
+            ),
+            Some(2.0)
+        );
+        // `share_*` divides by the sample count, `sum_*` adds the values.
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Le, FilterKind::Share),
+                &values,
+                2.0
+            ),
+            Some(2.0 / 3.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Gt, FilterKind::Share),
+                &values,
+                2.0
+            ),
+            Some(1.0 / 3.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Le, FilterKind::Sum),
+                &values,
+                2.0
+            ),
+            Some(3.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Gt, FilterKind::Sum),
+                &values,
+                2.0
+            ),
+            Some(3.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Eq, FilterKind::Sum),
+                &values,
+                2.0
+            ),
+            Some(2.0)
+        );
+        // No sample matches: the sum is 0, not NaN (VM's `sumFilter*` starts
+        // from 0), while the share is 0/3.
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Eq, FilterKind::Sum),
+                &values,
+                7.0
+            ),
+            Some(0.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Eq, FilterKind::Share),
+                &values,
+                7.0
+            ),
+            Some(0.0)
+        );
+        // NaN samples are removed before the comparison, so they count on
+        // neither side and the share denominator shrinks with them.
+        let gappy = [(0, 1.0), (10_000, f64::NAN), (20_000, 4.0)];
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Le, FilterKind::Count),
+                &gappy,
+                1.0
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Le, FilterKind::Share),
+                &gappy,
+                1.0
+            ),
+            Some(0.5)
+        );
+        // A window of nothing but NaNs leaves no samples, so no series.
+        assert_eq!(
+            run(
+                RangeFunc::FilterOverTime(FilterOp::Le, FilterKind::Count),
+                &[(0, f64::NAN)],
+                1.0
+            ),
+            None
+        );
+
+        // `duration_over_time` sums the gaps that fit the maximum. The first
+        // gap is 0, so with a maximum of 5 the two 10s gaps are skipped and
+        // only the 0 remains.
+        let gaps = [(0, 1.0), (10_000, 2.0), (20_000, 3.0)];
+        let duration = |max_gap| {
+            apply_range_func(
+                RangeFunc::DurationOverTime,
+                &samples(&gaps),
+                60_000,
+                Some(max_gap),
+                None,
+            )
+        };
+        assert_eq!(duration(5.0), Some(0.0));
+        assert_eq!(duration(10.0), Some(20.0));
+        assert_eq!(duration(15.0), Some(20.0));
+        // A gap that is too long is dropped, the ones around it still count.
+        let irregular = [(0, 1.0), (10_000, 2.0), (60_000, 3.0)];
+        assert_eq!(
+            apply_range_func(
+                RangeFunc::DurationOverTime,
+                &samples(&irregular),
+                60_000,
+                Some(15.0),
+                None
+            ),
+            Some(10.0)
+        );
+        // A negative maximum drops even the leading zero gap.
+        assert_eq!(duration(-1.0), Some(0.0));
+
+        // End to end: every name is wired into the parser through the
+        // range-vector-first arm, and all of them drop `__name__`.
+        let series = synthetic("m", &[(0, 1.0), (10_000, 3.0), (20_000, 2.0)]);
+        for (query, expected) in [
+            ("count_le_over_time(m[60s], 2)", 2.0),
+            ("count_gt_over_time(m[60s], 2)", 1.0),
+            ("count_eq_over_time(m[60s], 2)", 1.0),
+            ("count_ne_over_time(m[60s], 2)", 2.0),
+            ("share_le_over_time(m[60s], 2)", 2.0 / 3.0),
+            ("share_gt_over_time(m[60s], 2)", 1.0 / 3.0),
+            ("sum_le_over_time(m[60s], 2)", 3.0),
+            ("sum_gt_over_time(m[60s], 2)", 3.0),
+            ("sum_eq_over_time(m[60s], 2)", 2.0),
+            ("duration_over_time(m[60s], 10)", 20.0),
+        ] {
+            let result = eval_synthetic(series.clone(), "m", query, 20_000);
+            assert_eq!(result.len(), 1, "{query}: {result:?}");
+            assert_eq!(result[0].0, "{}", "{query}");
+            assert!(
+                (result[0].1 - expected).abs() < 1e-12,
+                "{query}: {} != {expected}",
+                result[0].1
+            );
+        }
+    }
+
+    #[test]
+    fn test_metricsql_threshold_rollups_parse_errors() {
+        // The bound is required and must come after the range vector.
+        assert!(parse_err("count_le_over_time(m[5m])").contains("expected Comma"));
+        assert!(parse_err("duration_over_time(m[5m])").contains("expected Comma"));
+        // The family is spelled out rather than derived, so near-misses are
+        // still unknown functions.
+        assert!(parse_err("share_ne_over_time(m[5m], 1)").contains("unknown function"));
+        assert!(parse_err("count_lt_over_time(m[5m], 1)").contains("unknown function"));
+        assert!(parse_err("sum_ne_over_time(m[5m], 1)").contains("unknown function"));
     }
 
     #[test]

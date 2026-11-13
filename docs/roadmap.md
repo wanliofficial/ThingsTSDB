@@ -339,10 +339,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     scrape interval 再算 lag）、`integrate` / `lag` / `lifetime` /
     `ascent_over_time` / `descent_over_time` / `tlast_change_over_time`（要窗口前
     后之外的样本，也就是 VM 的 `prevValue` / `realNextValue`）、
-    `count_*_over_time` / `share_*_over_time` / `sum_*_over_time`（带第二个参数，
-    且其中几个要用 `prevValue` 把阈值比较折算成时长）、`duration_over_time` /
+    `count_values_over_time` / `quantiles_over_time`（一条输入序列产出多条输出，
+    要给 range 求值加「一进多出」的通路）、
     `scrape_interval` / `stale_samples_over_time`（要 VM 自己的 staleness 标记与
-    step 上下文）。这些缺的都是窗口外的数据，硬做只能给出近似值。
+    step 上下文）。这些缺的都是窗口外的数据或输出形状，硬做只能给出近似值。
+    （阈值类 rollup `count_*` / `share_*` / `sum_*_over_time` 与 `duration_over_time`
+    原先列在这里，核对源码后发现只依赖窗口内的样本与一个标量参数，已按 2026-11-14
+    条目实现。）
   - 测试：解析与求值单测（`aggr_over_time` 的六种聚合、`tmin/tmax` 的时间戳语义、
     线性拟合的期望值、`aggr_over_time(topk, ...)` 与缺 horizon 的 `predict_linear`
     报错、新 `*_over_time` 家族各一条：max-min、NaN 被当作缺口丢弃后的中位数与
@@ -412,6 +415,30 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `+Inf` 单桶与全 0 计数都返回 NaN、计数不变的非零直方图只计第一个区间的权重
     （5/5 → 0.05）、两组直方图分组互不影响、缺 `le` 报错并点名，
     以及经求值器端到端丢掉 `__name__`/`le`、标量输入报错。
+- 已完成（2026-11-14）：MetricsQL 的阈值 rollup `count_eq|le|gt|ne_over_time` /
+  `share_eq|le|gt_over_time` / `sum_eq|le|gt_over_time` 与 `duration_over_time`
+  （`app/vmselect/promql/rollup.go` 的 `newRollupFilter` / `newRollupAvgFilter` /
+  `newRollupDurationOverTime`）：
+  - 这一族把范围向量放在**第一个参数**（`count_le_over_time(v[5m], 100)`），与
+    `predict_linear` / `integral` 同形，所以走同一段「range 在前」的解析分支；
+  - 比较逐样本进行，`eq` 是 `==`、`le` 是 `<=`、`gt` 是 `>`、`ne` 是 `!=`；
+    然后 `count_*` 数条数、`share_*` 再除以窗口内的样本数、`sum_*` 把这些样本的值
+    相加。`sum_*` 从 0 起加，所以一条都不命中时是 `0` 而不是 NaN（`sumFilter*`
+    的原样行为）；
+  - 与所有 MetricsQL rollup 一样先丢 NaN：NaN 既不命中也不计入 `share_*` 的
+    分母；整窗都是 NaN 时该序列不产出；
+  - `duration_over_time(v[range], max_interval)` 累加相邻样本的时间差，**超过**
+    `max_interval` 秒的间隔被跳过（`d <= dMax` 才计入，第一个间隔为 0）。
+    `dMax` 是 `int64(max_interval * 1000)`，按 amd64 上 Go 的转换语义取整
+    （向零截断，NaN/越界得 `MinInt64`，于是连第一个 0 间隔也不计）；
+  - 结果一律丢 `__name__`（VM 的 `rollupFuncsKeepMetricName` 里没有这一族），
+    沿用本仓库其它 MetricsQL rollup 的约定；
+  - 测试：`count/share/sum` 四种比较的条数与分数、无命中时 `sum` 为 0 且
+    `share` 为 0、NaN 被丢弃后分母同步缩小、整窗 NaN 不产出；
+    `duration_over_time` 的间隔上限（5/10/15 秒对 0-10-20 的样本）、
+    长间隔被跳过而它之后的短间隔仍计入、负上限连首个 0 间隔也不计；
+    以及十个函数名经解析器端到端求值、缺第二个参数与 `share_ne_over_time` /
+    `count_lt_over_time` / `sum_ne_over_time` 这些未实现拼写报未知函数。
 - 已完成（2026-11-14）：MetricsQL 的序列选择函数 `drop_common_labels` /
   `drop_empty_series` / `labels_equal` / `label_graphite_group` / `limit_offset`
   （同属 `app/vmselect/promql/transform.go`，逐条对照源码）：
