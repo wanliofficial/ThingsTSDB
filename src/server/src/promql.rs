@@ -1368,6 +1368,31 @@ pub enum Expr {
         op: LabelFilterOp,
         expr: Box<Expr>,
     },
+    /// `drop_common_labels(v, ...)` — merges every argument's series and drops
+    /// each label that carries the same value on all of them.
+    DropCommonLabels(Vec<Expr>),
+    /// `drop_empty_series(v)` — drops the samples MetricsQL treats as gaps
+    /// (NaN).
+    DropEmptySeries(Box<Expr>),
+    /// `labels_equal(v, "a", "b", ...)` — keeps the series whose named labels
+    /// all carry the same value (a missing label is the empty string).
+    LabelsEqual {
+        labels: Vec<String>,
+        expr: Box<Expr>,
+    },
+    /// `label_graphite_group(v, 1, 2, ...)` — rebuilds `__name__` from the
+    /// dot-separated groups at those indexes.
+    LabelGraphiteGroup {
+        groups: Vec<Expr>,
+        expr: Box<Expr>,
+    },
+    /// `limit_offset(limit, offset, v)` — skips `offset` series of the vector
+    /// and keeps at most `limit` of the rest.
+    LimitOffset {
+        limit: Box<Expr>,
+        offset: Box<Expr>,
+        expr: Box<Expr>,
+    },
     Sort {
         dir: SortDir,
         expr: Box<Expr>,
@@ -1521,7 +1546,16 @@ impl Expr {
             Expr::LabelReplace { expr, .. }
             | Expr::LabelJoin { expr, .. }
             | Expr::LabelOp { expr, .. }
-            | Expr::LabelFilter { expr, .. } => expr.selectors(out),
+            | Expr::LabelFilter { expr, .. }
+            | Expr::DropEmptySeries(expr)
+            | Expr::LabelsEqual { expr, .. }
+            | Expr::LabelGraphiteGroup { expr, .. }
+            | Expr::LimitOffset { expr, .. } => expr.selectors(out),
+            Expr::DropCommonLabels(exprs) => {
+                for expr in exprs {
+                    expr.selectors(out);
+                }
+            }
         }
     }
 
@@ -1662,8 +1696,30 @@ impl Expr {
             Expr::LabelReplace { expr, .. }
             | Expr::LabelJoin { expr, .. }
             | Expr::LabelOp { expr, .. }
-            | Expr::LabelFilter { expr, .. } => {
+            | Expr::LabelFilter { expr, .. }
+            | Expr::DropEmptySeries(expr)
+            | Expr::LabelsEqual { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
+            }
+            Expr::DropCommonLabels(exprs) => {
+                for expr in exprs {
+                    expr.widen_window(query_start_ms, query_end_ms, start, end);
+                }
+            }
+            Expr::LimitOffset {
+                limit,
+                offset,
+                expr,
+            } => {
+                limit.widen_window(query_start_ms, query_end_ms, start, end);
+                offset.widen_window(query_start_ms, query_end_ms, start, end);
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
+            }
+            Expr::LabelGraphiteGroup { groups, expr } => {
+                for group in groups {
+                    group.widen_window(query_start_ms, query_end_ms, start, end);
+                }
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
             }
         }
     }
@@ -2263,6 +2319,76 @@ impl Parser {
             | "label_value" | "alias" => return self.label_op(name),
             "label_map" | "label_uppercase" | "label_lowercase" | "label_transform"
             | "label_match" | "label_mismatch" => return self.label_filter(name),
+            // MetricsQL's whole-vector selection helpers. They read every
+            // series of their argument, which the per-step evaluator still has
+            // at hand, so they stay instant functions.
+            "drop_common_labels" => {
+                self.expect(Token::LParen)?;
+                let mut exprs = vec![self.expression(0)?];
+                while self.eat(&Token::Comma) {
+                    exprs.push(self.expression(0)?);
+                }
+                self.expect(Token::RParen)?;
+                return Ok(Expr::DropCommonLabels(exprs));
+            }
+            "drop_empty_series" => {
+                self.expect(Token::LParen)?;
+                let expr = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                return Ok(Expr::DropEmptySeries(Box::new(expr)));
+            }
+            "labels_equal" => {
+                self.expect(Token::LParen)?;
+                let expr = self.expression(0)?;
+                let mut labels = Vec::new();
+                while self.eat(&Token::Comma) {
+                    labels.push(self.string_argument(name)?);
+                }
+                self.expect(Token::RParen)?;
+                // VM also requires a vector plus two label names
+                // (`unexpected number of args; got N; want at least 3`); with
+                // fewer there is nothing to compare.
+                if labels.len() < 2 {
+                    return bad(format!(
+                        "{name} needs at least two label names; got {}",
+                        labels.len()
+                    ));
+                }
+                return Ok(Expr::LabelsEqual {
+                    labels,
+                    expr: Box::new(expr),
+                });
+            }
+            "label_graphite_group" => {
+                self.expect(Token::LParen)?;
+                let expr = self.expression(0)?;
+                let mut groups = Vec::new();
+                while self.eat(&Token::Comma) {
+                    groups.push(self.expression(0)?);
+                }
+                self.expect(Token::RParen)?;
+                if groups.is_empty() {
+                    return bad(format!("{name} needs at least one group index"));
+                }
+                return Ok(Expr::LabelGraphiteGroup {
+                    groups,
+                    expr: Box::new(expr),
+                });
+            }
+            "limit_offset" => {
+                self.expect(Token::LParen)?;
+                let limit = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let offset = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let expr = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                return Ok(Expr::LimitOffset {
+                    limit: Box::new(limit),
+                    offset: Box::new(offset),
+                    expr: Box::new(expr),
+                });
+            }
             // `aggr_over_time(avg, v[range])` names an aggregation where the
             // other range functions take a vector, so it is dispatched first.
             "aggr_over_time" => {
@@ -3322,6 +3448,144 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 })
             }
+            Expr::DropCommonLabels(exprs) => {
+                let mut points = Vec::new();
+                for expr in exprs {
+                    let instant = self.eval(expr, at_ms)?;
+                    if instant.scalar.is_some() {
+                        return bad("drop_common_labels expects instant vectors, got a scalar");
+                    }
+                    points.extend(instant.vector.0);
+                }
+                Ok(Instant {
+                    vector: drop_common_labels(points),
+                    scalar: None,
+                })
+            }
+            Expr::DropEmptySeries(expr) => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("drop_empty_series expects an instant vector, got a scalar");
+                }
+                // `removeEmptySeries` throws away the series whose values are
+                // all NaN; at one instant that is the sample itself.
+                let mut vector = Vector::default();
+                for point in instant.vector.0 {
+                    if !point.value.is_nan() {
+                        vector.push_point(&point);
+                    }
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
+            Expr::LabelsEqual { labels, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("labels_equal expects an instant vector, got a scalar");
+                }
+                // `hasIdenticalLabelValues`: a missing label reads as the
+                // empty string, so two absent labels are equal.
+                let mut vector = Vector::default();
+                for point in instant.vector.0 {
+                    let value_of = |name: &str| {
+                        point
+                            .labels
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let first = value_of(&labels[0]);
+                    if labels[1..].iter().all(|name| value_of(name) == first) {
+                        vector.push_point(&point);
+                    }
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
+            Expr::LabelGraphiteGroup { groups, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("label_graphite_group expects an instant vector, got a scalar");
+                }
+                let mut ids = Vec::with_capacity(groups.len());
+                for group in groups {
+                    ids.push(float_to_int_bounded(self.scalar_of(group, at_ms)?));
+                }
+                let mut vector = Vector::default();
+                for mut point in instant.vector.0 {
+                    // VM splits the metric group on '.' and joins the requested
+                    // groups back with '.'. An out-of-range index contributes
+                    // nothing but the separator still appears, so
+                    // `label_graphite_group(m, 5, 0)` on `a.b` yields `.a`.
+                    let name = point.labels.get("__name__").cloned().unwrap_or_default();
+                    let parts: Vec<&str> = name.split('.').collect();
+                    let mut rebuilt = String::new();
+                    for (i, id) in ids.iter().enumerate() {
+                        if let Some(part) = usize::try_from(*id).ok().and_then(|id| parts.get(id)) {
+                            rebuilt.push_str(part);
+                        }
+                        if i + 1 < ids.len() {
+                            rebuilt.push('.');
+                        }
+                    }
+                    // An empty metric group is no metric name at all.
+                    if rebuilt.is_empty() {
+                        point.labels.remove("__name__");
+                    } else {
+                        point.labels.insert("__name__".to_string(), rebuilt);
+                    }
+                    vector.push_point(&point);
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
+            Expr::LimitOffset {
+                limit,
+                offset,
+                expr,
+            } => {
+                let limit = float_to_int_bounded(self.scalar_of(limit, at_ms)?);
+                if limit < 0 {
+                    return bad(format!("limit must not be negative; got {limit}"));
+                }
+                let offset = float_to_int_bounded(self.scalar_of(offset, at_ms)?);
+                if offset < 0 {
+                    return bad(format!("offset must not be negative; got {offset}"));
+                }
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("limit_offset expects an instant vector, got a scalar");
+                }
+                // VM drops the empty series first, then offsets, then limits;
+                // the surviving order is the input order.
+                let points: Vec<Point> = instant
+                    .vector
+                    .0
+                    .into_iter()
+                    .filter(|point| !point.value.is_nan())
+                    .collect();
+                let mut vector = Vector::default();
+                if points.len() >= offset as usize {
+                    for point in points
+                        .into_iter()
+                        .skip(offset as usize)
+                        .take(limit as usize)
+                    {
+                        vector.push_point(&point);
+                    }
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
             Expr::HistogramStat { op, expr } => {
                 let instant = self.eval(expr, at_ms)?;
                 if instant.scalar.is_some() {
@@ -4042,6 +4306,38 @@ fn label_copy(labels: &mut LabelSet, pairs: &[(String, String)], remove_source: 
             labels.remove(src);
         }
     }
+}
+
+/// `drop_common_labels`: VM counts every label value across the merged series
+/// and removes a label name as soon as one of its values covers *all* of them
+/// (`RemoveTag` on every series). Note the count is over label values, not
+/// series: a name is dropped exactly when every series carries the same value
+/// for it, `__name__` included.
+fn drop_common_labels(points: Vec<Point>) -> Vector {
+    let total = points.len();
+    let mut counts: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
+    for point in &points {
+        for (name, value) in &point.labels {
+            *counts
+                .entry(name.as_str())
+                .or_default()
+                .entry(value.as_str())
+                .or_default() += 1;
+        }
+    }
+    let common: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, values)| values.values().any(|count| *count == total))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    let mut vector = Vector::default();
+    for mut point in points {
+        point
+            .labels
+            .retain(|name, _| !common.iter().any(|common| common == name));
+        vector.push_point(&point);
+    }
+    vector
 }
 
 /// Labels of a fetched series, without `__name__`.
@@ -5442,6 +5738,26 @@ fn label_string(labels: &LabelSet) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{{body}}}")
+}
+
+/// Go's `floatToIntBounded`: truncate toward zero and clamp to the `i64` range.
+///
+/// VM's helper is `int(f)` guarded by `math.MaxInt` / `math.MinInt`; Go leaves
+/// the NaN and out-of-range conversions to the platform, where amd64 yields
+/// `MinInt`. The callers (`limit_offset`, `label_graphite_group`) treat a
+/// negative index as out of range, so NaN behaves like a negative index here
+/// too.
+fn float_to_int_bounded(value: f64) -> i64 {
+    if value.is_nan() {
+        i64::MIN
+    } else if value > i64::MAX as f64 {
+        i64::MAX
+    } else if value < i64::MIN as f64 {
+        i64::MIN
+    } else {
+        // `as` truncates toward zero, like Go's conversion.
+        value as i64
+    }
 }
 
 /// Go's `math.Min`: NaN wins over any number, unlike Rust's `f64::min`.
@@ -8812,6 +9128,231 @@ mod tests {
             "{}",
             error.message()
         );
+    }
+
+    #[test]
+    fn test_metricsql_series_selection() {
+        let api = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("job", "api"), ("zone", "eu")],
+                &[(0, 1.0)],
+            )
+        };
+        let db = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("job", "db"), ("zone", "eu")],
+                &[(0, 2.0)],
+            )
+        };
+        // `drop_common_labels` merges every argument's series and drops each
+        // label whose value is the same on all of them. `zone` and `__name__`
+        // are shared, `job` is not.
+        let instant = eval_series(
+            vec![api(), db()],
+            "http_requests",
+            "drop_common_labels(http_requests)",
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![
+                ("{job=\"api\"}".to_string(), 1.0),
+                ("{job=\"db\"}".to_string(), 2.0)
+            ]
+        );
+        // With one series every label is shared, so nothing but the empty
+        // label set survives.
+        let instant = eval_series(
+            vec![api()],
+            "http_requests",
+            "drop_common_labels(http_requests)",
+            0,
+        );
+        assert_eq!(rendered(&instant.vector), vec![("{}".to_string(), 1.0)]);
+        // Several arguments are concatenated; `job` differs across them, so
+        // only the shared `zone` and `__name__` go away. Each argument is its
+        // own selector, hence the hand-built fetch table.
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector("http_requests")), vec![api()]);
+        fetched.insert(
+            selector_key(&selector(r#"http_requests{job="db"}"#)),
+            vec![db()],
+        );
+        let expr = parse_ok(r#"drop_common_labels(http_requests, http_requests{job="db"})"#);
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+            step_ms: 0,
+        };
+        let instant = evaluator.eval(&expr, 0).unwrap();
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![
+                ("{job=\"api\"}".to_string(), 1.0),
+                ("{job=\"db\"}".to_string(), 2.0)
+            ]
+        );
+
+        // `drop_empty_series` throws away the all-NaN series, which at one
+        // instant is the NaN sample itself.
+        let gappy = synthetic_labeled("m", &[("job", "db")], &[(0, f64::NAN)]);
+        let healthy = synthetic_labeled("m", &[("job", "api")], &[(0, 1.5)]);
+        let instant = eval_series(vec![healthy, gappy], "m", "drop_empty_series(m)", 0);
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{__name__=\"m\",job=\"api\"}".to_string(), 1.5)]
+        );
+
+        // `labels_equal` keeps the series whose named labels all hold the same
+        // value.
+        let same = synthetic_labeled("m", &[("a", "1"), ("b", "1")], &[(0, 1.0)]);
+        let different = synthetic_labeled("m", &[("a", "1"), ("b", "2")], &[(0, 2.0)]);
+        let instant = eval_series(
+            vec![same, different],
+            "m",
+            r#"labels_equal(m, "a", "b")"#,
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{__name__=\"m\",a=\"1\",b=\"1\"}".to_string(), 1.0)]
+        );
+        // A missing label reads as the empty string, so two absent labels are
+        // equal and a missing one never equals a present one.
+        let absent = || synthetic_labeled("m", &[("job", "api")], &[(0, 3.0)]);
+        let instant = eval_series(
+            vec![absent()],
+            "m",
+            r#"labels_equal(m, "zone", "region")"#,
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{__name__=\"m\",job=\"api\"}".to_string(), 3.0)]
+        );
+        let instant = eval_series(vec![absent()], "m", r#"labels_equal(m, "job", "zone")"#, 0);
+        assert!(rendered(&instant.vector).is_empty());
+
+        // `label_graphite_group` rebuilds `__name__` from the dot-separated
+        // groups at the given indexes; the tags are untouched.
+        let dotted = || synthetic_labeled("foo.bar.baz", &[("job", "api")], &[(0, 1.0)]);
+        let graphite = r#"{__name__="foo.bar.baz"}"#;
+        let instant = eval_series(
+            vec![dotted()],
+            graphite,
+            r#"label_graphite_group({__name__="foo.bar.baz"}, 0, 2)"#,
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{__name__=\"foo.baz\",job=\"api\"}".to_string(), 1.0)]
+        );
+        // An out-of-range index contributes nothing but the separator stays,
+        // and a name that ends up empty loses `__name__` altogether.
+        let instant = eval_series(
+            vec![dotted()],
+            graphite,
+            r#"label_graphite_group({__name__="foo.bar.baz"}, 5, 0)"#,
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{__name__=\".foo\",job=\"api\"}".to_string(), 1.0)]
+        );
+        let instant = eval_series(
+            vec![dotted()],
+            graphite,
+            r#"label_graphite_group({__name__="foo.bar.baz"}, 7)"#,
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{job=\"api\"}".to_string(), 1.0)]
+        );
+
+        // `limit_offset` skips then limits; the empty series are dropped
+        // first, so they do not consume an offset slot.
+        let m_series = |job: &str, value: f64| {
+            synthetic_labeled("m", &[("job", job), ("zone", "eu")], &[(0, value)])
+        };
+        let cache = || synthetic_labeled("m", &[("job", "cache")], &[(0, 3.0)]);
+        let empty = || synthetic_labeled("m", &[("job", "empty")], &[(0, f64::NAN)]);
+        let instant = eval_series(
+            vec![m_series("api", 1.0), empty(), m_series("db", 2.0), cache()],
+            "m",
+            "limit_offset(1, 1, m)",
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![("{__name__=\"m\",job=\"db\",zone=\"eu\"}".to_string(), 2.0)]
+        );
+        let instant = eval_series(
+            vec![m_series("api", 1.0), empty(), m_series("db", 2.0), cache()],
+            "m",
+            "limit_offset(2, 0, m)",
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![
+                ("{__name__=\"m\",job=\"api\",zone=\"eu\"}".to_string(), 1.0),
+                ("{__name__=\"m\",job=\"db\",zone=\"eu\"}".to_string(), 2.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_metricsql_series_selection_errors() {
+        // `labels_equal` needs two label names (`want at least 3` args in VM),
+        // and `label_graphite_group` at least one index.
+        assert!(parse_err(r#"labels_equal(m, "a")"#).contains("at least two label names"));
+        assert!(parse_err("label_graphite_group(m)").contains("at least one group index"));
+        assert!(parse_err("limit_offset(1, m)").contains("expected Comma"));
+
+        // A negative limit or offset is rejected, and the message names the
+        // argument.
+        let metric = || synthetic("m", &[(0, 1.0)]);
+        assert!(eval_err(metric(), "m", "limit_offset(-1, 0, m)", 0)
+            .contains("limit must not be negative; got -1"));
+        assert!(eval_err(metric(), "m", "limit_offset(1, -2, m)", 0)
+            .contains("offset must not be negative; got -2"));
+        // A fractional limit truncates toward zero, as Go's `int` conversion
+        // does: 1.9 series still means one.
+        let two = vec![
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 2.0)]),
+        ];
+        let instant = eval_series(two, "m", "limit_offset(1.9, 0, m)", 0);
+        assert_eq!(instant.vector.0.len(), 1);
+
+        // Scalars have no labels and no series to select from.
+        let fetched = HashMap::new();
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+            step_ms: 0,
+        };
+        for query in [
+            "drop_common_labels(1)",
+            "drop_empty_series(1)",
+            r#"labels_equal(1, "a", "b")"#,
+            "label_graphite_group(1, 0)",
+            "limit_offset(1, 0, 1)",
+        ] {
+            let expr = parse_ok(query);
+            let error = evaluator.eval(&expr, 0).unwrap_err();
+            assert!(
+                error.message().contains("expects an instant vector")
+                    || error.message().contains("expects instant vectors"),
+                "{query}: {}",
+                error.message()
+            );
+        }
     }
 
     #[test]

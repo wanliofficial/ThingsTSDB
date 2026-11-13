@@ -240,7 +240,9 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `median_over_time`、`sum2_over_time`、`geomean_over_time`、`distinct_over_time`、
     `mode_over_time`、`increases_over_time`、`decreases_over_time`、
     `tfirst_over_time`、`tlast_over_time`），日期函数 `year/month/day_of_month/day_of_week/day_of_year/
-    days_in_month/hour/minute`；
+    days_in_month/hour/minute`，以及 MetricsQL 的序列选择函数
+    `drop_common_labels`、`drop_empty_series`、`labels_equal`、
+    `label_graphite_group`、`limit_offset`（见下面单独一条）；
     （`histogram_quantile` / `histogram_quantiles` / `histogram_fraction` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
     count_values`，支持
@@ -410,6 +412,42 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `+Inf` 单桶与全 0 计数都返回 NaN、计数不变的非零直方图只计第一个区间的权重
     （5/5 → 0.05）、两组直方图分组互不影响、缺 `le` 报错并点名，
     以及经求值器端到端丢掉 `__name__`/`le`、标量输入报错。
+- 已完成（2026-11-14）：MetricsQL 的序列选择函数 `drop_common_labels` /
+  `drop_empty_series` / `labels_equal` / `label_graphite_group` / `limit_offset`
+  （同属 `app/vmselect/promql/transform.go`，逐条对照源码）：
+  - `drop_common_labels(v, ...)` 把各参数的序列**拼接**后统计每个标签名的取值分布，
+    只要某个取值覆盖了全部序列就删掉整个标签名（VM 的 `RemoveTag`，`__name__`
+    同样参与，所以同名序列合并后指标名也会被删）；`job` 这类各序列不同的标签保留；
+  - `drop_empty_series(v)` 丢掉「空」序列——VM 的 `removeEmptySeries` 判据是全 NaN。
+    本服务按 step 求值，单个 step 上的空序列就是取值为 NaN 的样本，因此这一步等价于
+    丢掉 NaN 样本；VM 是整段窗口判空，跨 step 的差异与下面那批变换一并记录；
+  - `labels_equal(v, "a", "b", ...)` 只保留点名标签取值全相同的序列，缺失标签按空串
+    参与比较（VM 的 `GetTagValue` 返回 nil，`hasIdenticalLabelValues` 里就是 `""`），
+    所以两个都缺的标签算相等、缺与不缺算不等；VM 要求至少 3 个参数
+    （`unexpected number of args; got N; want at least 3`），这里在解析期要求至少
+    两个标签名；
+  - `label_graphite_group(v, 1, 2, ...)` 按 `.` 拆开 `__name__`，取指定下标的段用
+    `.` 重新拼接，标签本身不动；越界/负下标什么都不贡献但**分隔符照写**
+    （`label_graphite_group(m, 5, 0)` 对 `a.b` 得 `.a`），拼出来为空串时等于没有指标名，
+    这里删掉 `__name__`。下标是标量表达式，`floatToIntBounded` 的语义（截断向零、
+    钳到 int 范围）单独实现；
+  - `limit_offset(limit, offset, v)` 先丢空序列再跳 `offset` 条、最多留 `limit` 条，
+    顺序即输入顺序（VM 自己在 `maySortResults` 里把 `limit_offset` 列为「已排好」，
+    不会事后重排）；`limit` / `offset` 为负时报错并点名参数。注意 VM 是按**整条
+    序列**做偏移（同一条序列在整段 step 上都留下或都丢掉），本服务每个 step 独立
+    求值，某条序列在某步缺席时偏移窗口会随之滑动——单 step 查询两者一致；
+  - 测试：`drop_common_labels` 的单参数/多参数/单序列（全删光只剩 `{}`）、
+    `drop_empty_series` 的 NaN 过滤、`labels_equal` 的相同/不同/双侧缺失、
+    `label_graphite_group` 的正常下标/越界下标保留分隔符/全越界删名、
+    `limit_offset` 的 NaN 先过滤再偏移、截断取整；以及参数过少、负数、标量输入
+    各自的报错。
+
+  同族的**跨 step 变换**明确不做：`keep_last_value` / `keep_next_value` /
+  `interpolate` / `running_*` / `range_*` / `smooth_exponential` 在 VM 里作用在
+  一条序列**整段 step 取值数组**上（补 NaN 缺口、前缀累积、整窗统计），而本服务
+  每个 step 独立求值，没有「上一步/下一步的值」这条数据通路；按 step 硬做会在
+  range 查询里给出与 VM 不同的曲线（`keep_last_value` 会退化成恒等），所以宁可
+  报未知函数。要做需要把求值器改成 VM 那样一次产出整段序列，留作后续条目。
 - 已完成（2026-11-11）：`histogram_quantile(q, v)`（经典直方图的 `le` 桶）。
   Grafana 的延迟面板几乎都写成 `histogram_quantile(0.9, sum by (le) (rate(x_bucket[5m])))`，
   之前这个函数会被当作未知函数拒绝。实现按 Prometheus 的 `BucketQuantile`：
