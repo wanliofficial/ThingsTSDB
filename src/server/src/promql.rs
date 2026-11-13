@@ -28,8 +28,8 @@
 //! * instant functions — math (`abs`, `ceil`, `clamp`, `clamp_min`, ...),
 //!   `scalar`, the date functions (`year`, `month`, `day_of_month`, ...),
 //!   `timestamp`, `sort`, `sort_desc`, `absent`, `histogram_quantile`,
-//!   `histogram_fraction`, `label_replace` / `label_join`, and the generators
-//!   `time`, `pi`, `vector`, plus MetricsQL's `default`;
+//!   `histogram_fraction`, `max_of` / `min_of`, `label_replace` / `label_join`,
+//!   and the generators `time`, `pi`, `vector`, plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, `quantile`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
@@ -1184,6 +1184,14 @@ pub enum Expr {
         upper: Box<Expr>,
         expr: Box<Expr>,
     },
+    /// `max_of(a, b)` / `min_of(a, b)` — two scalars, one scalar result
+    /// (Prometheus' duration-expression helpers, also usable on plain
+    /// numbers).
+    Extremum {
+        max: bool,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     /// `day_of_month(v)` and friends. With an argument each sample's value is
     /// read as Unix seconds; with none the evaluation instant is used.
     DateFunc {
@@ -1249,6 +1257,10 @@ impl Expr {
                 lower.selectors(out);
                 upper.selectors(out);
                 expr.selectors(out);
+            }
+            Expr::Extremum { lhs, rhs, .. } => {
+                lhs.selectors(out);
+                rhs.selectors(out);
             }
             Expr::DateFunc { expr, .. } => {
                 if let Some(expr) = expr {
@@ -1372,6 +1384,10 @@ impl Expr {
                 lower.widen_window(query_start_ms, query_end_ms, start, end);
                 upper.widen_window(query_start_ms, query_end_ms, start, end);
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
+            }
+            Expr::Extremum { lhs, rhs, .. } => {
+                lhs.widen_window(query_start_ms, query_end_ms, start, end);
+                rhs.widen_window(query_start_ms, query_end_ms, start, end);
             }
             Expr::DateFunc { expr, .. } => {
                 if let Some(expr) = expr {
@@ -2163,6 +2179,17 @@ impl Parser {
             }
         }
         match name {
+            "max_of" | "min_of" => {
+                let lhs = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let rhs = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Extremum {
+                    max: name == "max_of",
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                })
+            }
             "histogram_fraction" => {
                 let lower = self.expression(0)?;
                 self.expect(Token::Comma)?;
@@ -2266,8 +2293,8 @@ impl Parser {
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
-                 sort_by_label_desc, histogram_fraction, and the label functions \
-                 label_replace and label_join"
+                 sort_by_label_desc, histogram_fraction, max_of, min_of, and the label \
+                 functions label_replace and label_join"
             )),
         }
     }
@@ -2694,6 +2721,24 @@ impl<'a> Evaluator<'a> {
                     vector: histogram_fraction(lower, upper, &instant.vector)?,
                     scalar: None,
                 })
+            }
+            Expr::Extremum { max, lhs, rhs } => {
+                let lhs = self.scalar_of(lhs, at_ms)?;
+                let rhs = self.scalar_of(rhs, at_ms)?;
+                // Prometheus' `funcMaxOf` / `funcMinOf` match their respective
+                // aggregators: NaN only survives when both sides are NaN.
+                let value = if *max {
+                    if lhs < rhs || lhs.is_nan() {
+                        rhs
+                    } else {
+                        lhs
+                    }
+                } else if lhs > rhs || lhs.is_nan() {
+                    rhs
+                } else {
+                    lhs
+                };
+                Ok(Instant::scalar(value))
             }
             Expr::DateFunc { func, expr } => {
                 let mut vector = Vector::default();
@@ -5501,6 +5546,44 @@ mod tests {
             eval_synthetic(trailing, "m", "ts_of_max_over_time(m[60s])", 10_000),
             vec![("{}".to_string(), 0.0)]
         );
+    }
+
+    #[test]
+    fn test_max_of_and_min_of_pick_a_scalar() {
+        let run = |query: &str| eval_series(Vec::new(), "m", query, 0).scalar;
+        // Plain numbers are scalars, so no series is needed.
+        assert_eq!(run("max_of(1, 2)"), Some(2.0));
+        assert_eq!(run("max_of(2, 1)"), Some(2.0));
+        assert_eq!(run("min_of(1, 2)"), Some(1.0));
+        assert_eq!(run("min_of(2, 1)"), Some(1.0));
+        assert_eq!(run("max_of(-1, -2)"), Some(-1.0));
+        // ±Inf compare normally.
+        assert_eq!(run("max_of(-Inf, 1)"), Some(1.0));
+        assert_eq!(run("min_of(1, Inf)"), Some(1.0));
+        // NaN only survives when both sides are NaN: a single NaN is
+        // replaced by the other operand, exactly like `funcMaxOf`'s
+        // `if a < b || math.IsNaN(a) { a = b }`.
+        assert_eq!(run("max_of(NaN, 2)"), Some(2.0));
+        assert_eq!(run("max_of(2, NaN)"), Some(2.0));
+        assert_eq!(run("min_of(NaN, 2)"), Some(2.0));
+        assert_eq!(run("min_of(2, NaN)"), Some(2.0));
+        assert!(run("max_of(NaN, NaN)").unwrap().is_nan());
+        assert!(run("min_of(NaN, NaN)").unwrap().is_nan());
+        // The result is a scalar, not a vector: a duration expression like
+        // `max_of(step(), 5s)` is what these exist for.
+        assert!(eval_series(Vec::new(), "m", "max_of(1, 2)", 0)
+            .vector
+            .0
+            .is_empty());
+        // A vector operand is read as its sole sample, as `clamp` does; two
+        // series are an error rather than a silent pick.
+        let one = synthetic("m", &[(0, 7.0)]);
+        assert_eq!(
+            eval_series(vec![one.clone()], "m", "max_of(m, 5)", 0).scalar,
+            Some(7.0)
+        );
+        let message = parse_err("max_of(m, 5, 6)");
+        assert!(message.contains("expected RParen"));
     }
 
     #[test]

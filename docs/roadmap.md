@@ -541,6 +541,16 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：常数序列三种规则都等于 20、斜坡区隔三种规则（10 / 30 / 20）、NaN 归零、
     单样本等于 0（与 `deriv` 丢弃不同）、五种非法 strategy 都退回梯形，以及
     `integral(m[60s])` 与 `integral(m[60s], 0)` 两种查询写法。
+- 已完成（2026-11-13）：`max_of(a, b)` / `min_of(a, b)`（两个标量进、一个标量出）。
+  Prometheus 把它们当作时长表达式里的辅助函数（`max_of(step(), 5s)`），同时也
+  接受普通数字。语义照抄 `funcMaxOf` / `funcMinOf`，与 `max`/`min` 聚合的 NaN
+  规则一致：`if a < b || math.IsNaN(a) { a = b }`（`min_of` 是 `>`），即 **NaN 只在
+  两侧都是 NaN 时** 才保留，单侧 NaN 会被另一侧替换——注意这与 `clamp` 用
+  `go_min`/`go_max` 的「NaN 传播」**不同**，是两条独立的 Go 代码路径。
+  操作数按 `scalar_of` 读（标量本身，或单样本向量），结果恒为 `resultType=scalar`。
+  - 测试：四种大小关系、负数、`±Inf`、单侧 NaN 被替换、双侧 NaN 为 NaN、
+    结果是标量（向量为空），以及向量操作数取唯一值、参数多写一个时的解析报错。
+
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
