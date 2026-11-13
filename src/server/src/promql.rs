@@ -40,9 +40,10 @@
 //!   `and` / `or` / `unless`;
 //! * a MetricsQL subset on top of PromQL — `aggr_over_time(<agg>, v[range])`,
 //!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`,
-//!   `predict_linear(v[range], t)`, the `*_over_time` family, and the label
-//!   helpers `label_set` / `label_del` / `label_keep` / `label_copy` /
-//!   `label_move` / `label_value` / `alias`.
+//!   `predict_linear(v[range], t)`, the `*_over_time` family, the label helpers
+//!   `label_set` / `label_del` / `label_keep` / `label_copy` / `label_move` /
+//!   `label_value` / `alias`, and the classic-bucket summary functions
+//!   `histogram_avg` / `histogram_stddev` / `histogram_stdvar`.
 //!
 //! The parameterised range functions that put the range vector first —
 //! `predict_linear`, `double_exponential_smoothing` and `integral` — are
@@ -89,6 +90,13 @@
 //! destination, and `label_move` then deletes the source; `label_value`
 //! replaces every non-NaN value with the named label's text parsed as a
 //! float (NaN when it is not a number) and drops the metric name.
+//!
+//! `histogram_avg` / `histogram_stddev` / `histogram_stdvar` are
+//! VictoriaMetrics' classic-`le` versions, not Prometheus' native-histogram
+//! ones: every bucket is taken as uniform between the previous bound and its
+//! own, so it contributes its midpoint weighted by the increase in the
+//! cumulative count, the first interval starts at zero, and the `+Inf` bucket
+//! is skipped because it has no midpoint.
 //!
 //! Evaluation asks the engine for each selector's raw samples over the union
 //! window once, then evaluates the expression per step. One scan per selector
@@ -1179,6 +1187,40 @@ impl LabelOp {
     }
 }
 
+/// The MetricsQL summary functions over classic `le` buckets
+/// (`avgForLeTimeseries` / `stdvarForLeTimeseries` in `transform.go`).
+///
+/// VictoriaMetrics treats each bucket as uniform between its bound and the
+/// previous one and weights the bucket's midpoint by how many observations it
+/// holds; the total gives an approximate mean or variance. Prometheus' own
+/// functions with these names only read native histograms, so this is
+/// deliberately VM's classic-bucket semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistogramStatOp {
+    Avg,
+    Stddev,
+    Stdvar,
+}
+
+impl HistogramStatOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            HistogramStatOp::Avg => "histogram_avg",
+            HistogramStatOp::Stddev => "histogram_stddev",
+            HistogramStatOp::Stdvar => "histogram_stdvar",
+        }
+    }
+
+    fn parse(name: &str) -> Option<HistogramStatOp> {
+        Some(match name {
+            "histogram_avg" => HistogramStatOp::Avg,
+            "histogram_stddev" => HistogramStatOp::Stddev,
+            "histogram_stdvar" => HistogramStatOp::Stdvar,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(f64),
@@ -1307,6 +1349,12 @@ pub enum Expr {
         label: String,
         quantiles: Vec<Expr>,
     },
+    /// MetricsQL's `histogram_avg` / `histogram_stddev` / `histogram_stdvar`
+    /// over classic `le` buckets.
+    HistogramStat {
+        op: HistogramStatOp,
+        expr: Box<Expr>,
+    },
     /// `max_of(a, b)` / `min_of(a, b)` — two scalars, one scalar result
     /// (Prometheus' duration-expression helpers, also usable on plain
     /// numbers).
@@ -1403,6 +1451,7 @@ impl Expr {
                     quantile.selectors(out);
                 }
             }
+            Expr::HistogramStat { expr, .. } => expr.selectors(out),
             Expr::Extremum { lhs, rhs, .. } => {
                 lhs.selectors(out);
                 rhs.selectors(out);
@@ -1539,6 +1588,9 @@ impl Expr {
                 for quantile in quantiles {
                     quantile.widen_window(query_start_ms, query_end_ms, start, end);
                 }
+            }
+            Expr::HistogramStat { expr, .. } => {
+                expr.widen_window(query_start_ms, query_end_ms, start, end)
             }
             Expr::Extremum { lhs, rhs, .. } => {
                 lhs.widen_window(query_start_ms, query_end_ms, start, end);
@@ -2408,6 +2460,16 @@ impl Parser {
                     max: Box::new(max),
                 })
             }
+            // VictoriaMetrics' summary functions over classic `le` buckets.
+            "histogram_avg" | "histogram_stddev" | "histogram_stdvar" => {
+                let op = HistogramStatOp::parse(name).expect("name matched above");
+                let expr = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::HistogramStat {
+                    op,
+                    expr: Box::new(expr),
+                })
+            }
             "scalar" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
@@ -2498,7 +2560,8 @@ impl Parser {
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
-                 sort_by_label_desc, histogram_quantiles, histogram_fraction, max_of, min_of, \
+                 sort_by_label_desc, histogram_quantiles, histogram_fraction, histogram_avg, \
+                 histogram_stddev, histogram_stdvar, max_of, min_of, \
                  the query-context \
                  functions start, end, range, step, and the label functions label_replace, \
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
@@ -3034,6 +3097,19 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Instant {
                     vector: histogram_quantiles(&values, label, &instant.vector)?,
+                    scalar: None,
+                })
+            }
+            Expr::HistogramStat { op, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad(format!(
+                        "{} needs an instant vector of `le` buckets, not a scalar",
+                        op.name()
+                    ));
+                }
+                Ok(Instant {
+                    vector: histogram_stat(*op, &instant.vector)?,
                     scalar: None,
                 })
             }
@@ -4782,6 +4858,65 @@ fn histogram_fraction(lower: f64, upper: f64, vector: &Vector) -> Result<Vector>
     Ok(out)
 }
 
+/// MetricsQL's `histogram_avg` / `histogram_stddev` / `histogram_stdvar` for
+/// classic `le` buckets.
+///
+/// Each bucket is assumed to hold its observations uniformly between the
+/// previous bound and its own, so its weight is the increase in the cumulative
+/// count and its representative value is the midpoint of that interval. The
+/// first bucket's interval starts at zero, which is VM's assumption as well
+/// (`lePrev` and `vPrev` start at 0).
+fn histogram_stat(op: HistogramStatOp, vector: &Vector) -> Result<Vector> {
+    let mut out = Vector::default();
+    for (labels, mut buckets) in classic_buckets(op.name(), vector)? {
+        // VM sorts by `le`; `classic_buckets` already rejected NaN bounds, so
+        // `total_cmp` only has to order the remaining values.
+        buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out.push(labels, bucket_stat(op, &buckets));
+    }
+    Ok(out)
+}
+
+fn bucket_stat(op: HistogramStatOp, buckets: &[(f64, f64)]) -> f64 {
+    let mut le_prev = 0.0;
+    let mut value_prev = 0.0;
+    let mut sum = 0.0;
+    let mut sum2 = 0.0;
+    let mut weight_total = 0.0;
+    // The `+Inf` bucket has no midpoint, so VM skips it — and does not let it
+    // update `lePrev`/`vPrev` either.
+    for &(le, value) in buckets {
+        if le.is_infinite() {
+            continue;
+        }
+        let midpoint = (le + le_prev) / 2.0;
+        let weight = value - value_prev;
+        sum += midpoint * weight;
+        sum2 += midpoint * midpoint * weight;
+        weight_total += weight;
+        le_prev = le;
+        value_prev = value;
+    }
+    if weight_total == 0.0 {
+        return f64::NAN;
+    }
+    let avg = sum / weight_total;
+    if op == HistogramStatOp::Avg {
+        return avg;
+    }
+    let mut variance = sum2 / weight_total - avg * avg;
+    // VM clamps a negative result to zero: it can only come from float error,
+    // since the weights are non-negative for a monotonic histogram.
+    if variance < 0.0 {
+        variance = 0.0;
+    }
+    if op == HistogramStatOp::Stdvar {
+        variance
+    } else {
+        variance.sqrt()
+    }
+}
+
 /// Prometheus' `BucketQuantile` for classic histograms.
 ///
 /// Buckets are sorted by upper bound, buckets sharing a bound are coalesced
@@ -5585,6 +5720,9 @@ mod tests {
             r#"label_move(http_requests, "a", "b")"#,
             r#"label_value(http_requests, "a")"#,
             r#"alias(http_requests, "name")"#,
+            "histogram_avg(http_latency_bucket)",
+            "histogram_stddev(http_latency_bucket)",
+            "histogram_stdvar(http_latency_bucket)",
             "-(a + b)",
             "a and b",
             "a or b",
@@ -7181,6 +7319,131 @@ mod tests {
             0,
         );
         assert_eq!(rendered(&instant.vector), vec![("{}".to_string(), 1.0)]);
+    }
+
+    #[test]
+    fn test_histogram_stats_over_classic_buckets() {
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let bucket = |le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("__name__".to_string(), "latency_bucket".to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        let mut vector = Vector::default();
+        // Cumulative 2/4/6/8 observations up to 0.1/0.5/1/+Inf, i.e. two
+        // observations per finite bucket.
+        vector.0.push(bucket("0.1", 2.0));
+        vector.0.push(bucket("0.5", 4.0));
+        vector.0.push(bucket("1", 6.0));
+        vector.0.push(bucket("+Inf", 8.0));
+        // Midpoints 0.05, 0.3 and 0.75, two observations each: the mean is
+        // (0.1 + 0.6 + 1.5) / 6.
+        let avg = histogram_stat(HistogramStatOp::Avg, &vector).unwrap();
+        assert_eq!(avg.0.len(), 1);
+        assert!(approx(avg.0[0].value, 2.2 / 6.0));
+        assert!(!avg.0[0].labels.contains_key("le"));
+        assert!(!avg.0[0].labels.contains_key("__name__"));
+        // The variance is E[x^2] - E[x]^2 over the same midpoints:
+        // (2*0.0025 + 2*0.09 + 2*0.5625)/6 - (2.2/6)^2.
+        let variance = (0.005 + 0.18 + 1.125) / 6.0 - (2.2f64 / 6.0).powi(2);
+        let stdvar = histogram_stat(HistogramStatOp::Stdvar, &vector).unwrap();
+        assert!(approx(stdvar.0[0].value, variance));
+        let stddev = histogram_stat(HistogramStatOp::Stddev, &vector).unwrap();
+        assert!(approx(stddev.0[0].value, variance.sqrt()));
+        // The `+Inf` bucket carries no midpoint, so a histogram made only of
+        // it has no weight at all and VM answers NaN.
+        let mut infinite = Vector::default();
+        infinite.0.push(bucket("+Inf", 8.0));
+        assert!(
+            histogram_stat(HistogramStatOp::Avg, &infinite).unwrap().0[0]
+                .value
+                .is_nan()
+        );
+        // With zero counts in every bucket the total weight is zero and VM
+        // answers NaN (a non-empty first bucket would have weight, e.g.
+        // 5 → 5 gives just the first interval's midpoint).
+        let mut flat = Vector::default();
+        flat.0.push(bucket("0.1", 0.0));
+        flat.0.push(bucket("0.5", 0.0));
+        assert!(histogram_stat(HistogramStatOp::Avg, &flat).unwrap().0[0]
+            .value
+            .is_nan());
+        // A flat but non-zero histogram only weighs the first interval, since
+        // no observations were added afterwards: 5 at both bounds means all
+        // five are inside `[0, 0.1]`, midpoint 0.05.
+        let mut start_only = Vector::default();
+        start_only.0.push(bucket("0.1", 5.0));
+        start_only.0.push(bucket("0.5", 5.0));
+        assert!(approx(
+            histogram_stat(HistogramStatOp::Avg, &start_only).unwrap().0[0].value,
+            0.05
+        ));
+        // Two histograms are grouped apart by their non-`le` labels, and a
+        // missing `le` is refused by name.
+        let labeled = |job: &str, le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("job".to_string(), job.to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        let mut two = Vector::default();
+        two.0.push(labeled("api", "1", 2.0));
+        two.0.push(labeled("api", "+Inf", 4.0));
+        two.0.push(labeled("db", "2", 4.0));
+        two.0.push(labeled("db", "+Inf", 8.0));
+        let out = histogram_stat(HistogramStatOp::Avg, &two).unwrap();
+        assert_eq!(out.0.len(), 2);
+        let value = |job: &str| {
+            out.0
+                .iter()
+                .find(|point| point.labels.get("job") == Some(&job.to_string()))
+                .unwrap_or_else(|| panic!("missing {job}"))
+                .value
+        };
+        assert!(approx(value("api"), 0.5));
+        assert!(approx(value("db"), 1.0));
+        let mut mixed = two.clone();
+        mixed.0.push(Point {
+            labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
+            value: 0.0,
+            sample_ts: None,
+        });
+        let error = histogram_stat(HistogramStatOp::Stddev, &mixed).unwrap_err();
+        assert!(error.message().contains("`le` label"));
+        assert!(error.message().contains("job=\"api\""));
+
+        // End to end through the evaluator.
+        let series = vec![
+            synthetic_labeled("latency_bucket", &[("le", "0.1")], &[(0, 2.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "0.5")], &[(0, 4.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "1")], &[(0, 6.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "+Inf")], &[(0, 8.0)]),
+        ];
+        let instant = eval_series(
+            series.clone(),
+            "latency_bucket",
+            "histogram_avg(latency_bucket)",
+            0,
+        );
+        assert_eq!(instant.vector.0.len(), 1);
+        assert!(approx(instant.vector.0[0].value, 2.2 / 6.0));
+        let instant = eval_series(
+            series,
+            "latency_bucket",
+            "histogram_stddev(latency_bucket)",
+            0,
+        );
+        assert!(approx(instant.vector.0[0].value, variance.sqrt()));
+        // A scalar has no buckets to summarise.
+        assert!(
+            eval_err(synthetic("m", &[(0, 1.0)]), "m", "histogram_avg(1)", 0)
+                .contains("histogram_avg needs an instant vector of `le` buckets")
+        );
     }
 
     #[test]

@@ -369,6 +369,25 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `label_del`/`label_keep` 对 `__name__` 的处理、`label_copy` 的缺失源跳过、
     `label_move` 的同名不删、`label_value` 的数值/非数值/缺标签/NaN 四种情况，
     以及奇数个字符串参数、非字符串参数、标量输入的报错。
+- 已完成（2026-11-13）：MetricsQL 经典桶的汇总函数 `histogram_avg` /
+  `histogram_stddev` / `histogram_stdvar`（`transform.go` 的
+  `avgForLeTimeseries` / `stdvarForLeTimeseries`）。同名函数在 Prometheus 里只读
+  native histogram（本服务没有该表示，roadmap 下文据此把它们列为不做），
+  VictoriaMetrics 则按经典 `le` 桶估算，这里实现的是后者：
+  - 每个桶视为在「上一个边界, 本边界」之间均匀分布，权重取累计计数的增量，
+    代表值取区间中点；第一个区间的下界按 VM 的假设从 0 起（`lePrev = vPrev = 0`）；
+  - `+Inf` 桶没有中点，被跳过，且不参与 `lePrev`/`vPrev` 的推进（照抄 VM 的
+    `continue`）；
+  - 权重总和为 0（只有 `+Inf` 桶，或各桶累计计数都是 0）时返回 NaN；方差用
+    `E[x²] - E[x]²`，负数按 VM 的做法钳到 0，`histogram_stddev` 再开方；
+  - 分组与 `histogram_quantile` 一致（除 `le`/`__name__` 外的全部标签），缺 `le`
+    的序列按名字报错而不是静默丢弃；结果丢弃 `__name__` 与 `le`；
+  - VM 的 `convertBucketsToVMRange` 那套 `vmrange` 标签转换不在这里实现——本服务
+    只产出经典 `le` 桶（这也是既有 `histogram_quantile` 的约定）；
+  - 测试：2/4/6/8 累计计数下 avg=2.2/6、方差 `E[x²]-E[x]²` 与 stddev=√var、
+    `+Inf` 单桶与全 0 计数都返回 NaN、计数不变的非零直方图只计第一个区间的权重
+    （5/5 → 0.05）、两组直方图分组互不影响、缺 `le` 报错并点名，
+    以及经求值器端到端丢掉 `__name__`/`le`、标量输入报错。
 - 已完成（2026-11-11）：`histogram_quantile(q, v)`（经典直方图的 `le` 桶）。
   Grafana 的延迟面板几乎都写成 `histogram_quantile(0.9, sum by (le) (rate(x_bucket[5m])))`，
   之前这个函数会被当作未知函数拒绝。实现按 Prometheus 的 `BucketQuantile`：
@@ -643,11 +662,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
 
 
 - 剩余未实现的 Prometheus 函数（**明确不做**，理由记在这里）：
-  - `histogram_avg` / `histogram_count` / `histogram_sum` / `histogram_stddev` /
-    `histogram_stdvar`：上游走 `simpleHistogramFunc`，只处理 `el.H != nil` 的
-    native histogram，经典 `le` 桶的浮点样本被**静默丢弃**（结果是空向量，而不是
-    从 `_count`/`_sum` 推算）。本服务的样本类型只有 `f64`，没有 native histogram
-    表示，照抄只会得到恒空的函数；
+  - `histogram_count` / `histogram_sum`：上游走 `simpleHistogramFunc`，只处理
+    `el.H != nil` 的 native histogram，经典 `le` 桶的浮点样本被**静默丢弃**（结果是
+    空向量，而不是从 `_count`/`_sum` 推算）。本服务的样本类型只有 `f64`，没有
+    native histogram 表示，照抄只会得到恒空的函数。（同名的
+    `histogram_avg` / `histogram_stddev` / `histogram_stdvar` 在上文以
+    **VictoriaMetrics 的经典桶语义**实现了：VM 从 `le` 桶估算，Prometheus 只读
+    native histogram，两个上游本来就不一致，这里跟的是 VM。）
   - `info(v, ...)`：读取 `target_info` 一类元数据序列并与目标序列做标签连接，
     需要引擎侧的元数据视角，本服务没有；
   - `start_timestamp(v)`：依赖 `EvalNodeHelper.StartTimestamps`（由
