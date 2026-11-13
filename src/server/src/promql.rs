@@ -28,8 +28,8 @@
 //! * instant functions — math (`abs`, `ceil`, `clamp`, `clamp_min`, ...),
 //!   `scalar`, the date functions (`year`, `month`, `day_of_month`, ...),
 //!   `timestamp`, `sort`, `sort_desc`, `absent`, `histogram_quantile`,
-//!   `label_replace` / `label_join`, and the generators `time`, `pi`, `vector`,
-//!   plus MetricsQL's `default`;
+//!   `histogram_fraction`, `label_replace` / `label_join`, and the generators
+//!   `time`, `pi`, `vector`, plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, `quantile`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
@@ -368,7 +368,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             {
                 i += 1;
             }
-            tokens.push(Token::Ident(chars[start..i].iter().collect()));
+            let word: String = chars[start..i].iter().collect();
+            // `Inf` and `NaN` are float literals, case-insensitively, exactly
+            // as Prometheus' lexer treats them; `-Inf` is then a unary minus
+            // on that literal. A longer name such as `Infinity` stays an
+            // identifier, and a metric actually called `inf` would have to be
+            // quoted (which this subset does not support yet).
+            if word.eq_ignore_ascii_case("inf") {
+                tokens.push(Token::Number(f64::INFINITY));
+                continue;
+            }
+            if word.eq_ignore_ascii_case("nan") {
+                tokens.push(Token::Number(f64::NAN));
+                continue;
+            }
+            tokens.push(Token::Ident(word));
             continue;
         }
         let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
@@ -1163,6 +1177,13 @@ pub enum Expr {
         min: Box<Expr>,
         max: Box<Expr>,
     },
+    /// `histogram_fraction(lower, upper, v)` — both bounds are scalars, `v` a
+    /// vector of classic `le` buckets.
+    HistogramFraction {
+        lower: Box<Expr>,
+        upper: Box<Expr>,
+        expr: Box<Expr>,
+    },
     /// `day_of_month(v)` and friends. With an argument each sample's value is
     /// read as Unix seconds; with none the evaluation instant is used.
     DateFunc {
@@ -1223,6 +1244,11 @@ impl Expr {
                 expr.selectors(out);
                 min.selectors(out);
                 max.selectors(out);
+            }
+            Expr::HistogramFraction { lower, upper, expr } => {
+                lower.selectors(out);
+                upper.selectors(out);
+                expr.selectors(out);
             }
             Expr::DateFunc { expr, .. } => {
                 if let Some(expr) = expr {
@@ -1341,6 +1367,11 @@ impl Expr {
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
                 min.widen_window(query_start_ms, query_end_ms, start, end);
                 max.widen_window(query_start_ms, query_end_ms, start, end);
+            }
+            Expr::HistogramFraction { lower, upper, expr } => {
+                lower.widen_window(query_start_ms, query_end_ms, start, end);
+                upper.widen_window(query_start_ms, query_end_ms, start, end);
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
             }
             Expr::DateFunc { expr, .. } => {
                 if let Some(expr) = expr {
@@ -1652,7 +1683,9 @@ impl Parser {
                 Some(Token::Op("@")) => {
                     self.pos += 1;
                     let modifier = match self.next() {
-                        Some(Token::Number(value)) => AtModifier::At((value * 1_000.0) as i64),
+                        Some(Token::Number(value)) if value.is_finite() => {
+                            AtModifier::At((value * 1_000.0) as i64)
+                        }
                         Some(Token::Ident(word)) if word == "start" => {
                             self.expect(Token::LParen)?;
                             self.expect(Token::RParen)?;
@@ -1757,7 +1790,9 @@ impl Parser {
     fn duration(&mut self, context: &str) -> Result<i64> {
         match self.next() {
             Some(Token::Duration(ms)) => Ok(ms),
-            Some(Token::Number(seconds)) if seconds >= 0.0 => Ok((seconds * 1_000.0) as i64),
+            Some(Token::Number(seconds)) if seconds >= 0.0 && seconds.is_finite() => {
+                Ok((seconds * 1_000.0) as i64)
+            }
             other => bad(format!(
                 "expected a duration {context} but found {}",
                 describe(other)
@@ -2128,6 +2163,19 @@ impl Parser {
             }
         }
         match name {
+            "histogram_fraction" => {
+                let lower = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let upper = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let expr = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::HistogramFraction {
+                    lower: Box::new(lower),
+                    upper: Box::new(upper),
+                    expr: Box::new(expr),
+                })
+            }
             "clamp" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::Comma)?;
@@ -2218,7 +2266,8 @@ impl Parser {
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
-                 sort_by_label_desc, and the label functions label_replace and label_join"
+                 sort_by_label_desc, histogram_fraction, and the label functions \
+                 label_replace and label_join"
             )),
         }
     }
@@ -2606,11 +2655,11 @@ impl<'a> Evaluator<'a> {
                 let instant = self.eval(expr, at_ms)?;
                 let min = self.scalar_of(min, at_ms)?;
                 let max = self.scalar_of(max, at_ms)?;
-                let mut vector = Vector::default();
                 // `max < min` is an empty result, not the untouched input. A
                 // NaN bound is not less than anything, so — as in Go — it
                 // proceeds and turns every sample into NaN.
                 let inverted = max < min;
+                let mut vector = Vector::default();
                 if !inverted {
                     let points = match instant.scalar {
                         Some(value) => {
@@ -2629,6 +2678,20 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Instant {
                     vector,
+                    scalar: None,
+                })
+            }
+            Expr::HistogramFraction { lower, upper, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                let lower = self.scalar_of(lower, at_ms)?;
+                let upper = self.scalar_of(upper, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad(
+                        "histogram_fraction needs an instant vector of `le` buckets, not a scalar",
+                    );
+                }
+                Ok(Instant {
+                    vector: histogram_fraction(lower, upper, &instant.vector)?,
                     scalar: None,
                 })
             }
@@ -3968,6 +4031,10 @@ fn values(samples: &[SamplePoint]) -> Vec<f64> {
     samples.iter().map(|s| s.value).collect()
 }
 
+/// One classic histogram: the `le`/cumulative-count pairs grouped by the label
+/// set that stays after `le` and `__name__` are dropped.
+type ClassicHistograms = BTreeMap<BTreeMap<String, String>, Vec<(f64, f64)>>;
+
 /// `histogram_quantile(q, v)` for classic `le` buckets.
 ///
 /// Every series must carry a `le` bucket bound; `_sum`/`_count` series (or a
@@ -3975,28 +4042,54 @@ fn values(samples: &[SamplePoint]) -> Vec<f64> {
 /// a panel that passes the wrong metric hears about it instead of drawing an
 /// empty graph.
 fn histogram_quantile(quantile: f64, vector: &Vector) -> Result<Vector> {
-    type Groups = BTreeMap<BTreeMap<String, String>, Vec<(f64, f64)>>;
-    let mut groups: Groups = BTreeMap::new();
+    let mut out = Vector::default();
+    for (labels, mut buckets) in classic_buckets("histogram_quantile", vector)? {
+        out.push(labels, bucket_quantile(quantile, &mut buckets));
+    }
+    Ok(out)
+}
+
+/// Groups a vector of classic `le` buckets into one histogram per label set.
+///
+/// Every series must carry a `le` bucket bound; `_sum`/`_count` series (or a
+/// missing `by (le)` aggregation) are refused by name rather than dropped, so
+/// a panel that passes the wrong metric hears about it instead of drawing an
+/// empty graph. Prometheus emits a warning and skips such a series; this
+/// evaluator has no annotation channel, so the error is the honest signal.
+fn classic_buckets(function: &str, vector: &Vector) -> Result<ClassicHistograms> {
+    let mut groups: ClassicHistograms = BTreeMap::new();
     for point in &vector.0 {
         let Some(raw) = point.labels.get("le") else {
             return bad(format!(
-                "histogram_quantile needs a `le` label on every series; {} has none",
+                "{function} needs a `le` label on every series; {} has none",
                 label_string(&point.labels)
             ));
         };
         let Ok(upper) = raw.trim().parse::<f64>() else {
             return bad(format!(
-                "histogram_quantile cannot read `le={raw}` as a bucket bound"
+                "{function} cannot read `le={raw}` as a bucket bound"
             ));
         };
+        if upper.is_nan() {
+            // Prometheus refuses a NaN bound for the same reason as an
+            // unparseable one: every comparison against it is false.
+            return bad(format!(
+                "{function} cannot read `le={raw}` as a bucket bound"
+            ));
+        }
         let mut labels = point.labels.clone();
         labels.remove("le");
         labels.remove("__name__");
         groups.entry(labels).or_default().push((upper, point.value));
     }
+    Ok(groups)
+}
+
+/// `histogram_fraction(lower, upper, v)` for classic `le` buckets.
+fn histogram_fraction(lower: f64, upper: f64, vector: &Vector) -> Result<Vector> {
     let mut out = Vector::default();
-    for (labels, mut buckets) in groups {
-        out.push(labels, bucket_quantile(quantile, &mut buckets));
+    for (labels, mut buckets) in classic_buckets("histogram_fraction", vector)? {
+        out.push(labels, bucket_fraction(lower, upper, &mut buckets));
     }
     Ok(out)
 }
@@ -4076,6 +4169,101 @@ fn bucket_quantile(quantile: f64, buckets: &mut [(f64, f64)]) -> f64 {
             start + (end - start) * (rank / count)
         }
     }
+}
+
+/// Prometheus' `BucketFraction` for classic histograms: the fraction of the
+/// observations that fall between `lower` and `upper`.
+///
+/// The same sorting and coalescing as `bucket_quantile` applies, but *not* its
+/// monotonicity clamp: Prometheus' `BucketFraction` does not force it either.
+/// Special cases, kept as Prometheus has them: no buckets, no `+Inf` bucket or
+/// zero observations answer NaN; a NaN bound answers NaN; `lower >= upper`
+/// answers 0.
+///
+/// `lower` is exclusive for positive values and inclusive for negative ones,
+/// `upper` the other way round — that follows from interpolating only when a
+/// bound falls strictly *inside* a bucket. Observations above the last finite
+/// bucket are not counted, so `histogram_fraction(-Inf, +Inf, v)` can be < 1.
+fn bucket_fraction(lower: f64, upper: f64, buckets: &mut [(f64, f64)]) -> f64 {
+    if buckets.is_empty() {
+        return f64::NAN;
+    }
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if buckets.last().map(|(upper, _)| *upper) != Some(f64::INFINITY) {
+        return f64::NAN;
+    }
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(buckets.len());
+    for (upper_bound, count) in buckets.iter().copied() {
+        match merged.last_mut() {
+            Some((last_upper, last_count)) if *last_upper == upper_bound => *last_count += count,
+            _ => merged.push((upper_bound, count)),
+        }
+    }
+    let observations = merged[merged.len() - 1].1;
+    if observations == 0.0 || lower.is_nan() || upper.is_nan() {
+        return f64::NAN;
+    }
+    if lower >= upper {
+        return 0.0;
+    }
+
+    let mut rank = 0.0;
+    let mut lower_rank = 0.0;
+    let mut upper_rank = 0.0;
+    let mut lower_set = false;
+    let mut upper_set = false;
+    // A histogram whose first bucket ends at or below zero has an implicit
+    // lower bound of -Inf; otherwise 0 is assumed.
+    let mut lower_bound = if merged[0].0 <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        0.0
+    };
+    for (i, (upper_bound, count)) in merged.iter().copied().enumerate() {
+        if i > 0 {
+            lower_bound = merged[i - 1].0;
+        }
+        // Interpolation inside a bucket; an infinite lower bound cannot be
+        // interpolated against, so the bucket's whole count is used (the same
+        // effect the `+Inf` case gets for free).
+        let interpolate = |value: f64| {
+            if lower_bound == f64::NEG_INFINITY {
+                count
+            } else {
+                rank + (count - rank) * (value - lower_bound) / (upper_bound - lower_bound)
+            }
+        };
+        if !lower_set && lower_bound >= lower {
+            lower_rank = rank;
+            lower_set = true;
+        }
+        if !upper_set && lower_bound >= upper {
+            upper_rank = rank;
+            upper_set = true;
+        }
+        if lower_set && upper_set {
+            break;
+        }
+        if !lower_set && lower_bound < lower && upper_bound > lower {
+            lower_rank = interpolate(lower);
+            lower_set = true;
+        }
+        if !upper_set && lower_bound < upper && upper_bound > upper {
+            upper_rank = interpolate(upper);
+            upper_set = true;
+        }
+        if lower_set && upper_set {
+            break;
+        }
+        rank = count;
+    }
+    if !lower_set || lower_rank > observations {
+        lower_rank = observations;
+    }
+    if !upper_set || upper_rank > observations {
+        upper_rank = observations;
+    }
+    (upper_rank - lower_rank) / observations
 }
 
 /// Orders two label sets for `sort_by_label` / `sort_by_label_desc`.
@@ -4601,6 +4789,16 @@ mod tests {
         // `1e3` is a number, not a duration, and `10s` is a duration.
         assert!(matches!(parse_ok("1e3"), Expr::Number(value) if value == 1000.0));
         assert!(matches!(parse_ok("10s"), Expr::Number(_)));
+        // `Inf`/`NaN` are float literals, case-insensitively, and `-Inf` is a
+        // unary minus on the literal rather than a metric named `Inf`.
+        assert!(matches!(parse_ok("Inf"), Expr::Number(value) if value.is_infinite()));
+        assert!(matches!(parse_ok("NaN"), Expr::Number(value) if value.is_nan()));
+        match parse_ok("-Inf") {
+            Expr::Unary { negate: true, expr } => {
+                assert!(matches!(*expr, Expr::Number(value) if value.is_infinite()))
+            }
+            other => panic!("expected a negated number, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5915,6 +6113,150 @@ mod tests {
             apply_range_func(RangeFunc::CountOverTime, &samples, 4_000, None, None),
             Some(4.0)
         );
+    }
+
+    #[test]
+    fn test_bucket_fraction_interpolates_classic_buckets() {
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 10/20/30/40 observations up to 0.1/0.5/1/+Inf: 25 % of them lie in
+        // each bucket, so each quarter span holds a quarter of the mass.
+        let buckets = vec![(f64::INFINITY, 40.0), (0.5, 20.0), (0.1, 10.0), (1.0, 30.0)];
+        assert!(approx(
+            bucket_fraction(0.1, 0.5, &mut buckets.clone()),
+            0.25
+        ));
+        assert!(approx(
+            bucket_fraction(0.0, 1.0, &mut buckets.clone()),
+            0.75
+        ));
+        assert!(approx(
+            bucket_fraction(0.0, 0.1, &mut buckets.clone()),
+            0.25
+        ));
+        // Inside the first bucket the lower implicit bound is 0, so 0.05..0.25
+        // mixes the first bucket's interior with the second bucket's start.
+        assert!(approx(
+            bucket_fraction(0.05, 0.25, &mut buckets.clone()),
+            0.21875
+        ));
+        // The whole distribution is 1, including the `+Inf` tail.
+        assert!(approx(
+            bucket_fraction(f64::NEG_INFINITY, f64::INFINITY, &mut buckets.clone()),
+            1.0
+        ));
+        // Everything above the last finite bound is the `+Inf` bucket alone.
+        assert!(approx(
+            bucket_fraction(1.0, f64::INFINITY, &mut buckets.clone()),
+            0.25
+        ));
+        // A range past the data holds nothing.
+        assert_eq!(bucket_fraction(2.0, 3.0, &mut buckets.clone()), 0.0);
+        // Bounds that are equal or inverted hold nothing — Prometheus answers
+        // 0 rather than an error.
+        assert_eq!(bucket_fraction(0.5, 0.5, &mut buckets.clone()), 0.0);
+        assert_eq!(bucket_fraction(0.6, 0.4, &mut buckets.clone()), 0.0);
+        // A NaN bound answers NaN.
+        assert!(bucket_fraction(f64::NAN, 1.0, &mut buckets.clone()).is_nan());
+        assert!(bucket_fraction(0.0, f64::NAN, &mut buckets.clone()).is_nan());
+        // All-negative buckets get an implicit -Inf lower bound instead of 0.
+        let negative = vec![(-1.0, 5.0), (0.0, 10.0), (f64::INFINITY, 20.0)];
+        assert!(approx(
+            bucket_fraction(f64::NEG_INFINITY, 0.0, &mut negative.clone()),
+            0.5
+        ));
+        assert!(approx(
+            bucket_fraction(-0.5, -0.25, &mut negative.clone()),
+            0.0625
+        ));
+        // Equal bounds coalesce; unlike `bucket_quantile`, a decreasing count
+        // is *not* clamped (Prometheus' `BucketFraction` has no monotonicity
+        // fix), so this stays a plain cumulative read.
+        let mut duplicate = vec![(0.5, 1.0), (0.5, 3.0), (f64::INFINITY, 4.0)];
+        assert!(approx(bucket_fraction(0.0, 0.5, &mut duplicate), 1.0));
+        let mut decreasing = vec![(0.1, 5.0), (0.5, 3.0), (f64::INFINITY, 5.0)];
+        assert!(approx(
+            bucket_fraction(f64::NEG_INFINITY, f64::INFINITY, &mut decreasing),
+            1.0
+        ));
+        // Inputs that cannot describe a distribution answer NaN.
+        let mut no_inf = vec![(0.1, 1.0), (1.0, 2.0)];
+        assert!(bucket_fraction(0.0, 1.0, &mut no_inf).is_nan());
+        let mut no_observations = vec![(0.5, 0.0), (f64::INFINITY, 0.0)];
+        assert!(bucket_fraction(0.0, 1.0, &mut no_observations).is_nan());
+        assert!(bucket_fraction(0.0, 1.0, &mut []).is_nan());
+    }
+
+    #[test]
+    fn test_histogram_fraction_groups_buckets_per_histogram() {
+        let bucket = |job: &str, le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("__name__".to_string(), "latency_bucket".to_string()),
+                ("job".to_string(), job.to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        let mut vector = Vector::default();
+        // `api`: cumulative 2/4/6/8 observations, `db`: 20/40/60/80 — ten
+        // times the sample count in the same shape, so both fractions are
+        // exactly 0.5 at an upper bound of 0.5.
+        for (job, scale) in [("api", 1.0), ("db", 10.0)] {
+            vector.0.push(bucket(job, "0.1", 2.0 * scale));
+            vector.0.push(bucket(job, "0.5", 4.0 * scale));
+            vector.0.push(bucket(job, "1", 6.0 * scale));
+            vector.0.push(bucket(job, "+Inf", 8.0 * scale));
+        }
+        let out = histogram_fraction(0.0, 0.5, &vector).expect("both histograms are complete");
+        assert_eq!(out.0.len(), 2);
+        let value = |job: &str| {
+            out.0
+                .iter()
+                .find(|point| point.labels.get("job") == Some(&job.to_string()))
+                .unwrap_or_else(|| panic!("missing {job}"))
+                .value
+        };
+        // Half of each distribution is at or below 0.5.
+        assert!((value("api") - 0.5).abs() < 1e-9);
+        assert!((value("db") - 0.5).abs() < 1e-9);
+        for point in &out.0 {
+            assert!(!point.labels.contains_key("__name__"));
+            assert!(!point.labels.contains_key("le"));
+        }
+        // A series without `le` is refused by name, as for
+        // `histogram_quantile`.
+        let mut mixed = vector.clone();
+        mixed.0.push(Point {
+            labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
+            value: 0.0,
+            sample_ts: None,
+        });
+        let error = histogram_fraction(0.0, 0.5, &mixed).unwrap_err();
+        assert!(error.message().contains("`le` label"));
+        assert!(error.message().contains("job=\"api\""));
+        // End to end through the evaluator: one `le` series per bucket, 2/4/6/8
+        // observations up to 0.1/0.5/1/+Inf.
+        let series = vec![
+            synthetic_labeled("latency_bucket", &[("le", "0.1")], &[(0, 2.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "0.5")], &[(0, 4.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "1")], &[(0, 6.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "+Inf")], &[(0, 8.0)]),
+        ];
+        let instant = eval_series(
+            series.clone(),
+            "latency_bucket",
+            "histogram_fraction(0.5, 1, latency_bucket)",
+            0,
+        );
+        // (6 - 4) / 8: the second bucket's mass only.
+        assert_eq!(rendered(&instant.vector), vec![("{}".to_string(), 0.25)]);
+        let instant = eval_series(
+            series,
+            "latency_bucket",
+            "histogram_fraction(-Inf, +Inf, latency_bucket)",
+            0,
+        );
+        assert_eq!(rendered(&instant.vector), vec![("{}".to_string(), 1.0)]);
     }
 
     #[test]

@@ -237,7 +237,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     以及 `sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`、`absent`、`vector()`、
     `time()`、`pi()`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`；
-    （`histogram_quantile` 见下面单独一条）
+    （`histogram_quantile` / `histogram_fraction` 见下面单独两条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
     count_values`，支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
@@ -415,6 +415,27 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`present_over_time` 对普通序列与全 NaN 序列都返回 1、空区间不出现；
     `mad_over_time` 对 `[1,2,3,4]` 得 1、单样本得 0、含 NaN 得 NaN；解析测试
     覆盖两个新函数名。
+- 已完成（2026-11-13）：`histogram_fraction(lower, upper, v)`（经典 `le` 桶）。
+  `bucket_fraction` 逐行照抄 Prometheus：区间 `(lower, upper]` 内的观测占比，
+  `lower` 正数时不含、负数时含，`upper` 反之（由仅在桶内部插值推出），首个桶
+  的隐式下界全负时取 `-Inf`、否则取 `0`，因此 `(-Inf, +Inf)` 为 1（`+Inf` 尾部
+  桶也算在内）。与 `bucket_quantile` 共用 `classic_buckets` 的桶分组，但有两点
+  有意的差异：
+  - 排序后**不做**单调性钳平（Prometheus 的 `BucketFraction` 没有
+    `fixBadHistogramBuckets` 那步），递减计数按普通累计读；
+  - 缺/无法解析/NaN 的 `le` 直接 `bad_data` 报错，而非 Prometheus 的
+    `BadBucketLabel` warning 后跳过——本求值器没有 annotation 通道，报错才是
+    诚实的信号；
+  - 特殊值：无桶/无 `+Inf` 桶/观测数为 0 返回 NaN，NaN 界返回 NaN，`lower >= upper`
+    返回 0（相等与倒置都为 0）。
+  - 测试：`bucket_fraction` 的插值/`+Inf`/NaN/`-Inf` 隐式下界/重复边界/递减/无桶，
+    按直方图分组与标签裁剪、缺 `le` 的报错，以及经求值器写出四个桶后断言
+    `histogram_fraction(0.5, 1, ...)`=0.25、`(-Inf, +Inf)`=1。
+  - 顺带补上 PromQL 的 `Inf`/`NaN` 浮点字面量：此前 `-Inf` 会被词法分析当成
+    名为 `Inf` 的指标（再与 `-` 组成一元负号），`histogram_fraction(-Inf, +Inf, ...)`
+    因此悄悄算出 NaN。现在 `Inf`/`NaN`（大小写不敏感，`Infinity` 之类仍是标识符）
+    按 Prometheus 的词法规则直接是浮点字面量；`@` 与 `[ ]` 里的时长/时间戳
+    只接受有限值，`@ NaN` 报错而不是静默截成 0。
 - 已完成（2026-11-12）：钉住「不写 `by`/`without`」的默认聚合语义。查
   Prometheus 官方文档与 `promql/engine.go`（`generateGroupingKey` 在 grouping
   为空且非 `without` 时直接返回 0）确认：此时是**聚合全部标签维度**，整个向量
