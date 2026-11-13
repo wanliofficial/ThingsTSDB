@@ -227,7 +227,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `idelta`、`changes`、`resets`、`deriv`、`present_over_time`、`mad_over_time`、
     `first_over_time`、`ts_of_first_over_time`、`ts_of_last_over_time`、
     `ts_of_max_over_time`、`ts_of_min_over_time`、`predict_linear`、
-    `double_exponential_smoothing`、
+    `double_exponential_smoothing`、`integral`、
     `*_over_time`（`avg/min/max/sum/count/last/stddev/stdvar/quantile`）。
     `rate`/`increase` 按 Prometheus 规则处理计数器回绕（下降视为归零后继续累加），
     单位是「每秒」；`deriv` 是最小二乘斜率（每秒），只有 1 个样本时该序列不出现；
@@ -502,6 +502,24 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：线性序列复现、常数序列、两样本等于端点、非线性序列（`5,3,4,6` 配
     `sf=0.4 tf=0.6` 得 2.952）、单样本被丢弃、四种越界因子各自报错、以及
     `__name__` 被丢弃。
+- 已完成（2026-11-13）：`integral(v[range], strategy=2)`。照抄 `funcIntegral`：
+  - 三种求积规则：`strategy=0` 左点矩形（区间取旧样本值）、`1` 右点矩形（取新样本
+    值）、`2` 梯形（两端均值，默认）；
+  - NaN 一律当 0，好让「相邻的非零样本」仍能贡献面积——`1, NaN, 3` 在 0/10/20 s
+    上按梯形算得 `(1+0)/2*10 + (0+3)/2*10 = 20`；
+  - 求和用 Prometheus 的 `kahansum.Inc`（Neumaier 变体：`|sum| >= |inc|` 时把误差
+    记到 `sum` 一侧，否则记到 `inc` 一侧；中间结果溢出为 Inf 时清零补偿项），
+    照抄是因为梯形面积要先把 `curr + prev` 加起来再除 2，大数相加本身就会吃掉
+    小数；
+  - 梯形分支照抄了那条溢出保护：只有 `value` 溢出而两端都有限时才改成「各自减半
+    再相加」，否则才整体除 2；
+  - `strategy` 非法（NaN / ±Inf / 非整数 / 越界）时 Prometheus 只发 warning 并退回
+    梯形，这里同样退回默认而不是报错；参数缺失也走默认。**差异**：Prometheus 的
+    warning 走 annotation，本服务的求值器没有注释通道，所以这类降级是静默的，
+    roadmap 在此记录。
+  - 测试：常数序列三种规则都等于 20、斜坡区隔三种规则（10 / 30 / 20）、NaN 归零、
+    单样本等于 0（与 `deriv` 丢弃不同）、五种非法 strategy 都退回梯形，以及
+    `integral(m[60s])` 与 `integral(m[60s], 0)` 两种查询写法。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50

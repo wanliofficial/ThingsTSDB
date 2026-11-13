@@ -40,6 +40,11 @@
 //!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`, and
 //!   `predict_linear(v[range], t)`.
 //!
+//! The parameterised range functions that put the range vector first —
+//! `predict_linear`, `double_exponential_smoothing` and `integral` — are
+//! dispatched by name in the parser, since `quantile_over_time(0.9, v[range])`
+//! is the only one whose scalar comes first.
+//!
 //! Prometheus' `present_over_time` and `mad_over_time` are part of the range
 //! function set above.
 //!
@@ -790,6 +795,8 @@ pub enum RangeFunc {
     /// `double_exponential_smoothing(v[range], sf, tf)` — Holt's linear
     /// smoothing (Prometheus V2 called it `holt_winters`).
     DoubleExpSmoothing,
+    /// `integral(v[range], strategy=2)` — the integral over time in seconds.
+    Integral,
 }
 
 impl RangeFunc {
@@ -1999,6 +2006,25 @@ impl Parser {
                     param2: second,
                 });
             }
+            // `integral(v[range], strategy=2)` also puts the range vector
+            // first, but its parameter is optional (the trapezoidal rule is the
+            // default), so it gets its own arm.
+            "integral" => {
+                self.expect(Token::LParen)?;
+                let inner = self.range_argument(name)?;
+                let param = if self.eat(&Token::Comma) {
+                    Some(Box::new(self.expression(0)?))
+                } else {
+                    None
+                };
+                self.expect(Token::RParen)?;
+                return Ok(Expr::RangeFunc {
+                    func: RangeFunc::Integral,
+                    expr: Box::new(inner),
+                    param,
+                    param2: None,
+                });
+            }
             _ => {}
         }
         self.expect(Token::LParen)?;
@@ -2185,8 +2211,8 @@ impl Parser {
                 "unknown function {other:?}; supported range functions are rate, irate, \
                  increase, delta, idelta, deriv, changes, resets, first_over_time, \
                  ts_of_first_over_time, ts_of_last_over_time, ts_of_max_over_time, \
-                 ts_of_min_over_time, predict_linear, double_exponential_smoothing \
-                 and *_over_time, the math \
+                 ts_of_min_over_time, predict_linear, double_exponential_smoothing, \
+                 integral and *_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
                  clamp, clamp_min, clamp_max, scalar, timestamp, the trigonometric and \
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
@@ -3555,9 +3581,9 @@ fn apply_range_func(
             Some(slope)
         }
         // Holt's linear ("double exponential") smoothing, transcribed from
-        // Prometheus' `funcDoubleExponentialSmoothing`: seed the level with the
-        // first sample and the trend with the first difference, then walk the
-        // series forward. `calcTrendValue` keeps `b` unchanged on the very
+        // // Prometheus' `funcDoubleExponentialSmoothing`: seed the level with
+        // the first sample and the trend with the first difference, then walk
+        // the series forward. `calcTrendValue` keeps `b` unchanged on the very
         // first step (its `i == 0` case), so a two-sample series reproduces the
         // straight line through them. Fewer than two float samples has no
         // smoothing to do and the series is dropped.
@@ -3578,7 +3604,86 @@ fn apply_range_func(
             }
             Some(s1)
         }
+        // The integral over time, in seconds, following Prometheus'
+        // `funcIntegral`: three quadrature strategies, NaN treated as zero, and
+        // a Kahan-compensated sum. The parameter is the strategy (0 = left
+        // point, 1 = right point, 2 = trapezoid, the default).
+        RangeFunc::Integral => {
+            let strategy = match param {
+                // An out-of-range or non-integral strategy is a warning in
+                // Prometheus, not an error, and it falls back to the default.
+                Some(arg)
+                    if arg.is_finite() && arg.trunc() == arg && (0.0..=2.0).contains(&arg) =>
+                {
+                    arg as i64
+                }
+                _ => 2,
+            };
+            let nan_as_zero = |value: f64| if value.is_nan() { 0.0 } else { value };
+            let mut sum = 0.0;
+            let mut c = 0.0;
+            let mut previous = samples[0].clone();
+            for (i, sample) in samples.iter().enumerate() {
+                let current = nan_as_zero(sample.value);
+                let before = nan_as_zero(previous.value);
+                let (value, c_value) = match strategy {
+                    // Left-point rectangle: the interval takes the older
+                    // sample's value.
+                    0 => (before, 0.0),
+                    // Right-point rectangle: the newer one's.
+                    1 => (current, 0.0),
+                    // Trapezoid: the mean of the two, with a halving *after*
+                    // the sum so finite samples cannot overflow the average.
+                    _ => {
+                        if before == 0.0 && current == 0.0 {
+                            (0.0, 0.0)
+                        } else {
+                            let (value, c_value) = kahan_inc(current, before, 0.0);
+                            if value.is_infinite()
+                                && !current.is_infinite()
+                                && !before.is_infinite()
+                            {
+                                kahan_inc(current / 2.0, before / 2.0, 0.0)
+                            } else {
+                                (value / 2.0, c_value / 2.0)
+                            }
+                        }
+                    }
+                };
+                // The first sample only seeds `previous`; every later one
+                // contributes over the interval behind it.
+                if i > 0 && (value != 0.0 || c_value != 0.0) {
+                    let delta_t = (sample.timestamp - previous.timestamp) as f64 / 1_000.0;
+                    let (new_sum, new_c) = kahan_inc(value * delta_t, sum, c + c_value * delta_t);
+                    sum = new_sum;
+                    c = new_c;
+                }
+                previous = sample.clone();
+            }
+            if sum.is_infinite() {
+                Some(sum)
+            } else {
+                Some(sum + c)
+            }
+        }
     }
+}
+
+/// Prometheus' `kahansum.Inc`: adds `inc` to `sum` with compensation `c`,
+/// Neumaier-style (the smaller term wins the comparison), returning the new
+/// sum and compensation. An infinite intermediate result drops the
+/// compensation, since there is nothing left to compensate for.
+fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
+    let t = sum + inc;
+    let mut c = c;
+    if t.is_infinite() {
+        c = 0.0;
+    } else if sum.abs() >= inc.abs() {
+        c += (sum - t) + inc;
+    } else {
+        c += (inc - t) + sum;
+    }
+    (t, c)
 }
 
 /// Prometheus' `calcTrendValue`: the damped trend, with `i == 0` meaning "the
@@ -4922,6 +5027,73 @@ mod tests {
         };
         assert_eq!(order("sort_by_label(m, \"job\")"), vec!["a", "b"]);
         assert_eq!(order("sort_by_label_desc(m, \"job\")"), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn test_integral() {
+        let samples = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+                .collect()
+        };
+        // A constant 1 sampled every 10 s across a 20 s span integrates to 20,
+        // whichever quadrature rule is used.
+        let flat = samples(&[(0, 1.0), (10_000, 1.0), (20_000, 1.0)]);
+        for strategy in [Some(0.0), Some(1.0), Some(2.0), None] {
+            assert_eq!(
+                apply_range_func(RangeFunc::Integral, &flat, 20_000, strategy, None),
+                Some(20.0),
+                "strategy {strategy:?}"
+            );
+        }
+        // A ramp tells the three rules apart: left point 0*10 + 1*10 = 10,
+        // right point 1*10 + 2*10 = 30, trapezoid (0+1)/2*10 + (1+2)/2*10 = 20.
+        let ramp = samples(&[(0, 0.0), (10_000, 1.0), (20_000, 2.0)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &ramp, 20_000, Some(0.0), None),
+            Some(10.0)
+        );
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &ramp, 20_000, Some(1.0), None),
+            Some(30.0)
+        );
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &ramp, 20_000, Some(2.0), None),
+            Some(20.0)
+        );
+        // NaN is treated as zero, so the neighbouring non-zero values still
+        // contribute: (1+0)/2*10 + (0+3)/2*10 = 20.
+        let with_nan = samples(&[(0, 1.0), (10_000, f64::NAN), (20_000, 3.0)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &with_nan, 20_000, None, None),
+            Some(20.0)
+        );
+        // A lone sample spans no interval, so the answer is 0 (and the series
+        // still appears, unlike `deriv`).
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &samples(&[(0, 5.0)]), 0, None, None),
+            Some(0.0)
+        );
+        // An unusable strategy falls back to the trapezoidal default rather
+        // than failing — Prometheus only warns.
+        for strategy in [Some(3.0), Some(-1.0), Some(1.5), Some(f64::NAN)] {
+            assert_eq!(
+                apply_range_func(RangeFunc::Integral, &ramp, 20_000, strategy, None),
+                Some(20.0),
+                "strategy {strategy:?} should fall back to the trapezoid"
+            );
+        }
+        // And the query form parses without a strategy as well as with one.
+        let series = synthetic("m", &[(0, 1.0), (10_000, 1.0), (20_000, 1.0)]);
+        assert_eq!(
+            eval_synthetic(series.clone(), "m", "integral(m[60s])", 20_000),
+            vec![("{}".to_string(), 20.0)]
+        );
+        assert_eq!(
+            eval_synthetic(series, "m", "integral(m[60s], 0)", 20_000),
+            vec![("{}".to_string(), 20.0)]
+        );
     }
 
     #[test]
