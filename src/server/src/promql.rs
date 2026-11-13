@@ -775,6 +775,18 @@ pub enum RangeFunc {
     PredictLinear,
     /// `deriv(v[range])` — the least-squares slope, in per-second units.
     Deriv,
+    /// `first_over_time(v[range])` — the oldest sample's value.
+    FirstOverTime,
+    /// `ts_of_first_over_time(v[range])` — the oldest sample's timestamp.
+    TsOfFirstOverTime,
+    /// `ts_of_last_over_time(v[range])` — the newest sample's timestamp.
+    TsOfLastOverTime,
+    /// `ts_of_max_over_time(v[range])` — the *last* maximal sample's
+    /// timestamp (Prometheus compares with `>=`).
+    TsOfMaxOverTime,
+    /// `ts_of_min_over_time(v[range])` — the *last* minimal sample's
+    /// timestamp (Prometheus compares with `<=`).
+    TsOfMinOverTime,
 }
 
 impl RangeFunc {
@@ -802,6 +814,11 @@ impl RangeFunc {
             "present_over_time" => RangeFunc::PresentOverTime,
             "mad_over_time" => RangeFunc::MadOverTime,
             "deriv" => RangeFunc::Deriv,
+            "first_over_time" => RangeFunc::FirstOverTime,
+            "ts_of_first_over_time" => RangeFunc::TsOfFirstOverTime,
+            "ts_of_last_over_time" => RangeFunc::TsOfLastOverTime,
+            "ts_of_max_over_time" => RangeFunc::TsOfMaxOverTime,
+            "ts_of_min_over_time" => RangeFunc::TsOfMinOverTime,
             // `predict_linear` takes its range vector first, so it is
             // dispatched by name in `call` rather than through `parse`.
             _ => return None,
@@ -2126,7 +2143,9 @@ impl Parser {
             }
             other => bad(format!(
                 "unknown function {other:?}; supported range functions are rate, irate, \
-                 increase, delta, idelta, deriv, changes, resets and *_over_time, the math \
+                 increase, delta, idelta, deriv, changes, resets, first_over_time, \
+                 ts_of_first_over_time, ts_of_last_over_time, ts_of_max_over_time, \
+                 ts_of_min_over_time and *_over_time, the math \
                  functions abs, ceil, floor, sqrt, exp, ln, log2, log10, sgn, round, \
                  clamp, clamp_min, clamp_max, scalar, timestamp, the trigonometric and \
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
@@ -2711,10 +2730,15 @@ impl<'a> Evaluator<'a> {
             if samples.is_empty() {
                 continue;
             }
-            matrix.0.push(RangeSeries {
-                labels: labels_of(series),
-                samples,
-            });
+            // `__name__` travels with the labels so a range function can decide
+            // whether to keep it (`first_over_time` / `last_over_time` do,
+            // because they act like `offset`). Every other function drops it,
+            // so the choice is made there rather than lost here.
+            let mut labels = labels_of(series);
+            labels
+                .entry("__name__".to_string())
+                .or_insert_with(|| String::from_utf8_lossy(&series.metric_name).into_owned());
+            matrix.0.push(RangeSeries { labels, samples });
         }
         matrix
     }
@@ -3000,7 +3024,12 @@ impl<'a> Evaluator<'a> {
         for series in &matrix.0 {
             if let Some(value) = apply_range_func(func, &series.samples, range_ms, param) {
                 let mut labels = series.labels.clone();
-                labels.remove("__name__");
+                // `first_over_time` and `last_over_time` act like `offset`, so
+                // Prometheus keeps the metric name for them; every other range
+                // function describes a new quantity and drops it.
+                if !matches!(func, RangeFunc::FirstOverTime | RangeFunc::LastOverTime) {
+                    labels.remove("__name__");
+                }
                 vector.push(labels, value);
             }
         }
@@ -3397,6 +3426,23 @@ fn apply_range_func(
             .iter()
             .max_by(|a, b| a.value.total_cmp(&b.value))
             .map(|s| s.timestamp as f64 / 1_000.0),
+        // Prometheus' newest additions, all read off the same ordered sample
+        // slice. `first_over_time` is the oldest value; the `ts_of_*` forms
+        // report seconds, like `timestamp()`.
+        RangeFunc::FirstOverTime => samples.first().map(|s| s.value),
+        RangeFunc::TsOfFirstOverTime => samples.first().map(|s| s.timestamp as f64 / 1_000.0),
+        RangeFunc::TsOfLastOverTime => samples.last().map(|s| s.timestamp as f64 / 1_000.0),
+        // These two use `>=` / `<=`, so the *last* of the equally extreme
+        // samples wins — unlike `max_over_time` / `min_over_time`, which keep
+        // the first. The `|| best.is_nan()` half only matters when the running
+        // extreme is already NaN: Go's `NaN >= x` is false, so a NaN sample
+        // never wins by itself, but the next value after one does.
+        RangeFunc::TsOfMaxOverTime => {
+            timestamp_of_extreme(samples, |current, best| current >= best || best.is_nan())
+        }
+        RangeFunc::TsOfMinOverTime => {
+            timestamp_of_extreme(samples, |current, best| current <= best || best.is_nan())
+        }
         // A series only reaches this arm when it has at least one sample, so
         // the answer is always 1 (Prometheus' `funcPresentOverTime`).
         RangeFunc::PresentOverTime => Some(1.0),
@@ -3685,6 +3731,22 @@ fn set_vectors(
         _ => unreachable!("checked is_set"),
     }
     Ok(out)
+}
+
+/// The timestamp (in seconds) of the sample a `compareOverTime`-style scan
+/// settles on, following Prometheus' loop exactly: start from the first
+/// sample and replace the extreme when the comparison holds.
+fn timestamp_of_extreme(samples: &[SamplePoint], wins: impl Fn(f64, f64) -> bool) -> Option<f64> {
+    let first = samples.first()?;
+    let mut best = first.value;
+    let mut best_ts = first.timestamp;
+    for sample in samples {
+        if wins(sample.value, best) {
+            best = sample.value;
+            best_ts = sample.timestamp;
+        }
+    }
+    Some(best_ts as f64 / 1_000.0)
 }
 
 /// The values of a series' samples, for the aggregation-over-time functions.
@@ -4720,6 +4782,122 @@ mod tests {
         };
         assert_eq!(order("sort_by_label(m, \"job\")"), vec!["a", "b"]);
         assert_eq!(order("sort_by_label_desc(m, \"job\")"), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn test_first_and_ts_of_over_time() {
+        // 10, 20, 30, 30 at 0/10/20/30 s: the duplicated maximum is what
+        // distinguishes `ts_of_max_over_time` (`>=`, last one) from a
+        // `>`-based scan.
+        let series = synthetic(
+            "m",
+            &[(0, 10.0), (10_000, 20.0), (20_000, 30.0), (30_000, 30.0)],
+        );
+        let at = 30_000;
+        let run = |query: &str| eval_synthetic(series.clone(), "m", query, at);
+        // `first_over_time` acts like `offset`, so Prometheus keeps the metric
+        // name for it.
+        assert_eq!(
+            run("first_over_time(m[60s])"),
+            vec![("{__name__=\"m\"}".into(), 10.0)]
+        );
+        assert_eq!(
+            run("ts_of_first_over_time(m[60s])"),
+            vec![("{}".into(), 0.0)]
+        );
+        assert_eq!(
+            run("ts_of_last_over_time(m[60s])"),
+            vec![("{}".into(), 30.0)]
+        );
+        // `>=` keeps the newest of the equal maxima; `<=` the newest minimum.
+        assert_eq!(
+            run("ts_of_max_over_time(m[60s])"),
+            vec![("{}".into(), 30.0)]
+        );
+        assert_eq!(run("ts_of_min_over_time(m[60s])"), vec![("{}".into(), 0.0)]);
+        // A single sample: every timestamp form agrees.
+        let one = synthetic("m", &[(5_000, 7.0)]);
+        for query in [
+            "first_over_time(m[60s])",
+            "ts_of_first_over_time(m[60s])",
+            "ts_of_last_over_time(m[60s])",
+            "ts_of_max_over_time(m[60s])",
+            "ts_of_min_over_time(m[60s])",
+        ] {
+            let got = eval_synthetic(one.clone(), "m", query, 5_000);
+            let (want, labels) = if query.starts_with("first_over") {
+                // It keeps `__name__`, unlike the `ts_of_*` forms.
+                (7.0, "{__name__=\"m\"}")
+            } else {
+                (5.0, "{}")
+            };
+            assert_eq!(got, vec![(labels.to_string(), want)], "{query}");
+        }
+    }
+
+    #[test]
+    fn test_first_and_last_over_time_keep_the_metric_name() {
+        // Prometheus keeps `__name__` for `first_over_time` and
+        // `last_over_time` because they act like `offset`; every other range
+        // function drops it.
+        let series = synthetic("m", &[(0, 1.0), (10_000, 2.0)]);
+        let run =
+            |query: &str| rendered(&eval_series(vec![series.clone()], "m", query, 10_000).vector);
+        // A raw range selector: `__name__` comes from the series' metric name.
+        assert_eq!(
+            run("first_over_time(m[60s])"),
+            vec![("{__name__=\"m\"}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            run("last_over_time(m[60s])"),
+            vec![("{__name__=\"m\"}".to_string(), 2.0)]
+        );
+        // A subquery: the inner instant evaluation already carries it.
+        assert_eq!(
+            run("first_over_time(m[60s:10s])"),
+            vec![("{__name__=\"m\"}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            run("last_over_time(m[60s:10s])"),
+            vec![("{__name__=\"m\"}".to_string(), 2.0)]
+        );
+        // The timestamp forms are derived values, so they still drop it, and
+        // so does every other range function.
+        assert_eq!(
+            run("ts_of_last_over_time(m[60s:10s])"),
+            vec![("{}".to_string(), 10.0)]
+        );
+        assert_eq!(
+            run("count_over_time(m[60s])"),
+            vec![("{}".to_string(), 2.0)]
+        );
+    }
+
+    #[test]
+    fn test_ts_of_max_over_time_handles_nan() {
+        // The predicate is `cur >= best || math.IsNaN(best)`. Go's `NaN >= x`
+        // is always false, so a NaN sample never wins on its own — it only
+        // matters that a NaN *best* makes the next value win. With 10, NaN, 5
+        // the running best stays 10 the whole way, so the answer is its
+        // timestamp.
+        let series = synthetic("m", &[(0, 10.0), (10_000, f64::NAN), (20_000, 5.0)]);
+        assert_eq!(
+            eval_synthetic(series, "m", "ts_of_max_over_time(m[60s])", 20_000),
+            vec![("{}".to_string(), 0.0)]
+        );
+        // Once the best is NaN, the next value replaces it: NaN, 5 → 5's time.
+        let recovered = synthetic("m", &[(0, f64::NAN), (10_000, 5.0)]);
+        assert_eq!(
+            eval_synthetic(recovered, "m", "ts_of_max_over_time(m[60s])", 10_000),
+            vec![("{}".to_string(), 10.0)]
+        );
+        // A lone trailing NaN does not win (`NaN >= best` is false), so the
+        // earlier extreme's timestamp stays.
+        let trailing = synthetic("m", &[(0, 10.0), (10_000, f64::NAN)]);
+        assert_eq!(
+            eval_synthetic(trailing, "m", "ts_of_max_over_time(m[60s])", 10_000),
+            vec![("{}".to_string(), 0.0)]
+        );
     }
 
     #[test]

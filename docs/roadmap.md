@@ -225,6 +225,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     支持 `offset 5m` 与 `@ <ts>` / `@ start()` / `@ end()`；
   - **区间向量** `metric[5m]` 与区间函数：`rate`、`irate`、`increase`、`delta`、
     `idelta`、`changes`、`resets`、`deriv`、`present_over_time`、`mad_over_time`、
+    `first_over_time`、`ts_of_first_over_time`、`ts_of_last_over_time`、
+    `ts_of_max_over_time`、`ts_of_min_over_time`、
     `*_over_time`（`avg/min/max/sum/count/last/stddev/stdvar/quantile`）。
     `rate`/`increase` 按 Prometheus 规则处理计数器回绕（下降视为归零后继续累加），
     单位是「每秒」；`deriv` 是最小二乘斜率（每秒），只有 1 个样本时该序列不出现；
@@ -463,6 +465,27 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   运算的规则丢弃 `__name__`。测试覆盖优先级（`2 + 3 atan2 4` 与
   `2 * 3 atan2 4` 的结合形状）、向量对的 π/4、标量对、以及 `atan2(0,-1)=π` 与
   `atan2(-1,0)=-π/2` 的操作数顺序。
+- 已完成（2026-11-13）：`first_over_time` 与四个 `ts_of_*_over_time`
+  （`ts_of_first_over_time` / `ts_of_last_over_time` / `ts_of_max_over_time` /
+  `ts_of_min_over_time`）。
+  - `first_over_time(v[range])` 返回区间内**最旧**样本的值；
+  - `ts_of_first_over_time` / `ts_of_last_over_time` 返回最旧/最新样本的
+    时间戳（秒，与 `timestamp()` 同形状）；
+  - `ts_of_max_over_time` / `ts_of_min_over_time` 照抄 Prometheus 的
+    `compareOverTime`：比较用 `>=` / `<=`（不是 `max_over_time` 的 `>` / `<`），
+    因此并列极值时取**最后一个**；NaN 的处理也照抄：谓词是
+    `cur >= best || math.IsNaN(best)`，Go 里 `NaN >= x` 恒为假，所以 NaN 样本
+    自己不会成为极值，只有「当前极值已是 NaN」时下一个样本才接管。用
+    `10, NaN, 5`（答案是 `10` 的时间戳）、`NaN, 5`（答案是 `5` 的时间戳）与
+    尾部单个 NaN（极值不变）三种用例钉住；
+  - 标签规则同其他 range 函数：保留除 `__name__` 外的所有标签，空区间时该序列
+    不出现。唯一的例外是 `first_over_time` / `last_over_time` 自己 —— 它们像
+    `offset` 一样只是挑出一个已有样本，Prometheus 因此**保留** `__name__`
+    （`engine.go` 的 `dropName := (e.Func.Name != "last_over_time" &&
+    e.Func.Name != "first_over_time")`）；`ts_of_*` 是派生值，仍然丢弃。
+    这顺带修掉了 `last_over_time` 之前丢指标名的既有偏差，并且让原始区间选择器与
+    子查询两条路径一致（`select_range` 现在把 `__name__` 一并放进
+    `RangeSeries.labels`，由 range 函数决定去留）。
 - 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
