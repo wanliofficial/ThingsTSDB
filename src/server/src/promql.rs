@@ -947,14 +947,11 @@ impl RangeFunc {
     /// but take a required bound: `count_le_over_time(v[range], le)`,
     /// `share_gt_over_time(v[range], gt)` and `sum_*_over_time`.
     fn parse_filter(name: &str) -> Option<RangeFunc> {
-        let (kind, rest) = if let Some(rest) = name.strip_prefix("count_") {
-            (FilterKind::Count, rest)
-        } else if let Some(rest) = name.strip_prefix("share_") {
-            (FilterKind::Share, rest)
-        } else if let Some(rest) = name.strip_prefix("sum_") {
-            (FilterKind::Sum, rest)
-        } else {
-            return None;
+        let (kind, rest) = match name.split_once('_')? {
+            ("count", rest) => (FilterKind::Count, rest),
+            ("share", rest) => (FilterKind::Share, rest),
+            ("sum", rest) => (FilterKind::Sum, rest),
+            _ => return None,
         };
         let op = match rest {
             "eq_over_time" => FilterOp::Eq,
@@ -1475,6 +1472,14 @@ pub enum Expr {
         upper: Box<Expr>,
         expr: Box<Expr>,
     },
+    /// MetricsQL `histogram_share(le, v[, boundsLabel])` — the estimated
+    /// fraction of observations at or below `le`, optionally biased out into
+    /// `lower` / `upper` series under `boundsLabel`.
+    HistogramShare {
+        le: Box<Expr>,
+        bounds: Option<String>,
+        expr: Box<Expr>,
+    },
     /// `histogram_quantiles(v, "label", q1, q2, ...)` — one series per
     /// quantile per classic histogram, with the quantile written into the
     /// given label.
@@ -1575,6 +1580,10 @@ impl Expr {
             Expr::HistogramFraction { lower, upper, expr } => {
                 lower.selectors(out);
                 upper.selectors(out);
+                expr.selectors(out);
+            }
+            Expr::HistogramShare { le, expr, .. } => {
+                le.selectors(out);
                 expr.selectors(out);
             }
             Expr::HistogramQuantiles {
@@ -1723,6 +1732,10 @@ impl Expr {
             Expr::HistogramFraction { lower, upper, expr } => {
                 lower.widen_window(query_start_ms, query_end_ms, start, end);
                 upper.widen_window(query_start_ms, query_end_ms, start, end);
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
+            }
+            Expr::HistogramShare { le, expr, .. } => {
+                le.widen_window(query_start_ms, query_end_ms, start, end);
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
             }
             Expr::HistogramQuantiles {
@@ -2676,6 +2689,25 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            // `histogram_share(le, v)` and its optional third argument: VM's
+            // `boundsLabel`, which turns one answer into a `lower`/`upper`
+            // pair as well.
+            "histogram_share" => {
+                let le = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let expr = self.expression(0)?;
+                let bounds = if self.eat(&Token::Comma) {
+                    Some(self.string_argument(name)?)
+                } else {
+                    None
+                };
+                self.expect(Token::RParen)?;
+                Ok(Expr::HistogramShare {
+                    le: Box::new(le),
+                    bounds,
+                    expr: Box::new(expr),
+                })
+            }
             "histogram_quantiles" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::Comma)?;
@@ -2820,7 +2852,8 @@ impl Parser {
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
-                 sort_by_label_desc, histogram_quantiles, histogram_fraction, histogram_avg, \
+                 sort_by_label_desc, histogram_quantiles, histogram_fraction, histogram_share, \
+                 histogram_avg, \
                  histogram_stddev, histogram_stdvar, max_of, min_of, \
                  the query-context \
                  functions start, end, range, step, and the label functions label_replace, \
@@ -3417,6 +3450,19 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Instant {
                     vector: histogram_fraction(lower, upper, &instant.vector)?,
+                    scalar: None,
+                })
+            }
+            Expr::HistogramShare { le, bounds, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                let le = self.scalar_of(le, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad(
+                        "histogram_share needs an instant vector of `le` buckets, not a scalar",
+                    );
+                }
+                Ok(Instant {
+                    vector: histogram_share(le, bounds.as_deref(), &instant.vector)?,
                     scalar: None,
                 })
             }
@@ -5488,6 +5534,111 @@ fn histogram_fraction(lower: f64, upper: f64, vector: &Vector) -> Result<Vector>
         out.push(labels, bucket_fraction(lower, upper, &mut buckets));
     }
     Ok(out)
+}
+
+/// MetricsQL's `histogram_share(le, v[, boundsLabel])` for classic `le`
+/// buckets.
+///
+/// The answer is the estimated fraction of observations at or below `le`:
+/// bucket counts are made monotonic (`fixBrokenBuckets`), buckets sharing a
+/// bound are merged, and the requested bound is interpolated inside whichever
+/// bucket contains it, relative to the `+Inf` bucket's count.
+///
+/// The special cases are VM's: a NaN bound or an empty histogram answers NaN,
+/// a negative bound 0 and `+Inf` 1; a bound above every bucket is 1 even when
+/// the histogram has no `+Inf` bucket. With a `boundsLabel` every input
+/// histogram yields three series — the share itself and its `lower` / `upper`
+/// interpolants.
+fn histogram_share(le: f64, bounds: Option<&str>, vector: &Vector) -> Result<Vector> {
+    let mut out = Vector::default();
+    for (labels, buckets) in classic_buckets("histogram_share", vector)? {
+        let (share, lower, upper) = bucket_share(le, buckets);
+        if let Some(bounds) = bounds {
+            let mut lower_labels = labels.clone();
+            lower_labels.insert(bounds.to_string(), "lower".to_string());
+            let mut upper_labels = labels.clone();
+            upper_labels.insert(bounds.to_string(), "upper".to_string());
+            out.push(labels, share);
+            out.push(lower_labels, lower);
+            out.push(upper_labels, upper);
+        } else {
+            out.push(labels, share);
+        }
+    }
+    Ok(out)
+}
+
+/// The `(share, lower, upper)` triple VM's `share` closure returns for one
+/// histogram.
+fn bucket_share(le: f64, buckets: Vec<(f64, f64)>) -> (f64, f64, f64) {
+    let nan = (f64::NAN, f64::NAN, f64::NAN);
+    if le.is_nan() || buckets.is_empty() {
+        return nan;
+    }
+    if le < 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    if le == f64::INFINITY {
+        return (1.0, 1.0, 1.0);
+    }
+    let (buckets, values) = fix_broken_buckets(buckets);
+    let last_value = *values.last().expect("buckets is not empty");
+    let mut value_prev = 0.0;
+    let mut le_prev = 0.0;
+    for (bound, value) in buckets.iter().copied().zip(values.iter().copied()) {
+        if le >= bound {
+            value_prev = value;
+            le_prev = bound;
+            continue;
+        }
+        // `le_prev <= le < bound`, so the answer is inside this bucket.
+        let lower = value_prev / last_value;
+        if bound == f64::INFINITY {
+            return (lower, lower, 1.0);
+        }
+        if le_prev == le {
+            return (lower, lower, lower);
+        }
+        let upper = value / last_value;
+        let share = lower + (value - value_prev) / last_value * (le - le_prev) / (bound - le_prev);
+        return (share, lower, upper);
+    }
+    // Past every bucket.
+    (1.0, 1.0, 1.0)
+}
+
+/// VM's `fixBrokenBuckets` + `mergeSameLE`: coalesce equal bounds by summing
+/// their counts, then force the cumulative counts to be non-decreasing,
+/// treating a NaN count as its predecessor's.
+fn fix_broken_buckets(mut buckets: Vec<(f64, f64)>) -> (Vec<f64>, Vec<f64>) {
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut bounds: Vec<f64> = Vec::with_capacity(buckets.len());
+    let mut values: Vec<f64> = Vec::with_capacity(buckets.len());
+    for (bound, count) in buckets {
+        match bounds.last() {
+            Some(last) if *last == bound => {
+                let last_value = values.last_mut().expect("values tracks bounds");
+                *last_value += count;
+            }
+            _ => {
+                bounds.push(bound);
+                values.push(count);
+            }
+        }
+    }
+    let mut previous = values[0];
+    if previous.is_nan() {
+        previous = 0.0;
+        values[0] = previous;
+    }
+    for value in values.iter_mut().skip(1) {
+        if value.is_nan() || previous > *value {
+            *value = previous;
+        } else {
+            previous = *value;
+        }
+    }
+    (bounds, values)
 }
 
 /// MetricsQL's `histogram_avg` / `histogram_stddev` / `histogram_stdvar` for
@@ -8193,6 +8344,161 @@ mod tests {
             0,
         );
         assert_eq!(rendered(&instant.vector), vec![("{}".to_string(), 1.0)]);
+    }
+
+    #[test]
+    fn test_histogram_share_over_classic_buckets() {
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let bucket = |le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("__name__".to_string(), "latency_bucket".to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        let mut vector = Vector::default();
+        // Cumulative 1/2/3/4 observations up to 1/2/4/+Inf.
+        for (le, value) in [("1", 1.0), ("2", 2.0), ("4", 3.0), ("+Inf", 4.0)] {
+            vector.0.push(bucket(le, value));
+        }
+        let share = |le: f64| {
+            let out = histogram_share(le, None, &vector).expect("histogram is complete");
+            assert_eq!(out.0.len(), 1);
+            out.0[0].value
+        };
+        // A bound that is itself a bucket edge answers that bucket's share
+        // (`lePrev == leReq`), so 2 is exactly 2/4.
+        assert!(approx(share(2.0), 0.5));
+        // Inside (2, 4]: 0.5 + (3 - 2)/4 * (3 - 2)/(4 - 2).
+        assert!(approx(share(3.0), 0.625));
+        // Inside (4, +Inf) the interpolation stops at the `+Inf` bucket: the
+        // answer is that bucket's lower edge, 3/4.
+        assert!(approx(share(6.0), 0.75));
+        // Below the first bucket: 0 + 1/4 * 0.5/1.
+        assert!(approx(share(0.5), 0.125));
+        // A bound inside the `+Inf` bucket answers that bucket's lower edge,
+        // never 1: the histogram says nothing about how far into `+Inf` the
+        // observations go.
+        assert!(approx(share(10.0), 0.75));
+        // Without a `+Inf` bucket a bound past the last one is 1 (VM returns
+        // from the loop's tail, which is not the `+Inf` branch).
+        let mut finite = Vector::default();
+        for (le, value) in [("1", 1.0), ("2", 2.0), ("4", 3.0)] {
+            finite.0.push(bucket(le, value));
+        }
+        let out = histogram_share(10.0, None, &finite).unwrap();
+        assert_eq!(out.0[0].value, 1.0);
+        // The special cases VM hard-codes.
+        assert_eq!(share(f64::INFINITY), 1.0);
+        assert_eq!(share(-1.0), 0.0);
+        assert!(share(f64::NAN).is_nan());
+
+        // `fixBrokenBuckets`: a decreasing cumulative count is clamped up, and
+        // a NaN count takes its predecessor's value.
+        let mut broken = Vector::default();
+        for (le, value) in [("1", 1.0), ("2", 3.0), ("4", 2.0), ("+Inf", f64::NAN)] {
+            broken.0.push(bucket(le, value));
+        }
+        let out = histogram_share(3.0, None, &broken).unwrap();
+        // Every count is now 3 at the edges, so any bound inside is 1.
+        assert!(approx(out.0[0].value, 1.0));
+        // Equal bounds are merged by summing their counts: (1, 1), (1, 2),
+        // (2, 3) becomes (1, 3), (2, 3), so the 1 edge already holds all 3.
+        let mut merged = Vector::default();
+        merged.0.push(bucket("1", 1.0));
+        merged.0.push(bucket("1", 2.0));
+        merged.0.push(bucket("2", 3.0));
+        let out = histogram_share(1.0, None, &merged).unwrap();
+        assert!(approx(out.0[0].value, 1.0));
+        let out = histogram_share(1.5, None, &merged).unwrap();
+        assert!(approx(out.0[0].value, 1.0));
+
+        // A `boundsLabel` written into the input labels comes back as three
+        // series: the share itself plus its `lower` and `upper` interpolants.
+        let mut labelled = Vector::default();
+        for (le, value) in [("1", 1.0), ("2", 2.0), ("4", 3.0), ("+Inf", 4.0)] {
+            let mut point = bucket(le, value);
+            point
+                .labels
+                .insert("bounds".to_string(), "original".to_string());
+            labelled.0.push(point);
+        }
+        let out = histogram_share(3.0, Some("bounds"), &labelled).unwrap();
+        assert_eq!(out.0.len(), 3);
+        let by_bounds = |name: &str| {
+            out.0
+                .iter()
+                .find(|point| point.labels.get("bounds") == Some(&name.to_string()))
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .value
+        };
+        // The share keeps the original label value; the two interpolants
+        // overwrite it.
+        assert!(approx(by_bounds("original"), 0.625));
+        assert!(approx(by_bounds("lower"), 0.5));
+        assert!(approx(by_bounds("upper"), 0.75));
+        for point in &out.0 {
+            assert!(!point.labels.contains_key("le"));
+            assert!(!point.labels.contains_key("__name__"));
+        }
+
+        // A histogram with no `le` at all is refused by name.
+        let mut missing = Vector::default();
+        missing.0.push(Point {
+            labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
+            value: 0.0,
+            sample_ts: None,
+        });
+        let error = histogram_share(1.0, None, &missing).unwrap_err();
+        assert!(error.message().contains("`le` label"));
+
+        // End to end: the parser takes two or three arguments, and the answer
+        // drops `__name__` and `le`.
+        let series = || {
+            vec![
+                synthetic_labeled("latency_bucket", &[("le", "0.1")], &[(0, 2.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "0.5")], &[(0, 4.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "1")], &[(0, 6.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "+Inf")], &[(0, 8.0)]),
+            ]
+        };
+        let instant = eval_series(
+            series(),
+            "latency_bucket",
+            "histogram_share(0.5, latency_bucket)",
+            0,
+        );
+        // The 0.5 edge holds half the observations.
+        assert_eq!(rendered(&instant.vector), vec![("{}".to_string(), 0.5)]);
+        let instant = eval_series(
+            series(),
+            "latency_bucket",
+            r#"histogram_share(0.5, latency_bucket, "bound")"#,
+            0,
+        );
+        // Every one of the three series is 0.5 here; only the labels differ.
+        let mut got = rendered(&instant.vector);
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("{bound=\"lower\"}".to_string(), 0.5),
+                ("{bound=\"upper\"}".to_string(), 0.5),
+                ("{}".to_string(), 0.5),
+            ]
+        );
+        // A scalar has no buckets to split.
+        let expr = parse_ok("histogram_share(1, 2)");
+        let fetched = HashMap::new();
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+            step_ms: 0,
+        };
+        let error = evaluator.eval(&expr, 0).unwrap_err();
+        assert!(error.message().contains("not a scalar"));
     }
 
     #[test]

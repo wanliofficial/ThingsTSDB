@@ -243,7 +243,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     days_in_month/hour/minute`，以及 MetricsQL 的序列选择函数
     `drop_common_labels`、`drop_empty_series`、`labels_equal`、
     `label_graphite_group`、`limit_offset`（见下面单独一条）；
-    （`histogram_quantile` / `histogram_quantiles` / `histogram_fraction` 见下面单独几条）
+    （`histogram_quantile` / `histogram_quantiles` / `histogram_fraction` /
+    `histogram_share` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
     count_values`，支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
@@ -415,6 +416,29 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `+Inf` 单桶与全 0 计数都返回 NaN、计数不变的非零直方图只计第一个区间的权重
     （5/5 → 0.05）、两组直方图分组互不影响、缺 `le` 报错并点名，
     以及经求值器端到端丢掉 `__name__`/`le`、标量输入报错。
+- 已完成（2026-11-14）：MetricsQL 的 `histogram_share(le, v[, boundsLabel])`
+  （`transform.go` 的 `transformHistogramShare` / `share` / `fixBrokenBuckets` /
+  `mergeSameLE`）：
+  - 答案是在 `le` 及其以下的观测占比：先把每个桶的累计计数**向上钳平**
+    （`fixBrokenBuckets`——NaN 计数取前一个桶的值，比前一个小的也取前一个），
+    相同边界先合并（计数相加，`mergeSameLE`），再在包含 `le` 的那个桶里按
+    `lower + (v-vPrev)/vLast * (le-lePrev)/(le-lePrev)` 线性插值，
+    其中 `vLast` 是最后一个桶（通常是 `+Inf`）的计数；
+  - 边界语义：`le` 恰好落在桶边界上时（`lePrev == leReq`）直接返回该桶占比；
+    `le` 落在 `+Inf` 桶里返回最后一个有限桶的上界占比（`lower`，`upper` 为 1）；
+    **没有** `+Inf` 桶且 `le` 超过所有桶时才返回 1（VM 的循环尾分支）；
+  - `le` 为 NaN 或没有任何带 `le` 的序列时返回 NaN，负数返回 0，`+Inf` 返回 1；
+  - 第三个参数是 VM 的 `boundsLabel`：给了它，每个直方图产出**三条**序列——占比本身
+    （保留原有的同名标签值）、`boundsLabel="lower"` 与 `boundsLabel="upper"` 两个
+    插值边界。VM 不校验这个标签名（标签是任意字节串），这里同样不校验；
+  - 结果丢弃 `__name__` 与 `le`；缺 `le` 的序列按名字报错，与 `histogram_quantile` /
+    `histogram_fraction` 一致（VM 的 `groupLeTimeseries` 是静默跳过，这里沿用本仓库
+    的报错约定，宁可报错也不静默少一条）；
+  - 测试：1/2/3/4 累计计数下 2→0.5、3→0.625、6→0.75、0.5→0.125、10→0.75 与
+    `+Inf`/负数/NaN 的硬编码分支、无 `+Inf` 桶时超出末桶才为 1；计数递减与 NaN 计数
+    被钳平后为 1；同边界合并后 1 与 1.5 都是 1；`boundsLabel` 产出三条序列且
+    `lower`/`upper` 分别为 0.5/0.75、占比保留原标签值；缺 `le` 报错；经求值器
+    端到端丢名、两参数与三参数两种写法、标量输入报错。
 - 已完成（2026-11-14）：MetricsQL 的阈值 rollup `count_eq|le|gt|ne_over_time` /
   `share_eq|le|gt_over_time` / `sum_eq|le|gt_over_time` 与 `duration_over_time`
   （`app/vmselect/promql/rollup.go` 的 `newRollupFilter` / `newRollupAvgFilter` /
