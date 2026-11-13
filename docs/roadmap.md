@@ -349,6 +349,26 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `ts_of_*` 等价），以及走 actix 路由的端到端用例（`aggr_over_time(avg, ...)`=1.5、
     `predict_linear(..., 3600)`=363、`default(不存在的指标, 7)` 单条无标签 7、
     `absent_over_time(不存在的指标[60s])`=1）。
+- 已完成（2026-11-13）：MetricsQL 标签函数 `label_set` / `label_del` /
+  `label_keep` / `label_copy` / `label_move` / `label_value` / `alias`
+  （按 `app/vmselect/promql/transform.go` 逐条对照）：
+  - `label_set(v, "a", "1", ...)` 按顺序写入 name/value 对，同一标签出现两次时后者
+    生效，**空值删除该标签**；`alias(v, "name")` 就是
+    `label_set(v, "__name__", "name")`（MetricsQL 的 `with` 模板里也是这么重写的）；
+  - `label_del(v, "a", ...)` 删除点名标签；`label_keep(v, "a", ...)` 只留下点名的，
+    `__name__` 在两者里都**只当普通标签**——`label_keep(v, "job")` 会连指标名一起
+    丢掉（VM 的 `RemoveTagsOn` 在 `__name__` 没被保留时 `ResetMetricGroup`）；
+  - `label_copy(v, "src", "dst", ...)` 源标签缺失或为空时**跳过**（不删 dst），
+    `label_move` 复制后再删源，但 src 与 dst 同名时不删；
+  - `label_value(v, "label")` 把每条非 NaN 样本的值换成该标签文本解析出的浮点
+    （解析失败为 NaN），并丢掉 `__name__`；NaN 样本原样保留（VM 把 NaN 当缺口，
+    `label_value(q, "l") default 123` 才有意义）；
+  - 标签名不校验：VM 的标签是任意字节串（`k8s.io/name` 合法），这里同样接受；
+    `label_replace` 的 dst 校验是 Prometheus 侧的规定，两者各自照上游。
+  - 测试：`label_set` 的顺序/空值删除/无参数、`alias` 与 `label_set(__name__)` 等价、
+    `label_del`/`label_keep` 对 `__name__` 的处理、`label_copy` 的缺失源跳过、
+    `label_move` 的同名不删、`label_value` 的数值/非数值/缺标签/NaN 四种情况，
+    以及奇数个字符串参数、非字符串参数、标量输入的报错。
 - 已完成（2026-11-11）：`histogram_quantile(q, v)`（经典直方图的 `le` 桶）。
   Grafana 的延迟面板几乎都写成 `histogram_quantile(0.9, sum by (le) (rate(x_bucket[5m])))`，
   之前这个函数会被当作未知函数拒绝。实现按 Prometheus 的 `BucketQuantile`：

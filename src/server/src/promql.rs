@@ -39,8 +39,10 @@
 //!   (`on` / `ignoring`, `group_left` / `group_right`), and the set operators
 //!   `and` / `or` / `unless`;
 //! * a MetricsQL subset on top of PromQL — `aggr_over_time(<agg>, v[range])`,
-//!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`, and
-//!   `predict_linear(v[range], t)`.
+//!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`,
+//!   `predict_linear(v[range], t)`, the `*_over_time` family, and the label
+//!   helpers `label_set` / `label_del` / `label_keep` / `label_copy` /
+//!   `label_move` / `label_value` / `alias`.
 //!
 //! The parameterised range functions that put the range vector first —
 //! `predict_linear`, `double_exponential_smoothing` and `integral` — are
@@ -77,6 +79,16 @@
 //! (`^(?s:...)$`) and expands `$1` / `${name}` / `$$` exactly like Go's
 //! `ExpandString`; a series whose source value does not match passes through
 //! unchanged, and an empty result deletes the destination label.
+//!
+//! MetricsQL's label helpers follow `transform.go` too: `label_set` applies
+//! its name/value pairs in order and an empty value deletes the label
+//! (`alias` is `label_set` on `__name__`); `label_del` and `label_keep` treat
+//! `__name__` like any other name, so `label_keep(v, "job")` drops the metric
+//! name — VM's `RemoveTagsOn` resets the metric group unless `__name__` is
+//! kept; `label_copy` skips a missing or empty source instead of deleting the
+//! destination, and `label_move` then deletes the source; `label_value`
+//! replaces every non-NaN value with the named label's text parsed as a
+//! float (NaN when it is not a number) and drops the metric name.
 //!
 //! Evaluation asks the engine for each selector's raw samples over the union
 //! window once, then evaluates the expression per step. One scan per selector
@@ -1124,6 +1136,49 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
+/// The MetricsQL label-rewriting functions
+/// (`app/vmselect/promql/transform.go`).
+///
+/// Every variant rewrites the labels of each series and leaves its value and
+/// timestamp alone, except `Value`, which replaces the value with one parsed
+/// from a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelOp {
+    /// `label_set(v, "a", "1", ...)` — name/value pairs; an empty value
+    /// deletes the label. `alias(v, "name")` is the same call with
+    /// `__name__` as the destination (MetricsQL rewrites it that way).
+    Set(Vec<(String, String)>),
+    /// `label_del(v, "a", ...)` — drops the named labels, `__name__`
+    /// included when it is named.
+    Del(Vec<String>),
+    /// `label_keep(v, "a", ...)` — drops everything else, `__name__`
+    /// included unless it is named.
+    Keep(Vec<String>),
+    /// `label_copy(v, "src", "dst", ...)` — copies the source value to the
+    /// destination and leaves the source alone.
+    Copy(Vec<(String, String)>),
+    /// `label_move(v, "src", "dst", ...)` — a copy that then deletes the
+    /// source, unless source and destination are the same label.
+    Move(Vec<(String, String)>),
+    /// `label_value(v, "label")` — replaces each non-NaN value with the
+    /// label's text parsed as a float (NaN when it does not parse) and
+    /// drops `__name__`.
+    Value(String),
+}
+
+impl LabelOp {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LabelOp::Set(_) => "label_set",
+            LabelOp::Del(_) => "label_del",
+            LabelOp::Keep(_) => "label_keep",
+            LabelOp::Copy(_) => "label_copy",
+            LabelOp::Move(_) => "label_move",
+            LabelOp::Value(_) => "label_value",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(f64),
@@ -1207,6 +1262,12 @@ pub enum Expr {
         dst: String,
         separator: String,
         srcs: Vec<String>,
+    },
+    /// MetricsQL's label helpers: `label_set`, `label_del`, `label_keep`,
+    /// `label_copy`, `label_move`, `label_value` and `alias`.
+    LabelOp {
+        op: LabelOp,
+        expr: Box<Expr>,
     },
     Sort {
         dir: SortDir,
@@ -1351,7 +1412,9 @@ impl Expr {
                     expr.selectors(out);
                 }
             }
-            Expr::LabelReplace { expr, .. } | Expr::LabelJoin { expr, .. } => expr.selectors(out),
+            Expr::LabelReplace { expr, .. }
+            | Expr::LabelJoin { expr, .. }
+            | Expr::LabelOp { expr, .. } => expr.selectors(out),
         }
     }
 
@@ -1486,7 +1549,9 @@ impl Expr {
                     expr.widen_window(query_start_ms, query_end_ms, start, end);
                 }
             }
-            Expr::LabelReplace { expr, .. } | Expr::LabelJoin { expr, .. } => {
+            Expr::LabelReplace { expr, .. }
+            | Expr::LabelJoin { expr, .. }
+            | Expr::LabelOp { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
             }
         }
@@ -2080,6 +2145,11 @@ impl Parser {
                     srcs,
                 });
             }
+            // MetricsQL's label helpers rewrite labels per series without
+            // touching the values, so they are per-step instant functions like
+            // `label_replace`.
+            "label_set" | "label_del" | "label_keep" | "label_copy" | "label_move"
+            | "label_value" | "alias" => return self.label_op(name),
             // `aggr_over_time(avg, v[range])` names an aggregation where the
             // other range functions take a vector, so it is dispatched first.
             "aggr_over_time" => {
@@ -2430,10 +2500,82 @@ impl Parser {
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
                  sort_by_label_desc, histogram_quantiles, histogram_fraction, max_of, min_of, \
                  the query-context \
-                 functions start, end, range, step, and the label functions label_replace \
-                 and label_join"
+                 functions start, end, range, step, and the label functions label_replace, \
+                 label_join, label_set, label_del, label_keep, label_copy, label_move, \
+                 label_value and alias"
             )),
         }
+    }
+
+    /// Parses one of MetricsQL's label helpers: `label_set`, `label_del`,
+    /// `label_keep`, `label_copy`, `label_move`, `label_value` and `alias`.
+    ///
+    /// The label names are taken as written: VictoriaMetrics stores tags as
+    /// arbitrary byte strings, so `label_set(v, "foo.bar", "1")` is legal
+    /// there and is accepted here too — unlike `label_replace`, which follows
+    /// Prometheus and validates its destination.
+    fn label_op(&mut self, name: &str) -> Result<Expr> {
+        self.expect(Token::LParen)?;
+        let expr = self.expression(0)?;
+        let op = match name {
+            // MetricsQL rewrites `alias(q, "name")` into
+            // `label_set(q, "__name__", "name")`.
+            "alias" => {
+                self.expect(Token::Comma)?;
+                let value = self.string_argument(name)?;
+                self.expect(Token::RParen)?;
+                LabelOp::Set(vec![("__name__".to_string(), value)])
+            }
+            "label_value" => {
+                self.expect(Token::Comma)?;
+                let label = self.string_argument(name)?;
+                self.expect(Token::RParen)?;
+                LabelOp::Value(label)
+            }
+            "label_del" | "label_keep" => {
+                let labels = self.string_list(name)?;
+                if name == "label_del" {
+                    LabelOp::Del(labels)
+                } else {
+                    LabelOp::Keep(labels)
+                }
+            }
+            // `label_set`, `label_copy` and `label_move` take name/value
+            // pairs; VM rejects an odd number of strings.
+            _ => {
+                let strings = self.string_list(name)?;
+                if strings.len() % 2 != 0 {
+                    return bad(format!(
+                        "the number of string args to {name} must be even; got {}",
+                        strings.len()
+                    ));
+                }
+                let mut pairs = Vec::with_capacity(strings.len() / 2);
+                let mut strings = strings.into_iter();
+                while let (Some(dst), Some(value)) = (strings.next(), strings.next()) {
+                    pairs.push((dst, value));
+                }
+                match name {
+                    "label_set" => LabelOp::Set(pairs),
+                    "label_copy" => LabelOp::Copy(pairs),
+                    _ => LabelOp::Move(pairs),
+                }
+            }
+        };
+        Ok(Expr::LabelOp {
+            op,
+            expr: Box::new(expr),
+        })
+    }
+
+    /// Parses `, "a", "b", ...)` and the closing parenthesis.
+    fn string_list(&mut self, name: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        while self.eat(&Token::Comma) {
+            out.push(self.string_argument(name)?);
+        }
+        self.expect(Token::RParen)?;
+        Ok(out)
     }
 
     /// Parses a quoted string argument, the only form `label_replace` and
@@ -3009,6 +3151,64 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 })
             }
+            Expr::LabelOp { op, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad(format!(
+                        "{} expects an instant vector, got a scalar",
+                        op.name()
+                    ));
+                }
+                let mut vector = Vector::default();
+                for mut point in instant.vector.0 {
+                    match op {
+                        // The pairs are applied in order, so a repeated label
+                        // keeps the last value (VM writes them in sequence
+                        // too).
+                        LabelOp::Set(pairs) => {
+                            for (dst, value) in pairs {
+                                if value.is_empty() {
+                                    point.labels.remove(dst);
+                                } else {
+                                    point.labels.insert(dst.clone(), value.clone());
+                                }
+                            }
+                        }
+                        LabelOp::Del(labels) => {
+                            for label in labels {
+                                point.labels.remove(label);
+                            }
+                        }
+                        // `label_keep` names `__name__` like any other label:
+                        // it survives only when listed (VM's `RemoveTagsOn`
+                        // resets the metric group unless `__name__` is kept).
+                        LabelOp::Keep(labels) => {
+                            point.labels.retain(|name, _| labels.contains(name));
+                        }
+                        LabelOp::Copy(pairs) => label_copy(&mut point.labels, pairs, false),
+                        LabelOp::Move(pairs) => label_copy(&mut point.labels, pairs, true),
+                        LabelOp::Value(label) => {
+                            // VM replaces the value with the label's text and
+                            // drops the metric name; every other label stays.
+                            point.labels.remove("__name__");
+                            let parsed = point
+                                .labels
+                                .get(label)
+                                .and_then(|value| value.parse::<f64>().ok())
+                                .unwrap_or(f64::NAN);
+                            // NaN values are gaps in MetricsQL and stay NaN.
+                            if !point.value.is_nan() {
+                                point.value = parsed;
+                            }
+                        }
+                    }
+                    vector.push_point(&point);
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
+            }
         }
     }
 
@@ -3526,6 +3726,23 @@ impl<'a> Evaluator<'a> {
             vector,
             scalar: None,
         })
+    }
+}
+
+/// `label_copy` / `label_move`: a missing or empty source leaves the
+/// destination untouched (VM skips instead of deleting), and the pairs run in
+/// order, so a later pair sees an earlier pair's result.
+fn label_copy(labels: &mut LabelSet, pairs: &[(String, String)], remove_source: bool) {
+    for (src, dst) in pairs {
+        let Some(value) = labels.get(src).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let value = value.clone();
+        labels.insert(dst.clone(), value);
+        // `label_move(q, "a", "a")` must not delete the label it just wrote.
+        if remove_source && src != dst {
+            labels.remove(src);
+        }
     }
 }
 
@@ -5361,6 +5578,13 @@ mod tests {
             "decreases_over_time(http_requests[5m])",
             "tfirst_over_time(http_requests[5m])",
             "tlast_over_time(http_requests[5m])",
+            r#"label_set(http_requests, "a", "1")"#,
+            r#"label_del(http_requests, "a")"#,
+            r#"label_keep(http_requests, "a")"#,
+            r#"label_copy(http_requests, "a", "b")"#,
+            r#"label_move(http_requests, "a", "b")"#,
+            r#"label_value(http_requests, "a")"#,
+            r#"alias(http_requests, "name")"#,
             "-(a + b)",
             "a and b",
             "a or b",
@@ -7768,6 +7992,169 @@ mod tests {
     }
 
     #[test]
+    fn test_metricsql_label_helpers() {
+        let series = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("instance", "10.0.0.1:9090"), ("job", "api")],
+                &[(0, 1.0)],
+            )
+        };
+        let run = |query: &str| eval_synthetic(series(), "http_requests", query, 0);
+        // `label_set` writes each pair, and an empty value deletes the label.
+        assert_eq!(
+            run(r#"label_set(http_requests, "job", "db", "zone", "eu")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"db\",zone=\"eu\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+        assert_eq!(
+            run(r#"label_set(http_requests, "job", "")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\"}".to_string(),
+                1.0
+            )]
+        );
+        // `__name__` is a label like any other for `label_set`, and `alias` is
+        // the same call spelled the MetricsQL way (its own rewrite rule:
+        // `alias(q, name) = label_set(q, "__name__", name)`).
+        for query in [
+            r#"label_set(http_requests, "__name__", "renamed")"#,
+            r#"alias(http_requests, "renamed")"#,
+        ] {
+            assert_eq!(
+                run(query),
+                vec![(
+                    "{__name__=\"renamed\",instance=\"10.0.0.1:9090\",job=\"api\"}".to_string(),
+                    1.0
+                )],
+                "{query}"
+            );
+        }
+        // Pairs are applied in order, so the last value of a repeated label
+        // wins.
+        assert_eq!(
+            run(r#"label_set(http_requests, "job", "db", "job", "cache")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"cache\"}".to_string(),
+                1.0
+            )]
+        );
+        // A pair-less call is legal and changes nothing.
+        assert_eq!(
+            run("label_set(http_requests)"),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // VM keeps tags as arbitrary byte strings, so a name that Prometheus
+        // would reject is accepted here (`label_replace` validates because
+        // Prometheus does; these functions have no such rule upstream).
+        assert_eq!(
+            run(r#"label_set(http_requests, "k8s.io/name", "x")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"api\",\
+                 k8s.io/name=\"x\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+        // `label_del` drops the named labels and keeps `__name__` unless it is
+        // named.
+        assert_eq!(
+            run(r#"label_del(http_requests, "instance")"#),
+            vec![("{__name__=\"http_requests\",job=\"api\"}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            run(r#"label_del(http_requests, "__name__")"#),
+            vec![("{instance=\"10.0.0.1:9090\",job=\"api\"}".to_string(), 1.0)]
+        );
+        // `label_keep` drops everything not named, `__name__` included —
+        // VM's `RemoveTagsOn` resets the metric group unless `__name__` is
+        // kept. Keeping nothing leaves an empty label set.
+        assert_eq!(
+            run(r#"label_keep(http_requests, "job")"#),
+            vec![("{job=\"api\"}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            run(r#"label_keep(http_requests, "job", "__name__")"#),
+            vec![("{__name__=\"http_requests\",job=\"api\"}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            run("label_keep(http_requests)"),
+            vec![("{}".to_string(), 1.0)]
+        );
+        // `label_copy` keeps the source and leaves the destination alone when
+        // the source is missing (VM skips rather than deleting).
+        assert_eq!(
+            run(r#"label_copy(http_requests, "job", "team")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"api\",\
+                 team=\"api\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+        assert_eq!(
+            run(r#"label_copy(http_requests, "zone", "job")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // `label_move` deletes the source afterwards; the same source and
+        // destination is a no-op instead of a deletion.
+        assert_eq!(
+            run(r#"label_move(http_requests, "job", "team")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",team=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        assert_eq!(
+            run(r#"label_move(http_requests, "job", "job")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // `label_value` drops `__name__`, keeps the other labels, and replaces
+        // the value with the named label's text.
+        let numeric = || {
+            synthetic_labeled(
+                "http_requests",
+                &[("job", "api"), ("port", "9090")],
+                &[(0, 7.0)],
+            )
+        };
+        assert_eq!(
+            eval_synthetic(
+                numeric(),
+                "http_requests",
+                r#"label_value(http_requests, "port")"#,
+                0
+            ),
+            vec![("{job=\"api\",port=\"9090\"}".to_string(), 9090.0)]
+        );
+        // A label that is not a number, or does not exist, makes the value
+        // NaN — and VM leaves NaN samples alone, so they stay NaN rather than
+        // taking the parsed value.
+        let value_of = |series: SeriesSamples, query: &str| -> f64 {
+            eval_series(vec![series], "http_requests", query, 0)
+                .vector
+                .0[0]
+                .value
+        };
+        assert!(value_of(numeric(), r#"label_value(http_requests, "job")"#).is_nan());
+        assert!(value_of(numeric(), r#"label_value(http_requests, "zone")"#).is_nan());
+        let gappy = synthetic_labeled("http_requests", &[("port", "9090")], &[(0, f64::NAN)]);
+        assert!(value_of(gappy, r#"label_value(http_requests, "port")"#).is_nan());
+    }
+
+    #[test]
     fn test_label_functions_parse_errors() {
         // The regex is compiled at parse time, so a bad pattern names the
         // function that carried it.
@@ -7784,6 +8171,14 @@ mod tests {
         assert!(parse_err(r#"label_replace(m, 5, "", "b", ".*")"#).contains("quoted string"));
         assert!(parse_err(r#"label_join(m, "a", "-")"#).contains("at least one source label"));
         assert!(parse_err(r#"label_replace(m, "a", "$1", "b")"#).contains("expected Comma"));
+        // The MetricsQL helpers reject an odd number of name/value strings,
+        // and a non-string where a string belongs (VM's `getStringPairs`).
+        assert!(parse_err(r#"label_set(m, "a")"#).contains("number of string args to label_set"));
+        assert!(parse_err(r#"label_move(m, "a", "b", "c")"#)
+            .contains("number of string args to label_move"));
+        assert!(parse_err(r#"label_del(m, 5)"#).contains("quoted string"));
+        assert!(parse_err(r#"label_value(m, 5)"#).contains("quoted string"));
+        assert!(parse_err(r#"alias(m)"#).contains("expected Comma"));
         // A scalar has no labels to rewrite; this is an evaluation error, not
         // a parse error, so the shape still parses.
         let expr = parse_ok(r#"label_replace(1, "a", "", "b", ".*")"#);
@@ -7796,5 +8191,14 @@ mod tests {
         };
         let error = evaluator.eval(&expr, 0).unwrap_err();
         assert!(error.message().contains("instant vector, got a scalar"));
+        let expr = parse_ok(r#"label_set(1, "a", "b")"#);
+        let error = evaluator.eval(&expr, 0).unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("label_set expects an instant vector, got a scalar"),
+            "{}",
+            error.message()
+        );
     }
 }
