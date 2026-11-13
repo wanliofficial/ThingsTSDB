@@ -238,7 +238,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `time()`、`pi()`，查询上下文标量 `start()`/`end()`/`range()`/`step()`、
     `max_of`/`min_of`，日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`；
-    （`histogram_quantile` / `histogram_fraction` 见下面单独两条）
+    （`histogram_quantile` / `histogram_quantiles` / `histogram_fraction` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
     count_values`，支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
@@ -563,9 +563,46 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     「instant vector, got scalar」。
   - 测试：区间查询下四个值（100/160/60/15）、算术与 `max_of` 组合、即时查询下
     `step()`/`range()` 为 0、`start()[5m:1m]` 报错，并加入支持表达式清单。
+- 已完成（2026-11-13）：`histogram_quantiles(v, "label", q1, q2, ...)`（经典 `le` 桶）。
+  照抄 `funcHistogramQuantiles` 的经典直方图分支：对每个分位数、每个直方图各输出
+  一条序列，值是该分位数的 `BucketQuantile`（与 `histogram_quantile` 完全同一份
+  实现），并把分位数用 `labels.FormatOpenMetricsFloat` 写进给定标签。
+  - `FormatOpenMetricsFloat` 是 Go 的 `strconv.FormatFloat(f, 'g', -1, 64)`（最短往返、
+    十进制指数落在 `[-4, 6)` 时用定点、否则 `d.dddde±dd`）再补一条「结果里既没有
+    `.` 也没有 `e` 就追加 `.0`」；`1`/`0`/`-1`/`NaN`/`±Inf` 走硬编码分支，且 `-0`
+    因为 Go 用 `f == 0` 比较也返回 `"0.0"`。`{:e}` 在 Rust 里给出与 Go 相同的
+    最短数字与指数，所以只需按 Go 的规则摆放小数点。
+  - 分位数标签是 `labels.Builder.Set` 语义：分组里已有同名标签时**覆盖**；
+    标签名按本仓库既有约定校验（`count_values`/`label_replace` 同样在解析期校验）。
+  - 参数个数照 Prometheus 的 `ArgTypes`/`Variadic` 折算：至少 1 个、最多 10 个
+    分位数（`na = 4-1 = 3`，`na + Variadic(9) = 12` 个参数）。
+  - 越界分位数（`q<0`/`q>1`/NaN）**不是错误**：Prometheus 只发 warning，照样输出
+    一条 `-Inf`/`+Inf`/`NaN` 的序列，这里同样输出（没有 annotation 通道，warning
+    略去）。
+  - 测试：`format_open_metrics_float` 按 Go 实测值逐条对照（`1.0`/`0.0`/`-0`/`NaN`/
+    `±Inf`、常见分位数、`100000.0`、`123456.0`、`1e+06`、`1.234567e+06`、`1e-05`、
+    `1e-07`、`1e+21`）；`histogram_quantiles` 对 2/4/6/8 桶给出中位数 0.5、q=0.9
+    落到最后一个有限桶上界 1、`q=1` 为 1.0；越界与 NaN 分位数照样各出一条
+    `-Inf`/`+Inf`/`NaN`，标签是**请求的分位数**（`"-0.5"`/`"1.5"`/`"NaN"`）而不是
+    结果值；同名标签被覆盖；经求值器
+    端到端丢弃 `__name__`；缺 `le`、标量输入、零个分位数、11 个分位数、非法标签名
+    各自报错。
 
 
-- 已完成（部分，2026-11-10）：新增 `metric_query_bench` 度量部署态 `DualRead`
+- 剩余未实现的 Prometheus 函数（**明确不做**，理由记在这里）：
+  - `histogram_avg` / `histogram_count` / `histogram_sum` / `histogram_stddev` /
+    `histogram_stdvar`：上游走 `simpleHistogramFunc`，只处理 `el.H != nil` 的
+    native histogram，经典 `le` 桶的浮点样本被**静默丢弃**（结果是空向量，而不是
+    从 `_count`/`_sum` 推算）。本服务的样本类型只有 `f64`，没有 native histogram
+    表示，照抄只会得到恒空的函数；
+  - `info(v, ...)`：读取 `target_info` 一类元数据序列并与目标序列做标签连接，
+    需要引擎侧的元数据视角，本服务没有；
+  - `start_timestamp(v)`：依赖 `EvalNodeHelper.StartTimestamps`（由
+    `use-start-timestamps` 特性填充的每序列起始时间），本服务没有这条数据通路。
+  这三类缺的是**存储/引擎能力**而不是函数实现，硬写只会给出看似成功、实则空或
+  伪造的结果。
+
+
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
   全表扫描改为缓存（新序列写入时失效），窄选择器（eq instance，1 序列）p50
   12.0 ms / p99 25 ms，宽选择器（18 万序列）p50 1.4–1.9 s、正则选择器 207 ms。

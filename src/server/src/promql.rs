@@ -28,9 +28,10 @@
 //! * instant functions — math (`abs`, `ceil`, `clamp`, `clamp_min`, ...),
 //!   `scalar`, the date functions (`year`, `month`, `day_of_month`, ...),
 //!   `timestamp`, `sort`, `sort_desc`, `absent`, `histogram_quantile`,
-//!   `histogram_fraction`, `max_of` / `min_of`, `label_replace` / `label_join`,
-//!   the query-context scalars `start()`, `end()`, `range()`, `step()`, and the
-//!   generators `time`, `pi`, `vector`, plus MetricsQL's `default`;
+//!   `histogram_fraction`, `histogram_quantiles`, `max_of` / `min_of`,
+//!   `label_replace` / `label_join`, the query-context scalars `start()`,
+//!   `end()`, `range()`, `step()`, and the generators `time`, `pi`, `vector`,
+//!   plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, `quantile`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
@@ -1185,6 +1186,14 @@ pub enum Expr {
         upper: Box<Expr>,
         expr: Box<Expr>,
     },
+    /// `histogram_quantiles(v, "label", q1, q2, ...)` — one series per
+    /// quantile per classic histogram, with the quantile written into the
+    /// given label.
+    HistogramQuantiles {
+        expr: Box<Expr>,
+        label: String,
+        quantiles: Vec<Expr>,
+    },
     /// `max_of(a, b)` / `min_of(a, b)` — two scalars, one scalar result
     /// (Prometheus' duration-expression helpers, also usable on plain
     /// numbers).
@@ -1272,6 +1281,14 @@ impl Expr {
                 lower.selectors(out);
                 upper.selectors(out);
                 expr.selectors(out);
+            }
+            Expr::HistogramQuantiles {
+                expr, quantiles, ..
+            } => {
+                expr.selectors(out);
+                for quantile in quantiles {
+                    quantile.selectors(out);
+                }
             }
             Expr::Extremum { lhs, rhs, .. } => {
                 lhs.selectors(out);
@@ -1399,6 +1416,14 @@ impl Expr {
                 lower.widen_window(query_start_ms, query_end_ms, start, end);
                 upper.widen_window(query_start_ms, query_end_ms, start, end);
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
+            }
+            Expr::HistogramQuantiles {
+                expr, quantiles, ..
+            } => {
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
+                for quantile in quantiles {
+                    quantile.widen_window(query_start_ms, query_end_ms, start, end);
+                }
             }
             Expr::Extremum { lhs, rhs, .. } => {
                 lhs.widen_window(query_start_ms, query_end_ms, start, end);
@@ -2218,6 +2243,36 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            "histogram_quantiles" => {
+                let expr = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let label = self.string_argument(name)?;
+                validate_label_name(&label, name)?;
+                let mut quantiles = Vec::new();
+                while self.eat(&Token::Comma) {
+                    quantiles.push(self.expression(0)?);
+                }
+                self.expect(Token::RParen)?;
+                // Prometheus takes `vector, string` plus at least one variadic
+                // scalar and allows nine more (`ArgTypes` has four entries,
+                // `Variadic` is 9), so one to ten quantiles.
+                if quantiles.is_empty() {
+                    return bad(
+                        "histogram_quantiles needs at least one quantile after the label name",
+                    );
+                }
+                if quantiles.len() > 10 {
+                    return bad(format!(
+                        "histogram_quantiles takes at most ten quantiles, got {}",
+                        quantiles.len()
+                    ));
+                }
+                Ok(Expr::HistogramQuantiles {
+                    expr: Box::new(expr),
+                    label,
+                    quantiles,
+                })
+            }
             "clamp" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::Comma)?;
@@ -2318,7 +2373,8 @@ impl Parser {
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
-                 sort_by_label_desc, histogram_fraction, max_of, min_of, the query-context \
+                 sort_by_label_desc, histogram_quantiles, histogram_fraction, max_of, min_of, \
+                 the query-context \
                  functions start, end, range, step, and the label functions label_replace \
                  and label_join"
             )),
@@ -2760,6 +2816,27 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Instant {
                     vector: histogram_fraction(lower, upper, &instant.vector)?,
+                    scalar: None,
+                })
+            }
+            Expr::HistogramQuantiles {
+                expr,
+                label,
+                quantiles,
+            } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad(
+                        "histogram_quantiles needs an instant vector of `le` buckets, \
+                         not a scalar",
+                    );
+                }
+                let mut values = Vec::with_capacity(quantiles.len());
+                for quantile in quantiles {
+                    values.push(self.scalar_of(quantile, at_ms)?);
+                }
+                Ok(Instant {
+                    vector: histogram_quantiles(&values, label, &instant.vector)?,
                     scalar: None,
                 })
             }
@@ -3551,6 +3628,95 @@ fn format_float_g(value: f64) -> String {
     format!("{value}")
 }
 
+/// `labels.FormatOpenMetricsFloat`: Go's shortest `%g` formatting, with `".0"`
+/// appended when the result would otherwise contain neither a `'.'` nor an
+/// `'e'`.
+///
+/// Used for the quantile label of `histogram_quantiles`, where Prometheus
+/// writes the quantile through this exact function, so `0.5` becomes `"0.5"`
+/// and `1` becomes `"1.0"`.
+fn format_open_metrics_float(value: f64) -> String {
+    // Go compares before looking at the sign, so `-0` is `"0.0"` too.
+    if value == 1.0 {
+        return "1.0".to_string();
+    }
+    if value == 0.0 {
+        return "0.0".to_string();
+    }
+    if value == -1.0 {
+        return "-1.0".to_string();
+    }
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-Inf".to_string()
+        } else {
+            "+Inf".to_string()
+        };
+    }
+    let mut out = go_format_g(value);
+    // Go looks for `e` and `.` only — never `E` — because `'g'` is lowercase.
+    if !out.contains(['e', '.']) {
+        out.push_str(".0");
+    }
+    out
+}
+
+/// Go's `strconv.FormatFloat(value, 'g', -1, 64)`: the shortest decimal that
+/// round-trips, written in fixed-point notation while the decimal exponent
+/// stays in `[-4, 6)` and in `d.dddde±dd` form outside it.
+///
+/// Rust's `{:e}` gives the same shortest digits and the same exponent as Go's
+/// `%g` does, so the formatting is only a matter of putting the point where Go
+/// puts it.
+fn go_format_g(value: f64) -> String {
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` always writes an exponent");
+    let exponent: i32 = exponent.parse().expect("`{:e}` writes an integer");
+    let negative = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if !(-4..6).contains(&exponent) {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exponent < 0 { '-' } else { '+' });
+        let magnitude = exponent.unsigned_abs();
+        if magnitude < 10 {
+            out.push('0');
+        }
+        out.push_str(&magnitude.to_string());
+        return out;
+    }
+    // `point` is how many digits sit before the decimal point; it can be zero
+    // or negative, which is what the two padding branches handle.
+    let point = exponent + 1;
+    if point <= 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-point) as usize));
+        out.push_str(&digits);
+    } else if point as usize >= digits.len() {
+        out.push_str(&digits);
+        out.push_str(&"0".repeat(point as usize - digits.len()));
+    } else {
+        let (whole, fraction) = digits.split_at(point as usize);
+        out.push_str(whole);
+        out.push('.');
+        out.push_str(fraction);
+    }
+    out
+}
+
 fn apply_range_func(
     func: RangeFunc,
     samples: &[SamplePoint],
@@ -4131,6 +4297,31 @@ fn histogram_quantile(quantile: f64, vector: &Vector) -> Result<Vector> {
     let mut out = Vector::default();
     for (labels, mut buckets) in classic_buckets("histogram_quantile", vector)? {
         out.push(labels, bucket_quantile(quantile, &mut buckets));
+    }
+    Ok(out)
+}
+
+/// `histogram_quantiles(v, "label", q1, q2, ...)` for classic `le` buckets.
+///
+/// One series per quantile per histogram, with the quantile rendered by
+/// `format_open_metrics_float` into `label`. `__name__` is dropped and the
+/// bucket groups are the same ones `histogram_quantile` uses; a quantile
+/// outside `[0, 1]` still produces a series (Prometheus only warns), whose
+/// value is `-Inf`, `+Inf` or `NaN`.
+fn histogram_quantiles(quantiles: &[f64], label: &str, vector: &Vector) -> Result<Vector> {
+    let groups = classic_buckets("histogram_quantiles", vector)?;
+    let mut out = Vector::default();
+    for quantile in quantiles {
+        let name = format_open_metrics_float(*quantile);
+        for (labels, buckets) in &groups {
+            // Each quantile gets its own copy of the buckets so
+            // `BucketQuantile` can sort and coalesce in place; Prometheus
+            // reuses the slice and relies on those steps being idempotent.
+            let mut buckets = buckets.clone();
+            let mut labels = labels.clone();
+            labels.insert(label.to_string(), name.clone());
+            out.push(labels, bucket_quantile(*quantile, &mut buckets));
+        }
     }
     Ok(out)
 }
@@ -4955,6 +5146,7 @@ mod tests {
             r#"rate(http_requests{job="api"}[5m] offset 1h)"#,
             "sort_desc(http_requests)",
             "histogram_quantile(0.9, http_latency_bucket)",
+            "histogram_quantiles(http_latency_bucket, \"quantile\", 0.5, 0.9)",
             "histogram_quantile(0.5, sum by (le) (rate(http_latency_bucket[5m])))",
             "absent(http_requests)",
             "vector(1)",
@@ -6469,6 +6661,148 @@ mod tests {
         assert!(approx(bucket_quantile(0.5, &mut duplicate), 0.5));
         let mut decreasing = vec![(0.1, 5.0), (0.5, 3.0), (f64::INFINITY, 5.0)];
         assert!(approx(bucket_quantile(0.5, &mut decreasing), 0.05));
+    }
+
+    #[test]
+    fn test_format_open_metrics_float() {
+        // Ground truth from Go's `labels.FormatOpenMetricsFloat`.
+        assert_eq!(format_open_metrics_float(1.0), "1.0");
+        assert_eq!(format_open_metrics_float(0.0), "0.0");
+        // `-0` compares equal to `0`, so Go answers "0.0" for it too.
+        assert_eq!(format_open_metrics_float(-0.0), "0.0");
+        assert_eq!(format_open_metrics_float(-1.0), "-1.0");
+        assert_eq!(format_open_metrics_float(f64::NAN), "NaN");
+        assert_eq!(format_open_metrics_float(f64::INFINITY), "+Inf");
+        assert_eq!(format_open_metrics_float(f64::NEG_INFINITY), "-Inf");
+        // The usual quantiles are plain shortest decimals.
+        for (value, want) in [
+            (0.5, "0.5"),
+            (0.9, "0.9"),
+            (0.99, "0.99"),
+            (0.999, "0.999"),
+            (1.5, "1.5"),
+            (-0.5, "-0.5"),
+            (0.0001, "0.0001"),
+        ] {
+            assert_eq!(format_open_metrics_float(value), want);
+        }
+        // Go switches to exponent form at a decimal exponent of 6 and below
+        // -4; inside that window the number is written out in full and gets a
+        // trailing ".0" when it would otherwise have no point.
+        assert_eq!(format_open_metrics_float(100_000.0), "100000.0");
+        assert_eq!(format_open_metrics_float(123_456.0), "123456.0");
+        assert_eq!(format_open_metrics_float(1e6), "1e+06");
+        assert_eq!(format_open_metrics_float(1_234_567.0), "1.234567e+06");
+        assert_eq!(format_open_metrics_float(1e-5), "1e-05");
+        assert_eq!(format_open_metrics_float(1e-7), "1e-07");
+        assert_eq!(format_open_metrics_float(1e21), "1e+21");
+        assert_eq!(
+            format_open_metrics_float(1.2345678901234569e23),
+            "1.2345678901234569e+23"
+        );
+    }
+
+    #[test]
+    fn test_histogram_quantiles_emits_one_series_per_quantile() {
+        let bucket = |le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("__name__".to_string(), "latency_bucket".to_string()),
+                ("job".to_string(), "api".to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        let mut vector = Vector::default();
+        // 2/4/6/8 observations up to 0.1/0.5/1/+Inf.
+        for (le, value) in [("0.1", 2.0), ("0.5", 4.0), ("1", 6.0), ("+Inf", 8.0)] {
+            vector.0.push(bucket(le, value));
+        }
+        let out = histogram_quantiles(&[0.5, 0.9], "quantile", &vector)
+            .expect("the histogram is complete");
+        let rendered_out = rendered(&out);
+        assert_eq!(rendered_out.len(), 2);
+        // The median sits exactly on the upper bound of the bucket holding
+        // rank 4; the 90th percentile falls past every finite bucket, so
+        // Prometheus answers the last finite bound.
+        assert_eq!(
+            rendered_out,
+            vec![
+                ("{job=\"api\",quantile=\"0.5\"}".to_string(), 0.5),
+                ("{job=\"api\",quantile=\"0.9\"}".to_string(), 1.0),
+            ]
+        );
+        // An out-of-range quantile is not an error: Prometheus only warns and
+        // still emits the series. The label holds the *requested* quantile
+        // (`-0.5`, `1.5`), not the value it produces.
+        let extremes = histogram_quantiles(&[-0.5, 1.5, f64::NAN], "q", &vector).unwrap();
+        let values: Vec<(String, f64)> = rendered(&extremes);
+        assert_eq!(
+            values.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            vec![
+                "{job=\"api\",q=\"-0.5\"}",
+                "{job=\"api\",q=\"1.5\"}",
+                "{job=\"api\",q=\"NaN\"}",
+            ]
+        );
+        assert_eq!(values[0].1, f64::NEG_INFINITY);
+        assert_eq!(values[1].1, f64::INFINITY);
+        assert!(values[2].1.is_nan());
+        // The quantile label is written with `labels.Builder.Set`, so a label
+        // that already exists is overwritten.
+        let overwritten = histogram_quantiles(&[0.5], "job", &vector).unwrap();
+        assert_eq!(
+            rendered(&overwritten),
+            vec![("{job=\"0.5\"}".to_string(), 0.5)]
+        );
+        // End to end through the evaluator: `__name__` is dropped and one
+        // series comes out per quantile.
+        let series = vec![
+            synthetic_labeled("latency_bucket", &[("le", "0.1")], &[(0, 2.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "0.5")], &[(0, 4.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "1")], &[(0, 6.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "+Inf")], &[(0, 8.0)]),
+        ];
+        let instant = eval_series(
+            series,
+            "latency_bucket",
+            "histogram_quantiles(latency_bucket, \"quantile\", 0.5, 1)",
+            0,
+        );
+        assert_eq!(
+            rendered(&instant.vector),
+            vec![
+                ("{quantile=\"0.5\"}".to_string(), 0.5),
+                ("{quantile=\"1.0\"}".to_string(), 1.0),
+            ]
+        );
+        // Bad arguments: no quantile, too many quantiles, an invalid label
+        // name, and a scalar input.
+        assert!(parse_err("histogram_quantiles(latency_bucket, \"q\")")
+            .contains("at least one quantile"));
+        let too_many = format!(
+            "histogram_quantiles(latency_bucket, \"q\", {})",
+            "0.5, ".repeat(10) + "0.5"
+        );
+        assert!(parse_err(&too_many).contains("at most ten quantiles"));
+        assert!(
+            parse_err("histogram_quantiles(latency_bucket, \"q x\", 0.5)")
+                .contains("invalid label name")
+        );
+        let error = eval_err(
+            synthetic("latency_bucket", &[(0, 1.0)]),
+            "latency_bucket",
+            "histogram_quantiles(latency_bucket, \"q\", 0.5)",
+            0,
+        );
+        assert!(error.contains("needs a `le` label"));
+        let error = eval_err(
+            synthetic("m", &[(0, 1.0)]),
+            "m",
+            "histogram_quantiles(1, \"q\", 0.5)",
+            0,
+        );
+        assert!(error.contains("not a scalar"));
     }
 
     #[test]
