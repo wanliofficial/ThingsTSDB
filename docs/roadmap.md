@@ -442,6 +442,25 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     被钳平后为 1；同边界合并后 1 与 1.5 都是 1；`boundsLabel` 产出三条序列且
     `lower`/`upper` 分别为 0.5/0.75、占比保留原标签值；缺 `le` 报错；经求值器
     端到端丢名、两参数与三参数两种写法、标量输入报错。
+- 已完成（2026-11-14）：MetricsQL 的 `buckets_limit(limit, v)`
+  （`transform.go` 的 `transformBucketsLimit`），把一条直方图的经典 `le` 桶
+  thinning 到每幅最多 `limit` 个：
+  - 分组按 VM 的做法取「除 `le` 外的全部标签」（`__name__` 也参与分组），所以
+    多幅直方图互不影响；桶数已不超过 `limit` 时原样保留全部桶；
+  - 否则把桶按 `le` 升序排，每个桶的 `hits` 取累计计数相对上一桶的增量
+    （第一个桶相对 0），先把两端**连续空桶**（`|hits| < 1e-9`）在仍超过 `limit`
+    时丢弃，再把相邻两桶中 `hits` 之和最小的一对合并到上界成员里，直到只剩
+    `limit` 个；首尾桶始终保留，合并后的桶沿用上界桶的 `le`、计数把下界桶的
+    累计值并入；
+  - `limit` 先按 Go 的 `float→int`（`floatToIntBounded`）取整，`<= 0` 报错，
+    `< 3` 抬到 3（VM 保留首尾桶的考量）、`> 3` 原样保留（不封顶）；缺 `le` 或
+    `le` 不可解析的序列被跳过；`limit` 必须是数值样本值，字符串字面量在解析期被
+    拒绝（VM 只在 `scalar()` 里特判字符串）；
+  - 测试：桶数不超限时全保留（`limit=10` 对 8 个桶）；超限时按最小 hits 合并到
+    `limit` 个且首末桶保留（8 桶 → `le` 1/64/+Inf，计数 1/7/8）；两端空桶被裁掉
+    （6 桶 → `le` 2/4/8）；`limit` 抬到 3、`<= 0` 报错；字符串字面量解析期报错；
+    缺 `le` 的序列被跳过、不产出；经求值器端到端保留 `__name__` 与原始 `le` 文本、
+    标量输入报错。
 - 已完成（2026-11-14）：MetricsQL 的阈值 rollup `count_eq|le|gt|ne_over_time` /
   `share_eq|le|gt_over_time` / `sum_eq|le|gt_over_time` 与 `duration_over_time`
   （`app/vmselect/promql/rollup.go` 的 `newRollupFilter` / `newRollupAvgFilter` /

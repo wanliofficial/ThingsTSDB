@@ -28,10 +28,10 @@
 //! * instant functions — math (`abs`, `ceil`, `clamp`, `clamp_min`, ...),
 //!   `scalar`, the date functions (`year`, `month`, `day_of_month`, ...),
 //!   `timestamp`, `sort`, `sort_desc`, `absent`, `histogram_quantile`,
-//!   `histogram_fraction`, `histogram_quantiles`, `max_of` / `min_of`,
-//!   `label_replace` / `label_join`, the query-context scalars `start()`,
-//!   `end()`, `range()`, `step()`, and the generators `time`, `pi`, `vector`,
-//!   plus MetricsQL's `default`;
+//!   `histogram_fraction`, `histogram_quantiles`, `buckets_limit`, `max_of` /
+//!   `min_of`, `label_replace` / `label_join`, the query-context scalars
+//!   `start()`, `end()`, `range()`, `step()`, and the generators `time`, `pi`,
+//!   `vector`, plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, `quantile`, plus MetricsQL's `any`, `sum2`,
 //!   `geomean`, `distinct`, `median`, `mode`, `mad`, `share`, `zscore`,
@@ -1586,6 +1586,13 @@ pub enum Expr {
         label: String,
         quantiles: Vec<Expr>,
     },
+    /// MetricsQL `buckets_limit(limit, v)` — thins a histogram's classic `le`
+    /// buckets down to at most `limit` per histogram, merging away the least
+    /// significant buckets. `limit` is a scalar, `v` a vector of `le` buckets.
+    BucketsLimit {
+        limit: Box<Expr>,
+        expr: Box<Expr>,
+    },
     /// MetricsQL's `histogram_avg` / `histogram_stddev` / `histogram_stdvar`
     /// over classic `le` buckets.
     HistogramStat {
@@ -1708,6 +1715,10 @@ impl Expr {
             }
             Expr::HistogramStat { expr, .. } => expr.selectors(out),
             Expr::Histogram { expr, .. } => expr.selectors(out),
+            Expr::BucketsLimit { limit, expr } => {
+                limit.selectors(out);
+                expr.selectors(out);
+            }
             Expr::Quantiles {
                 expr, quantiles, ..
             } => {
@@ -1875,6 +1886,10 @@ impl Expr {
             }
             Expr::Histogram { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
+            }
+            Expr::BucketsLimit { limit, expr } => {
+                limit.widen_window(query_start_ms, query_end_ms, start, end);
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
             }
             Expr::Quantiles {
                 expr, quantiles, ..
@@ -2914,6 +2929,21 @@ impl Parser {
                     quantiles,
                 })
             }
+            // `buckets_limit(limit, v)`: VM's `transformBucketsLimit`. `limit`
+            // is a scalar, `v` a vector of classic `le` buckets. Unlike
+            // `scalar()`, VM does not parse a string literal here: it reads the
+            // argument's sample value, a string evaluates to NaN, and the
+            // `limit <= 0` check rejects it.
+            "buckets_limit" => {
+                let limit = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let expr = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::BucketsLimit {
+                    limit: Box::new(limit),
+                    expr: Box::new(expr),
+                })
+            }
             "clamp" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::Comma)?;
@@ -3107,9 +3137,8 @@ impl Parser {
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
                  sort_by_label_desc, sort_by_label_numeric and sort_by_label_numeric_desc, \
                  histogram_quantiles, histogram_fraction, histogram_share, \
-                 histogram_avg, \
-                 histogram_stddev, histogram_stdvar, histogram, max_of, min_of, union, \
-                 the query-context \
+                 histogram_avg, histogram_stddev, histogram_stdvar, histogram, \
+                 buckets_limit, max_of, min_of, union, the query-context \
                  functions start, end, range, step, and the label functions label_replace, \
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
                  label_value, label_map, label_uppercase, label_lowercase, label_transform, \
@@ -3825,6 +3854,18 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Instant {
                     vector: histogram_quantiles(&values, label, &instant.vector)?,
+                    scalar: None,
+                })
+            }
+            Expr::BucketsLimit { limit, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("buckets_limit needs an instant vector of `le` buckets, \
+                         not a scalar");
+                }
+                let limit = self.scalar_of(limit, at_ms)?;
+                Ok(Instant {
+                    vector: buckets_limit(limit, &instant.vector)?,
                     scalar: None,
                 })
             }
@@ -6228,6 +6269,119 @@ fn histogram_quantiles(quantiles: &[f64], label: &str, vector: &Vector) -> Resul
             let mut labels = labels.clone();
             labels.insert(label.to_string(), name.clone());
             out.push(labels, bucket_quantile(*quantile, &mut buckets));
+        }
+    }
+    Ok(out)
+}
+
+/// One histogram's `le` buckets, keyed by the label set that groups them: the
+/// upper bound (`le` parsed to a float) and the original point.
+type BucketGroups<'a> = BTreeMap<Vec<(String, String)>, Vec<(f64, &'a Point)>>;
+
+/// MetricsQL's `buckets_limit(limit, v)` — thin a histogram's classic `le`
+/// buckets down to at most `limit` per histogram.
+///
+/// The buckets of one histogram are grouped by every label except `le` (VM's
+/// `transformBucketsLimit` groups on the whole metric name minus `le`, so
+/// `__name__` and the other labels all take part). When a histogram already has
+/// `limit` buckets or fewer they are all kept; otherwise the buckets are sorted
+/// by `le`, each bucket's `hits` is the increase of the cumulative counter over
+/// the previous bucket (the first over 0), buckets that are empty at the two
+/// ends are dropped while the count still exceeds `limit`, and then the
+/// adjacent pair with the smallest combined hits is merged into its upper
+/// member until only `limit` remain. The first and last bucket are always kept
+/// so the merged histogram still spans the original range.
+///
+/// A `limit` of three or fewer is raised to three, and a non-positive limit is
+/// an error, exactly as VM rejects it before doing any work. The surviving
+/// buckets are emitted with their original labels (`le` included) and their
+/// original cumulative count; only the bucket *selection* changes, since a
+/// merged-away bucket's observations are already inside the next bucket's
+/// cumulative counter.
+fn buckets_limit(limit_raw: f64, vector: &Vector) -> Result<Vector> {
+    let limit = float_to_int_bounded(limit_raw);
+    if limit <= 0 {
+        return bad(format!("limit must be greater than 0; got {limit_raw}"));
+    }
+    // A limit below three is raised to three (VM preserves the first and last
+    // buckets for min/max accuracy); a larger limit is kept as is.
+    let limit = limit.max(3) as usize;
+
+    // Group by all labels except `le`, keeping each bucket's full label set so
+    // the survivors can be emitted unchanged. VM's `__name__` is just another
+    // label here and takes part in the grouping.
+    let mut groups: BucketGroups<'_> = BTreeMap::new();
+    for point in &vector.0 {
+        let Some(raw) = point.labels.get("le") else {
+            continue;
+        };
+        let Ok(upper) = raw.trim().parse::<f64>() else {
+            continue;
+        };
+        if upper.is_nan() {
+            continue;
+        }
+        let key: Vec<(String, String)> = point
+            .labels
+            .iter()
+            .filter(|(name, _)| name.as_str() != "le")
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        groups.entry(key).or_default().push((upper, point));
+    }
+
+    let mut out = Vector::default();
+    for (_, mut group) in groups {
+        if group.len() <= limit {
+            for (_, point) in group {
+                out.push(point.labels.clone(), point.value);
+            }
+            continue;
+        }
+        group.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Per-bucket hits: the increase of the cumulative counter over the
+        // previous bucket, with the first bucket measured against 0.
+        let mut hits: Vec<f64> = Vec::with_capacity(group.len());
+        let mut prev = 0.0;
+        for &(_, point) in &group {
+            hits.push(point.value - prev);
+            prev = point.value;
+        }
+        // Drop empty buckets at both ends while the count still exceeds the
+        // limit, so the trimmed histogram keeps accurate min and max.
+        let epsilon = 1e-9;
+        let is_empty = |h: f64| !h.is_nan() && h.abs() < epsilon;
+        let mut l = 0usize;
+        let mut r = group.len() - 1;
+        while r - l + 1 > limit && is_empty(hits[r]) {
+            r -= 1;
+        }
+        while r - l + 1 > limit && is_empty(hits[l]) {
+            l += 1;
+        }
+        group = group[l..=r].to_vec();
+        hits = hits[l..=r].to_vec();
+        // Merge the adjacent pair with the smallest combined hits into its
+        // upper member until only `limit` buckets remain. The merged pairs are
+        // (1,2), (2,3), ..., (n-2, n-1) — the last bucket is never the lower
+        // half of a merge, so it always survives as the histogram's top.
+        while group.len() > limit {
+            let mut min_idx = 1;
+            let mut min_merge = hits[1] + hits[2];
+            let last = group.len() - 2;
+            for i in 1..last {
+                let merge = hits[i] + hits[i + 1];
+                if merge < min_merge {
+                    min_idx = i;
+                    min_merge = merge;
+                }
+            }
+            hits[min_idx + 1] += hits[min_idx];
+            group.remove(min_idx);
+            hits.remove(min_idx);
+        }
+        for (_, point) in group {
+            out.push(point.labels.clone(), point.value);
         }
     }
     Ok(out)
@@ -10207,6 +10361,202 @@ mod tests {
         };
         let error = evaluator.eval(&expr, 0).unwrap_err();
         assert!(error.message().contains("not a scalar"));
+    }
+
+    #[test]
+    fn test_buckets_limit_thins_classic_buckets() {
+        let bucket = |le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("__name__".to_string(), "latency_bucket".to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        let uniform = || {
+            let mut vector = Vector::default();
+            for (le, value) in [
+                ("1", 1.0),
+                ("2", 2.0),
+                ("4", 3.0),
+                ("8", 4.0),
+                ("16", 5.0),
+                ("32", 6.0),
+                ("64", 7.0),
+                ("+Inf", 8.0),
+            ] {
+                vector.0.push(bucket(le, value));
+            }
+            vector
+        };
+        let les = |out: &Vector| {
+            let mut les: Vec<(f64, f64)> = out
+                .0
+                .iter()
+                .map(|point| {
+                    let le = point.labels.get("le").expect("survivor keeps `le`");
+                    (le.trim().parse::<f64>().unwrap(), point.value)
+                })
+                .collect();
+            les.sort_by(|a, b| a.0.total_cmp(&b.0));
+            les
+        };
+        // Eight buckets with a uniform count of one each, thinned to three:
+        // VM keeps the first and last and merges the two cheapest interior
+        // pairs, giving le 1 / 64 / +Inf with cumulative counts 1 / 7 / 8.
+        let out = buckets_limit(3.0, &uniform()).unwrap();
+        assert_eq!(
+            les(&out),
+            vec![(1.0, 1.0), (64.0, 7.0), (f64::INFINITY, 8.0)]
+        );
+        // A limit that already covers the count keeps every bucket untouched.
+        let out = buckets_limit(10.0, &uniform()).unwrap();
+        assert_eq!(out.0.len(), 8);
+        // A limit below three is raised to three, so `2` behaves like `3`.
+        let raised = buckets_limit(2.0, &uniform()).unwrap();
+        assert_eq!(les(&raised), les(&out_3(&uniform())));
+        // Empty buckets at the two ends are dropped while the count still
+        // exceeds the limit: 0/0 at the low end and 0/0 at the high end go,
+        // leaving the three buckets that actually hold observations.
+        let mut empty_ends = Vector::default();
+        for (le, value) in [
+            ("1", 0.0),
+            ("2", 0.0),
+            ("4", 5.0),
+            ("8", 10.0),
+            ("16", 10.0),
+            ("32", 10.0),
+        ] {
+            empty_ends.0.push(bucket(le, value));
+        }
+        let out = buckets_limit(3.0, &empty_ends).unwrap();
+        assert_eq!(les(&out), vec![(2.0, 0.0), (4.0, 5.0), (8.0, 10.0)]);
+        // A non-positive limit is rejected.
+        assert!(buckets_limit(0.0, &uniform()).is_err());
+        assert!(buckets_limit(-1.0, &uniform()).is_err());
+        // A series without a parseable `le` is skipped rather than grouped.
+        let mut no_le = uniform();
+        no_le.0.push(Point {
+            labels: BTreeMap::from([("__name__".to_string(), "stray".to_string())]),
+            value: 1.0,
+            sample_ts: None,
+        });
+        let out = buckets_limit(3.0, &no_le).unwrap();
+        assert_eq!(out.0.len(), 3);
+    }
+
+    fn out_3(v: &Vector) -> Vector {
+        buckets_limit(3.0, v).expect("thinning succeeds")
+    }
+
+    #[test]
+    fn test_buckets_limit_groups_per_histogram() {
+        let bucket = |job: &str, le: &str, value: f64| Point {
+            labels: BTreeMap::from([
+                ("__name__".to_string(), "latency_bucket".to_string()),
+                ("job".to_string(), job.to_string()),
+                ("le".to_string(), le.to_string()),
+            ]),
+            value,
+            sample_ts: None,
+        };
+        // Two histograms, eight uniform buckets each; `buckets_limit(3, ...)`
+        // thins each to its own 1 / 64 / +Inf without mixing the jobs.
+        let mut vector = Vector::default();
+        for job in ["api", "db"] {
+            for (le, value) in [
+                ("1", 1.0),
+                ("2", 2.0),
+                ("4", 3.0),
+                ("8", 4.0),
+                ("16", 5.0),
+                ("32", 6.0),
+                ("64", 7.0),
+                ("+Inf", 8.0),
+            ] {
+                vector.0.push(bucket(job, le, value));
+            }
+        }
+        let out = buckets_limit(3.0, &vector).unwrap();
+        assert_eq!(out.0.len(), 6);
+        for job in ["api", "db"] {
+            let mut survivor: Vec<(f64, f64)> = out
+                .0
+                .iter()
+                .filter(|point| point.labels.get("job") == Some(&job.to_string()))
+                .map(|point| {
+                    (
+                        point
+                            .labels
+                            .get("le")
+                            .unwrap()
+                            .trim()
+                            .parse::<f64>()
+                            .unwrap(),
+                        point.value,
+                    )
+                })
+                .collect();
+            survivor.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(
+                survivor,
+                vec![(1.0, 1.0), (64.0, 7.0), (f64::INFINITY, 8.0)]
+            );
+        }
+    }
+
+    #[test]
+    fn test_buckets_limit_end_to_end() {
+        // End to end: `buckets_limit(3, latency_bucket)` thins the eight
+        // uniform buckets to three and keeps the `le` label and value on each
+        // survivor, dropping `__name__` like the other derived histograms.
+        let series = || {
+            vec![
+                synthetic_labeled("latency_bucket", &[("le", "1")], &[(0, 1.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "2")], &[(0, 2.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "4")], &[(0, 3.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "8")], &[(0, 4.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "16")], &[(0, 5.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "32")], &[(0, 6.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "64")], &[(0, 7.0)]),
+                synthetic_labeled("latency_bucket", &[("le", "+Inf")], &[(0, 8.0)]),
+            ]
+        };
+        let instant = eval_series(
+            series(),
+            "latency_bucket",
+            "buckets_limit(3, latency_bucket)",
+            0,
+        );
+        // The three survivors keep their `le` bound (rendered as a label) and
+        // cumulative count. Unlike the other classic-bucket transforms,
+        // buckets_limit groups on the whole label set minus `le`, so `__name__`
+        // survives too and `le` keeps its original text.
+        let mut got = rendered(&instant.vector);
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("{__name__=\"latency_bucket\",le=\"+Inf\"}".to_string(), 8.0),
+                ("{__name__=\"latency_bucket\",le=\"1\"}".to_string(), 1.0),
+                ("{__name__=\"latency_bucket\",le=\"64\"}".to_string(), 7.0),
+            ]
+        );
+        // A larger limit keeps every bucket: `10` dwarfs the eight on offer.
+        let instant = eval_series(
+            series(),
+            "latency_bucket",
+            "buckets_limit(10, latency_bucket)",
+            0,
+        );
+        assert_eq!(instant.vector.0.len(), 8);
+        // VM parses the limit as a sample value, not a MetricsQL string, so a
+        // string literal is not a valid numeric argument here — the parser
+        // rejects it (only `scalar()` special-cases strings).
+        assert!(parse_err(r#"buckets_limit("3", latency_bucket)"#).contains("string"));
+        // A scalar argument is not a bucket vector and is refused.
+        let error = eval_err(synthetic("m", &[(0, 1.0)]), "m", "buckets_limit(3, 3)", 0);
+        assert!(error.contains("not a scalar"));
     }
 
     #[test]
