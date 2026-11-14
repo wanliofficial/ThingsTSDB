@@ -234,7 +234,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp/clamp_min/
     clamp_max/timestamp/scalar`，三角函数与双曲函数
     `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/deg/rad`，
-    以及 `sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`、`absent`、`vector()`、
+    以及 `sort`、`sort_desc`、`sort_by_label`、`sort_by_label_desc`、
+    `sort_by_label_numeric`、`sort_by_label_numeric_desc`、`absent`、`vector()`、
     `time()`、`pi()`，查询上下文标量 `start()`/`end()`/`range()`/`step()`、
     `max_of`/`min_of`，MetricsQL 的 `*_over_time` 家族（`range_over_time`、
     `median_over_time`、`sum2_over_time`、`geomean_over_time`、`distinct_over_time`、
@@ -242,7 +243,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `tfirst_over_time`、`tlast_over_time`），日期函数 `year/month/day_of_month/day_of_week/day_of_year/
     days_in_month/hour/minute`，以及 MetricsQL 的序列选择函数
     `drop_common_labels`、`drop_empty_series`、`labels_equal`、
-    `label_graphite_group`、`limit_offset`（见下面单独一条）；
+    `label_graphite_group`、`limit_offset`、`union`（见下面单独一条）；
     （`histogram_quantile` / `histogram_quantiles` / `histogram_fraction` /
     `histogram_share` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
@@ -499,6 +500,27 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   每个 step 独立求值，没有「上一步/下一步的值」这条数据通路；按 step 硬做会在
   range 查询里给出与 VM 不同的曲线（`keep_last_value` 会退化成恒等），所以宁可
   报未知函数。要做需要把求值器改成 VM 那样一次产出整段序列，留作后续条目。
+- 已完成（2026-11-14）：MetricsQL 的 `sort_by_label_numeric(v, "label", ...)` /
+  `sort_by_label_numeric_desc` 与 `union(v1, v2, ...)`（同属
+  `app/vmselect/promql/transform.go`，`newTransformFuncNumericSort` /
+  `numericLess` / `transformUnion`）：
+  - 数值排序用 VM 的 `numericLess`：把两个字符串按位置切成「数字前缀」与
+    「非数字前缀」交替比较——数字前缀是可选正负号加至多一个小数点的数字
+    （`.5` / `1.` / `+1.5` 都算），按 `ParseFloat` 后的数值比；非数字前缀按字节比；
+    某一侧当前位置没有数字前缀时它更小（所以 `"a" < "1a"`）。`1.10` 与 `1.5`
+    是 1.1 与 1.5，因此 `1.10 < 1.5`；
+  - 与 `sort_by_label` 不同，它**没有平局打破**：第一个不同的标签上
+    `numericLess` 两个方向都为假（如 `"1"` 与 `"01"`）即视为相等，稳定排序保持
+    输入顺序；
+  - 标签名不校验（VM 的标签是任意字节串，`a.b` 合法），但至少要求一个；
+  - `union(v1, v2, ...)` 按顺序拼接各参数的序列，按**完整标签集**去重、先出现的
+    保留（VM 以 `marshalMetricNameSorted` 的结果作键）；全标量参数
+    （`union(1, 2)`）返回各自的无名序列而不是并成一条，标量与向量混用时标量算
+    一条无标签序列再一起参与去重；零参数在解析期报 `at least one argument`；
+  - 测试：`node1/node2/node10` 的正序与倒序、`1a < 02 < a`、`1.10 < 1.5`、
+    `"1"`/`"01"` 保持输入顺序、`a.b` 这类标签名可解析、缺标签名与裸标识符报错；
+    `union` 跨选择器的去重与先出现者胜、`union(1, 2)` 的两条无名序列、
+    `union(1, m)` 的单条无标签标量序列，以及 `union()` / `union(m,)` 的报错。
 - 已完成（2026-11-11）：`histogram_quantile(q, v)`（经典直方图的 `le` 桶）。
   Grafana 的延迟面板几乎都写成 `histogram_quantile(0.9, sum by (le) (rate(x_bucket[5m])))`，
   之前这个函数会被当作未知函数拒绝。实现按 Prometheus 的 `BucketQuantile`：

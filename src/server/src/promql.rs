@@ -1453,6 +1453,16 @@ pub enum Expr {
         labels: Vec<String>,
         expr: Box<Expr>,
     },
+    /// MetricsQL `sort_by_label_numeric(v, "a", ...)` — VM's `numericLess`
+    /// comparison on the named labels, with no tiebreak (the sort is stable).
+    SortByLabelNumeric {
+        desc: bool,
+        labels: Vec<String>,
+        expr: Box<Expr>,
+    },
+    /// MetricsQL `union(v1, v2, ...)` — concatenates the arguments' series and
+    /// keeps the first occurrence of every label set.
+    Union(Vec<Expr>),
     Absent(Box<Expr>),
     /// `vector(scalar)` lifts a scalar into a one-sample vector.
     Vector(Box<Expr>),
@@ -1611,8 +1621,9 @@ impl Expr {
             | Expr::DropEmptySeries(expr)
             | Expr::LabelsEqual { expr, .. }
             | Expr::LabelGraphiteGroup { expr, .. }
+            | Expr::SortByLabelNumeric { expr, .. }
             | Expr::LimitOffset { expr, .. } => expr.selectors(out),
-            Expr::DropCommonLabels(exprs) => {
+            Expr::DropCommonLabels(exprs) | Expr::Union(exprs) => {
                 for expr in exprs {
                     expr.selectors(out);
                 }
@@ -1763,10 +1774,11 @@ impl Expr {
             | Expr::LabelOp { expr, .. }
             | Expr::LabelFilter { expr, .. }
             | Expr::DropEmptySeries(expr)
-            | Expr::LabelsEqual { expr, .. } => {
+            | Expr::LabelsEqual { expr, .. }
+            | Expr::SortByLabelNumeric { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
             }
-            Expr::DropCommonLabels(exprs) => {
+            Expr::DropCommonLabels(exprs) | Expr::Union(exprs) => {
                 for expr in exprs {
                     expr.widen_window(query_start_ms, query_end_ms, start, end);
                 }
@@ -2796,6 +2808,42 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            // VM's numeric variant does not validate the label names: they are
+            // only looked up with `GetTagValue`, which accepts any byte string.
+            "sort_by_label_numeric" | "sort_by_label_numeric_desc" => {
+                let expr = self.expression(0)?;
+                let mut labels = Vec::new();
+                while self.eat(&Token::Comma) {
+                    labels.push(self.string_argument(name)?);
+                }
+                self.expect(Token::RParen)?;
+                if labels.is_empty() {
+                    return bad(format!("{name} needs at least one label name"));
+                }
+                Ok(Expr::SortByLabelNumeric {
+                    desc: name == "sort_by_label_numeric_desc",
+                    labels,
+                    expr: Box::new(expr),
+                })
+            }
+            // `union(v1, v2, ...)` — VM's identity for a list of vectors, with
+            // the first occurrence of each label set winning.
+            "union" => {
+                let mut exprs = Vec::new();
+                if !self.eat(&Token::RParen) {
+                    loop {
+                        exprs.push(self.expression(0)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                }
+                if exprs.is_empty() {
+                    return bad("union needs at least one argument");
+                }
+                Ok(Expr::Union(exprs))
+            }
             "absent" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
@@ -2852,9 +2900,10 @@ impl Parser {
                  hyperbolic functions sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, \
                  asinh, acosh, atanh, deg, rad, the date functions day_of_month, day_of_week, \
                  day_of_year, days_in_month, hour, minute, month, year, sort_by_label and \
-                 sort_by_label_desc, histogram_quantiles, histogram_fraction, histogram_share, \
+                 sort_by_label_desc, sort_by_label_numeric and sort_by_label_numeric_desc, \
+                 histogram_quantiles, histogram_fraction, histogram_share, \
                  histogram_avg, \
-                 histogram_stddev, histogram_stdvar, max_of, min_of, \
+                 histogram_stddev, histogram_stdvar, max_of, min_of, union, \
                  the query-context \
                  functions start, end, range, step, and the label functions label_replace, \
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
@@ -3385,6 +3434,72 @@ impl<'a> Evaluator<'a> {
                     }
                 });
                 Ok(instant)
+            }
+            Expr::SortByLabelNumeric { desc, labels, expr } => {
+                let mut instant = self.eval(expr, at_ms)?;
+                // VM's comparator only ever decides on the first differing
+                // label and has no tiebreak; `sort_by` is stable, so equal
+                // elements keep their input order.
+                instant.vector.0.sort_by(|a, b| {
+                    let (left, right) = if *desc { (b, a) } else { (a, b) };
+                    numeric_sort_order(&left.labels, &right.labels, labels)
+                });
+                Ok(instant)
+            }
+            Expr::Union(exprs) => {
+                let mut points = Vec::new();
+                let mut scalars = Vec::new();
+                let mut all_scalar = true;
+                for expr in exprs {
+                    let instant = self.eval(expr, at_ms)?;
+                    match instant.scalar {
+                        Some(value) => scalars.push(value),
+                        None => {
+                            all_scalar = false;
+                            points.extend(instant.vector.0);
+                        }
+                    }
+                }
+                if all_scalar {
+                    // VM returns every scalar as its own unnamed series, which
+                    // an instant `union(1, 2)` relies on. The dedupe step below
+                    // must not collapse them.
+                    let mut vector = Vector::default();
+                    for value in scalars {
+                        vector.push(BTreeMap::new(), value);
+                    }
+                    return Ok(Instant {
+                        vector,
+                        scalar: None,
+                    });
+                }
+                // A scalar mixed with vectors is one unnamed series, as VM
+                // treats it, and then the dedupe runs over everything.
+                for value in scalars {
+                    points.push(Point {
+                        labels: BTreeMap::new(),
+                        value,
+                        sample_ts: None,
+                    });
+                }
+                let mut seen: HashSet<MatchKey> = HashSet::new();
+                let mut vector = Vector::default();
+                for point in points {
+                    // VM keys on the marshalled metric name (group plus sorted
+                    // tags), which is exactly this label map.
+                    let key: MatchKey = point
+                        .labels
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect();
+                    if seen.insert(key) {
+                        vector.push_point(&point);
+                    }
+                }
+                Ok(Instant {
+                    vector,
+                    scalar: None,
+                })
             }
             Expr::Absent(expr) => {
                 let instant = self.eval(expr, at_ms)?;
@@ -5872,6 +5987,126 @@ fn bucket_fraction(lower: f64, upper: f64, buckets: &mut [(f64, f64)]) -> f64 {
     (upper_rank - lower_rank) / observations
 }
 
+/// Orders two label sets for VM's `sort_by_label_numeric`.
+///
+/// VM's comparator (`newTransformFuncNumericSort`) walks the requested labels
+/// and returns `numericLess` on the first pair that differs — with no tiebreak
+/// at all, unlike `sort_by_label`. Once `numericLess` is false in both
+/// directions (it is not a total order: "1" and "01" precede neither way) the
+/// two series are considered equal and the stable sort keeps their input
+/// order.
+fn numeric_sort_order(a: &LabelSet, b: &LabelSet, labels: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for label in labels {
+        let left = a.get(label).map(String::as_str).unwrap_or("");
+        let right = b.get(label).map(String::as_str).unwrap_or("");
+        if left == right {
+            continue;
+        }
+        if numeric_less(left, right) {
+            return Ordering::Less;
+        }
+        if numeric_less(right, left) {
+            return Ordering::Greater;
+        }
+        return Ordering::Equal;
+    }
+    Ordering::Equal
+}
+
+/// VM's `numericLess`: walk both strings, comparing numeric runs as numbers
+/// and everything else as bytes.
+///
+/// A run is a number when `getNumPrefix` accepts it, i.e. an optional sign
+/// followed by digits with at most one dot (`.5`, `1.`, `+1.5`). A string with
+/// no number at the current position compares as "less" than one that has one,
+/// which is why `"a"` precedes `"1a"`.
+fn numeric_less(a: &str, b: &str) -> bool {
+    let mut a = a;
+    let mut b = b;
+    loop {
+        if b.is_empty() {
+            return false;
+        }
+        if a.is_empty() {
+            return true;
+        }
+        let a_prefix = num_prefix(a);
+        let b_prefix = num_prefix(b);
+        a = &a[a_prefix.len()..];
+        b = &b[b_prefix.len()..];
+        if !a_prefix.is_empty() || !b_prefix.is_empty() {
+            if a_prefix.is_empty() {
+                return false;
+            }
+            if b_prefix.is_empty() {
+                return true;
+            }
+            let a_num = must_parse_num(a_prefix);
+            let b_num = must_parse_num(b_prefix);
+            if a_num != b_num {
+                return a_num < b_num;
+            }
+        }
+        let a_prefix = non_num_prefix(a);
+        let b_prefix = non_num_prefix(b);
+        a = &a[a_prefix.len()..];
+        b = &b[b_prefix.len()..];
+        if a_prefix != b_prefix {
+            return a_prefix.as_bytes() < b_prefix.as_bytes();
+        }
+    }
+}
+
+/// VM's `getNumPrefix`: the leading numeric run of `s`, or `""` when it does
+/// not start with one. Note `.` alone, `-` alone and `..` are all rejected.
+fn num_prefix(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if let Some(first) = bytes.first() {
+        if *first == b'-' || *first == b'+' {
+            i += 1;
+        }
+    }
+    let mut has_num = false;
+    let mut has_dot = false;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            if !has_dot && bytes[i] == b'.' {
+                has_dot = true;
+                i += 1;
+                continue;
+            }
+            if !has_num {
+                return "";
+            }
+            return &s[..i];
+        }
+        has_num = true;
+        i += 1;
+    }
+    if !has_num {
+        return "";
+    }
+    s
+}
+
+/// VM's `getNonNumPrefix`: everything up to the first ASCII digit.
+fn non_num_prefix(s: &str) -> &str {
+    match s.bytes().position(|byte| byte.is_ascii_digit()) {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+/// VM's `mustParseNum`: `strconv.ParseFloat`, where an out-of-range value is
+/// `±Inf` (which Rust's parser also returns). A syntax error would be a bug in
+/// `num_prefix` — VM panics there — so NaN is the defensive answer instead of a
+/// panic inside the query path.
+fn must_parse_num(s: &str) -> f64 {
+    s.parse::<f64>().unwrap_or(f64::NAN)
+}
+
 /// Orders two label sets for `sort_by_label` / `sort_by_label_desc`.
 ///
 /// Follows Prometheus' `funcSortByLabel`: walk the requested labels in order,
@@ -6942,6 +7177,180 @@ mod tests {
         };
         assert_eq!(order("sort_by_label(m, \"job\")"), vec!["a", "b"]);
         assert_eq!(order("sort_by_label_desc(m, \"job\")"), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn test_sort_by_label_numeric_orders_numerically() {
+        let series = vec![
+            synthetic_labeled("m", &[("instance", "node10")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("instance", "node2")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("instance", "node1")], &[(0, 3.0)]),
+        ];
+        let order = |query: &str| -> Vec<String> {
+            eval_series(series.clone(), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.labels["instance"].clone())
+                .collect()
+        };
+        // Numeric runs compare as numbers, so node10 sorts after node2 — the
+        // same answer as the natural sort here, but reached by a different
+        // rule (byte prefixes decide the rest).
+        assert_eq!(
+            order("sort_by_label_numeric(m, \"instance\")"),
+            vec!["node1", "node2", "node10"]
+        );
+        assert_eq!(
+            order("sort_by_label_numeric_desc(m, \"instance\")"),
+            vec!["node10", "node2", "node1"]
+        );
+        // Numbers sort before a non-numeric run at the same position, so "a"
+        // precedes "1a" from the other direction: "1a" < "a".
+        let mixed = vec![
+            synthetic_labeled("m", &[("v", "a")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("v", "1a")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("v", "02")], &[(0, 3.0)]),
+        ];
+        let values = |query: &str| -> Vec<String> {
+            eval_series(mixed.clone(), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.labels["v"].clone())
+                .collect()
+        };
+        // 1a (number 1), 02 (number 2), a (no number).
+        assert_eq!(
+            values("sort_by_label_numeric(m, \"v\")"),
+            vec!["1a", "02", "a"]
+        );
+        // "1" and "01" are numerically equal and `numericLess` says neither
+        // precedes the other, so the stable sort keeps the input order — the
+        // one place `sort_by_label` would have broken the tie with the full
+        // labelset.
+        let ties = vec![
+            synthetic_labeled("m", &[("v", "1"), ("id", "first")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("v", "01"), ("id", "second")], &[(0, 2.0)]),
+        ];
+        let ids = eval_series(ties, "m", "sort_by_label_numeric(m, \"v\")", 0)
+            .vector
+            .0
+            .iter()
+            .map(|point| point.labels["id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["first", "second"]);
+        // A fractional run is still one number: 1.10 (i.e. 1.1) before 1.5.
+        let decimals = vec![
+            synthetic_labeled("m", &[("v", "1.5")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("v", "1.10")], &[(0, 2.0)]),
+        ];
+        let values = eval_series(decimals, "m", "sort_by_label_numeric(m, \"v\")", 0)
+            .vector
+            .0
+            .iter()
+            .map(|point| point.labels["v"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["1.10", "1.5"]);
+        // The label names are not validated (VM looks them up as byte
+        // strings), so a dotted name parses.
+        assert!(matches!(
+            parse_ok("sort_by_label_numeric(m, \"a.b\")"),
+            Expr::SortByLabelNumeric { .. }
+        ));
+        assert!(parse_err("sort_by_label_numeric(m)").contains("at least one label name"));
+        assert!(parse_err("sort_by_label_numeric(m, v)").contains("quoted string"));
+    }
+
+    #[test]
+    fn test_union_concatenates_and_keeps_first_occurrence() {
+        let api = || synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]);
+        let db = || synthetic_labeled("m", &[("job", "db")], &[(0, 2.0)]);
+        // Two selectors in one expression need a hand-built fetch table.
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector("m")), vec![api(), db()]);
+        fetched.insert(selector_key(&selector(r#"m{job="api"}"#)), vec![api()]);
+        fetched.insert(
+            selector_key(&selector(r#"n{job="cache"}"#)),
+            vec![synthetic_labeled("n", &[("job", "cache")], &[(0, 3.0)])],
+        );
+        let evaluate = |query: &str| {
+            let expr = parse_ok(query);
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: 0,
+                query_end_ms: 0,
+                step_ms: 0,
+            };
+            rendered(&evaluator.eval(&expr, 0).unwrap().vector)
+        };
+        // Every label set appears once: `m` twice from the first argument and
+        // once from the second, `n` from the third.
+        assert_eq!(
+            evaluate("union(m, m{job=\"api\"}, n{job=\"cache\"})"),
+            vec![
+                ("{__name__=\"m\",job=\"api\"}".to_string(), 1.0),
+                ("{__name__=\"m\",job=\"db\"}".to_string(), 2.0),
+                ("{__name__=\"n\",job=\"cache\"}".to_string(), 3.0),
+            ]
+        );
+        // The first occurrence wins when values differ.
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector("m")), vec![api()]);
+        fetched.insert(
+            selector_key(&selector(r#"m{job="api"}"#)),
+            vec![synthetic_labeled("m", &[("job", "api")], &[(0, 9.0)])],
+        );
+        let expr = parse_ok("union(m, m{job=\"api\"})");
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+            step_ms: 0,
+        };
+        assert_eq!(
+            rendered(&evaluator.eval(&expr, 0).unwrap().vector),
+            vec![("{__name__=\"m\",job=\"api\"}".to_string(), 1.0)]
+        );
+        // All-scalar arguments stay separate unnamed series, which is what
+        // `union(1, 2)` is for in VM.
+        let fetched = HashMap::new();
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+            step_ms: 0,
+        };
+        let expr = parse_ok("union(1, 2)");
+        let vector = evaluator.eval(&expr, 0).unwrap().vector;
+        assert_eq!(vector.0.len(), 2);
+        assert!(vector.0.iter().all(|point| point.labels.is_empty()));
+        assert_eq!(vector.0[0].value, 1.0);
+        assert_eq!(vector.0[1].value, 2.0);
+        // A scalar mixed with a vector is one unnamed series, deduped like any
+        // other label set.
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector("m")), vec![api()]);
+        let evaluator = Evaluator {
+            fetched: &fetched,
+            query_start_ms: 0,
+            query_end_ms: 0,
+            step_ms: 0,
+        };
+        let expr = parse_ok("union(1, m)");
+        let vector = evaluator.eval(&expr, 0).unwrap().vector;
+        assert_eq!(vector.0.len(), 2);
+        assert!(vector
+            .0
+            .iter()
+            .any(|point| point.labels.is_empty() && point.value == 1.0));
+        assert!(vector
+            .0
+            .iter()
+            .any(|point| point.labels.get("job") == Some(&"api".to_string())));
+        // No argument at all is refused; a missing one is a syntax error.
+        assert!(parse_err("union()").contains("at least one argument"));
+        assert!(parse_err("union(m,)").contains("expected"));
     }
 
     #[test]
