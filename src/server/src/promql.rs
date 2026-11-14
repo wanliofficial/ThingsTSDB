@@ -1586,6 +1586,14 @@ pub enum Expr {
         op: HistogramStatOp,
         expr: Box<Expr>,
     },
+    /// MetricsQL `quantiles("label", q1, q2, ..., v)` — one output series per
+    /// quantile per group, with the quantile written into the given label.
+    Quantiles {
+        label: String,
+        quantiles: Vec<Expr>,
+        expr: Box<Expr>,
+        grouping: Option<Grouping>,
+    },
     /// `max_of(a, b)` / `min_of(a, b)` — two scalars, one scalar result
     /// (Prometheus' duration-expression helpers, also usable on plain
     /// numbers).
@@ -1687,6 +1695,14 @@ impl Expr {
                 }
             }
             Expr::HistogramStat { expr, .. } => expr.selectors(out),
+            Expr::Quantiles {
+                expr, quantiles, ..
+            } => {
+                expr.selectors(out);
+                for quantile in quantiles {
+                    quantile.selectors(out);
+                }
+            }
             Expr::Extremum { lhs, rhs, .. } => {
                 lhs.selectors(out);
                 rhs.selectors(out);
@@ -1841,6 +1857,14 @@ impl Expr {
             }
             Expr::HistogramStat { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
+            }
+            Expr::Quantiles {
+                expr, quantiles, ..
+            } => {
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
+                for quantile in quantiles {
+                    quantile.widen_window(query_start_ms, query_end_ms, start, end);
+                }
             }
             Expr::Extremum { lhs, rhs, .. } => {
                 lhs.widen_window(query_start_ms, query_end_ms, start, end);
@@ -2350,6 +2374,17 @@ impl Parser {
                         param,
                         grouping: Some(grouping),
                     })
+                } else if name == "quantiles" && matches!(self.peek(), Some(Token::Ident(_))) {
+                    // The prefix form: `quantiles by (job) ("q", 0.5, v)`.
+                    let grouping = self.grouping()?;
+                    self.expect(Token::LParen)?;
+                    let (label, quantiles, expr) = self.quantiles_arguments()?;
+                    Ok(Expr::Quantiles {
+                        label,
+                        quantiles,
+                        expr: Box::new(expr),
+                        grouping,
+                    })
                 } else {
                     Ok(Expr::Selector {
                         selector: Selector {
@@ -2380,6 +2415,25 @@ impl Parser {
             return Ok(Expr::Str(label));
         }
         self.expression(0)
+    }
+
+    /// The argument list of `quantiles("label", phi1, ..., phiN, v)`, with the
+    /// opening `(` already consumed: a quoted label, at least one quantile and
+    /// a final vector expression.
+    fn quantiles_arguments(&mut self) -> Result<(String, Vec<Expr>, Expr)> {
+        let label = self.string_argument("quantiles")?;
+        self.expect(Token::Comma)?;
+        let mut args = vec![self.expression(0)?];
+        while self.eat(&Token::Comma) {
+            args.push(self.expression(0)?);
+        }
+        self.expect(Token::RParen)?;
+        if args.len() < 2 {
+            return bad("quantiles needs at least one quantile and a vector: \
+                 quantiles(\"label\", 0.5, v)");
+        }
+        let expr = args.pop().expect("checked above");
+        Ok((label, args, expr))
     }
 
     /// Parses `by (a, b)` / `without (a)` if present.
@@ -2855,6 +2909,19 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            // `quantiles("label", phi1, ..., phiN, v)`: every argument but the
+            // last is a quantile, the last one is the vector. VM takes the
+            // grouping modifier after the call, like `topk` does.
+            "quantiles" => {
+                let (label, quantiles, expr) = self.quantiles_arguments()?;
+                let grouping = self.grouping()?;
+                Ok(Expr::Quantiles {
+                    label,
+                    quantiles,
+                    expr: Box::new(expr),
+                    grouping,
+                })
+            }
             "scalar" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
@@ -2991,9 +3058,9 @@ impl Parser {
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
                  label_value, label_map, label_uppercase, label_lowercase, label_transform, \
                  label_match, label_mismatch, alias, drop_common_labels, drop_empty_series, \
-                 labels_equal, label_graphite_group, limit_offset and the MetricsQL \
-                 aggregations any, sum2, geomean, distinct, median, mode, mad, share, \
-                 zscore, limitk, outliers_iqr, outliers_mad and outliersk"
+                 labels_equal, label_graphite_group, limit_offset, quantiles and the \
+                 MetricsQL aggregations any, sum2, geomean, distinct, median, mode, mad, \
+                 share, zscore, limitk, outliers_iqr, outliers_mad and outliersk"
             )),
         }
     }
@@ -3683,6 +3750,31 @@ impl<'a> Evaluator<'a> {
                 }
                 Ok(Instant {
                     vector: histogram_quantiles(&values, label, &instant.vector)?,
+                    scalar: None,
+                })
+            }
+            Expr::Quantiles {
+                label,
+                quantiles,
+                expr,
+                grouping,
+            } => {
+                let instant = self.eval(expr, at_ms)?;
+                let values = if let Some(scalar) = instant.scalar {
+                    // A scalar is one unlabelled series, like the other
+                    // aggregations treat it.
+                    let mut vector = Vector::default();
+                    vector.push(BTreeMap::new(), scalar);
+                    vector
+                } else {
+                    instant.vector
+                };
+                let mut phis = Vec::with_capacity(quantiles.len());
+                for quantile in quantiles {
+                    phis.push(self.scalar_of(quantile, at_ms)?);
+                }
+                Ok(Instant {
+                    vector: quantiles_agg(&values, label, &phis, grouping.as_ref()),
                     scalar: None,
                 })
             }
@@ -4848,6 +4940,46 @@ fn quantile_agg(values: &Vector, quantile: f64, grouping: Option<&Grouping>) -> 
     for (key, mut group) in groups {
         group.sort_by(|a, b| a.total_cmp(b));
         out.push(key.into_iter().collect(), quantile_of(&group, quantile));
+    }
+    out
+}
+
+/// `quantiles("label", phi1, ..., v)`: one output series per quantile per
+/// group, with each quantile written into `label` using Go's `%g`.
+///
+/// Following VM's `aggrFuncQuantiles`: NaNs are dropped before the quantiles
+/// are computed (they are gaps, not values), the value label is removed from
+/// the source metric name first and re-added with the formatted quantile, and
+/// the grouping key is computed on the metric name *after* `removeGroupTags`,
+/// so with no `by`/`without` every output series is `{}` plus the label.
+fn quantiles_agg(
+    values: &Vector,
+    label: &str,
+    quantiles: &[f64],
+    grouping: Option<&Grouping>,
+) -> Vector {
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<f64>> = BTreeMap::new();
+    for point in &values.0 {
+        // `aggrPrepareSeries` drops all-NaN series before grouping, so a NaN
+        // sample is a gap here too: it neither joins a group nor votes.
+        if point.value.is_nan() {
+            continue;
+        }
+        groups
+            .entry(group_key(&point.labels, grouping))
+            .or_default()
+            .push(point.value);
+    }
+    let mut out = Vector::default();
+    for (key, group) in groups {
+        let mut sorted = group;
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        for quantile in quantiles {
+            let mut labels: LabelSet = key.iter().cloned().collect();
+            labels.remove(label);
+            labels.insert(label.to_string(), go_format_g(*quantile));
+            out.push(labels, quantile_of(&sorted, *quantile));
+        }
     }
     out
 }
@@ -9141,6 +9273,84 @@ mod tests {
         assert_eq!(hash(Some("m"), &[("instance", "b")]), 36738780650153961);
         assert_eq!(hash(Some("m"), &[("instance", "c")]), 1453846441280961190);
         assert_eq!(hash(Some("m"), &[("instance", "d")]), 15688669754200327500);
+    }
+
+    #[test]
+    fn test_metricsql_quantiles() {
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api"), ("i", "1")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "api"), ("i", "2")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("job", "api"), ("i", "3")], &[(0, 3.0)]),
+            synthetic_labeled("m", &[("job", "api"), ("i", "4")], &[(0, 4.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        // Without `by`/`without` the group key is empty, so every output series
+        // is `{}` plus the quantile label; the label values use Go's `%g`.
+        assert_eq!(
+            run(r#"quantiles("q", 0.5, m)"#),
+            vec![("{q=\"0.5\"}".to_string(), 2.5)]
+        );
+        // Two quantiles give two series off the same group.
+        assert_eq!(
+            run(r#"quantiles("q", 0, 1, m)"#),
+            vec![
+                ("{q=\"0\"}".to_string(), 1.0),
+                ("{q=\"1\"}".to_string(), 4.0),
+            ]
+        );
+        // Out-of-range quantiles are not errors: `±Inf`, as in VM.
+        assert_eq!(
+            run(r#"quantiles("q", -1, 2, m)"#),
+            vec![
+                ("{q=\"-1\"}".to_string(), f64::NEG_INFINITY),
+                ("{q=\"2\"}".to_string(), f64::INFINITY),
+            ]
+        );
+        // `by (job)` keeps the grouping label next to the quantile label.
+        assert_eq!(
+            run(r#"quantiles by (job) ("q", 0.5, m)"#),
+            vec![("{job=\"api\",q=\"0.5\"}".to_string(), 2.5)]
+        );
+        // An existing label of the same name is overwritten, not duplicated.
+        assert_eq!(
+            run(r#"quantiles("job", 0.5, m)"#),
+            vec![("{job=\"0.5\"}".to_string(), 2.5)]
+        );
+        // Metric-name rendering: `%g` writes `100000` but `1e+06`.
+        assert_eq!(
+            run(r#"quantiles("q", 100000, 1000000, m)"#),
+            vec![
+                ("{q=\"100000\"}".to_string(), f64::INFINITY),
+                ("{q=\"1e+06\"}".to_string(), f64::INFINITY),
+            ]
+        );
+        // A scalar is one unlabelled series, like the other aggregations.
+        let scalar = eval_series(Vec::new(), "m", r#"quantiles("q", 0.5, 1)"#, 0);
+        assert_eq!(
+            rendered(&scalar.vector),
+            vec![("{q=\"0.5\"}".to_string(), 1.0)]
+        );
+    }
+
+    #[test]
+    fn test_metricsql_quantiles_nan_is_a_gap() {
+        let series = vec![
+            synthetic_labeled("m", &[("i", "1")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("i", "2")], &[(0, f64::NAN)]),
+            synthetic_labeled("m", &[("i", "3")], &[(0, 3.0)]),
+        ];
+        // The NaN series is dropped before grouping, so the median is over 1
+        // and 3 only.
+        assert_eq!(
+            rendered(&eval_series(series, "m", r#"quantiles("q", 0.5, m)"#, 0).vector),
+            vec![("{q=\"0.5\"}".to_string(), 2.0)]
+        );
+    }
+
+    #[test]
+    fn test_metricsql_quantiles_parse_errors() {
+        assert!(parse_err(r#"quantiles("q", m)"#).contains("at least one quantile"));
+        assert!(parse_err(r#"quantiles(0.5, m)"#).contains("needs a quoted string"));
     }
 
     #[test]

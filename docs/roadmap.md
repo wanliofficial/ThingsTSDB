@@ -248,7 +248,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `histogram_share` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
     count_values`，以及 MetricsQL 的 `any/sum2/geomean/distinct/median/mode/mad/
-    share/zscore/limitk/outliers_iqr/outliers_mad/outliersk`（见下面单独一条），支持
+    share/zscore/limitk/outliers_iqr/outliers_mad/outliersk/quantiles`（见下面
+    单独条目），支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
     并保留分组标签，与 Prometheus 一致。不写 `by`/`without` 时按官方文档「聚合
     全部标签维度」处理，即整个向量并成一条无标签序列（`sum(m)` 只有一个
@@ -532,17 +533,31 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     （`limitk(2, m)`、`outliers_mad(1.5, m)`）；
   - `aggr_over_time` 现在只接受 `sum/avg/min/max/count/stddev/stdvar`（新增的
     MetricsQL 聚合名不在其上），解析期报错并列出可用名；
-  - 留作后续条目：`histogram(v)`（要向 `vmrange` 多序列 + `le` 转换，与本服务
-    `histogram_*` 系列一样需要先定桶表示）、`quantiles("label", q…, v)`
-    （一进多出，且多出来的维度是新标签而不是原始序列的子集，要单独给
-    `Expr::Aggregation` 加一条参数列表通路）、`topk_*`/`bottomk_*` 这组按
-    「整段 step 的取值」挑选的变体（与上面「跨 step 变换」同一类理由）；
   - 测试：`sum2`/`geomean`/`distinct`/`median`/`mode`/`mad` 的数值与 NaN 缺口语义、
     `-0`/`0` 合并；`any` 保名、`share` 的 1/6 与 2/6、`zscore` 的 `±sqrt(1.5)`、
     `outliers_iqr` 的「无离群点」与 100 这条离群点、`outliers_mad(1, …)` 的同一边界、
     `outliersk(1, …)` 选中 100；`limitk(2, …)` 的条数与按哈希序的前缀、
     `limitk(0, …)` 为空；`metric_name_hash` 按 Go `xxhash/v2` 实测值逐条对照
     （`m`、`m{instance=a..d}` 与空 metric group）。
+- 已完成（2026-11-14）：MetricsQL 的 `quantiles("label", q1, …, v)` /
+  前缀式 `quantiles by (job) ("q", 0.5, m)`（同属
+  `app/vmselect/promql/aggr.go` 的 `aggrFuncQuantiles`）：
+  - 每条输入序列产出与分位参数个数相同条数的输出，输出标签是**去掉目标标签后
+    再加上 `label=go_format_g(phi)`**（VM 的 `ts.MetricName.RemoveTag(dstLabel)`
+    + `AddTag(dstLabel, fmt.Sprintf("%g", phi))`）；越界分位不报错，`phi<0` 得
+    `-Inf`、`phi>1` 得 `+Inf`——沿用本服务 `histogram_quantiles` 已固定的
+    `quantileSorted` 语义；
+  - NaN 样本在分组前丢弃（VM 的 `aggrPrepareSeries` +
+    `prepareForQuantileFloat64`），与目标标签同名的旧标签值被分位标签覆盖；
+    标量被当作一条无标签序列；
+  - 分组键用 `group_key` 之后才写分位标签，所以默认聚合（无 `by`/`without`）下
+    每条输出都是 `{}` 加分位标签；后缀式（`quantiles("q",0.5,m) by (job)`）与
+    前缀式（`quantiles by (job) ("q",0.5,m)`）两种写法都支持，与 VM
+    `parseAggrFuncExpr` 的 `isIdentPrefix` 分支对齐；
+  - 测试：单/多分位、越界分位（`±Inf`）、`by (job)`、同名标签覆盖、
+    `%g` 标签值（`100000`→`"100000"`、`1e6`→`"1e+06"`）、NaN 是缺口、
+    标量输入、两种分组写法与解析期参数校验。
+
 - 已完成（2026-11-14）：MetricsQL 的 `sort_by_label_numeric(v, "label", ...)` /
   `sort_by_label_numeric_desc` 与 `union(v1, v2, ...)`（同属
   `app/vmselect/promql/transform.go`，`newTransformFuncNumericSort` /
