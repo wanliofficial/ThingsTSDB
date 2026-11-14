@@ -500,6 +500,48 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   每个 step 独立求值，没有「上一步/下一步的值」这条数据通路；按 step 硬做会在
   range 查询里给出与 VM 不同的曲线（`keep_last_value` 会退化成恒等），所以宁可
   报未知函数。要做需要把求值器改成 VM 那样一次产出整段序列，留作后续条目。
+- 已完成（2026-11-14）：MetricsQL 的取值类聚合函数 `any` / `sum2` / `geomean` /
+  `distinct` / `median` / `mode` / `mad` / `share` / `zscore` / `limitk` /
+  `outliers_iqr` / `outliers_mad` / `outliersk`（`app/vmselect/promql/aggr.go`
+  的 `aggrFuncs` 表与各 `aggrFunc*`）：
+  - **标量折叠**（每组一个值）：`sum2` 是平方和、`geomean` 是 `prod^(1/n)`、
+    `distinct` 是不同取值个数、`median` 就是 `quantile(0.5, …)`（复用
+    `quantile_of`）、`mode` 复用 `modeNoNaNs`（与 `mode_over_time` 同一份实现）、
+    `mad` 是 `median(|v - median(v)|)`。它们都先跳过 NaN 样本，整组都是 NaN 时
+    返回 NaN——即 VM 的 `removeEmptySeries` + 各 `aggrFunc*` 里的
+    `if count == 0 { … = nan }`；`distinct` 把 `-0` 与 `0` 算作同一个键（Go 的
+    `map[float64]` 按 `==` 比较）；
+  - **一进多出**（每条输入序列一条输出、**保留原始标签**，对应 VM 里
+    `aggrFuncExt(..., keepOriginal=true)` 的调用者）：
+    `any` 每组留第一条序列；`share` 把每个非负值除以该组非负值之和（负数与 NaN
+    变 NaN）；`zscore` 用 VM 的 Welford 递推算组内均值与总体标准差，再算
+    `(v-avg)/stddev`；`outliers_iqr` 留「超出 `[q1-1.5IQR, q3+1.5IQR]`」的点；
+    `outliers_mad(tolerance, v)` 留超出 `median ± tolerance*MAD` 的点；
+    `outliersk(k, v)` 按「与中位数的平方距离」取前 k 条（`getRangeTopKTimeseries`
+    升序排再整体反转，所以输出是距离降序）；
+  - 这里的「超界」判定是**逐点**的：VM 的 `aggrFuncOutliersIQR` / `aggrFuncOutliersMAD`
+    按时间点分别算组内上下界，再「序列只要有任何一点超界就整条留下」；本服务每个
+    step 独立求值、一条序列在这一步只有一个点，两种写法在这里等价（区间查询下
+    VM 可能在前面的 step 就留下一条序列并沿用它在后续 step 的 NaN 值，本服务不会
+    这样持有跨 step 状态，与 `limit_offset` 记录的是同一类差异）；
+  - `limitk(k, v)` 按 VM 的 `getHash`（xxhash64，种子 0，先写 `__name__` 再按标签名
+    排序写每个 name/value）升序取前 k 条，保证同一组输入的选集合稳定；
+    `k`/`tolerance` 走 `floatToIntBounded`（NaN 与越界钳到边界），`k<=0` 返回空；
+  - 分组照旧走 `group_key`，所以 `by`/`without` 都能用；聚合参数写在向量前
+    （`limitk(2, m)`、`outliers_mad(1.5, m)`）；
+  - `aggr_over_time` 现在只接受 `sum/avg/min/max/count/stddev/stdvar`（新增的
+    MetricsQL 聚合名不在其上），解析期报错并列出可用名；
+  - 留作后续条目：`histogram(v)`（要向 `vmrange` 多序列 + `le` 转换，与本服务
+    `histogram_*` 系列一样需要先定桶表示）、`quantiles("label", q…, v)`
+    （一进多出，且多出来的维度是新标签而不是原始序列的子集，要单独给
+    `Expr::Aggregation` 加一条参数列表通路）、`topk_*`/`bottomk_*` 这组按
+    「整段 step 的取值」挑选的变体（与上面「跨 step 变换」同一类理由）；
+  - 测试：`sum2`/`geomean`/`distinct`/`median`/`mode`/`mad` 的数值与 NaN 缺口语义、
+    `-0`/`0` 合并；`any` 保名、`share` 的 1/6 与 2/6、`zscore` 的 `±sqrt(1.5)`、
+    `outliers_iqr` 的「无离群点」与 100 这条离群点、`outliers_mad(1, …)` 的同一边界、
+    `outliersk(1, …)` 选中 100；`limitk(2, …)` 的条数与按哈希序的前缀、
+    `limitk(0, …)` 为空；`metric_name_hash` 按 Go `xxhash/v2` 实测值逐条对照
+    （`m`、`m{instance=a..d}` 与空 metric group）。
 - 已完成（2026-11-14）：MetricsQL 的 `sort_by_label_numeric(v, "label", ...)` /
   `sort_by_label_numeric_desc` 与 `union(v1, v2, ...)`（同属
   `app/vmselect/promql/transform.go`，`newTransformFuncNumericSort` /

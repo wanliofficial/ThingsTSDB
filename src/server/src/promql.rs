@@ -739,6 +739,32 @@ pub enum AggOp {
     Quantile,
     /// `count_values("label", v)` — one output series per distinct value.
     CountValues,
+    /// MetricsQL `any(v)` — one arbitrary series per group, labels untouched.
+    Any,
+    /// MetricsQL `sum2(v)` — the sum of squares.
+    Sum2,
+    /// MetricsQL `geomean(v)` — the geometric mean.
+    Geomean,
+    /// MetricsQL `distinct(v)` — how many distinct values.
+    Distinct,
+    /// MetricsQL `median(v)` — the same as `quantile(0.5, v)`.
+    Median,
+    /// MetricsQL `mode(v)` — the most frequent value.
+    Mode,
+    /// MetricsQL `mad(v)` — the median absolute deviation.
+    Mad,
+    /// MetricsQL `share(v)` — each sample's share of the group's sum.
+    Share,
+    /// MetricsQL `zscore(v)` — each sample's standard score in its group.
+    ZScore,
+    /// MetricsQL `limitk(k, v)` — `k` series picked by metric-name hash.
+    LimitK,
+    /// MetricsQL `outliers_iqr(v)` — series outside 1.5 IQR of the group.
+    OutliersIqr,
+    /// MetricsQL `outliers_mad(tolerance, v)`.
+    OutliersMad,
+    /// MetricsQL `outliersk(k, v)` — the series furthest from the median.
+    OutliersK,
 }
 
 impl AggOp {
@@ -756,6 +782,19 @@ impl AggOp {
             AggOp::Bottomk => "bottomk",
             AggOp::Quantile => "quantile",
             AggOp::CountValues => "count_values",
+            AggOp::Any => "any",
+            AggOp::Sum2 => "sum2",
+            AggOp::Geomean => "geomean",
+            AggOp::Distinct => "distinct",
+            AggOp::Median => "median",
+            AggOp::Mode => "mode",
+            AggOp::Mad => "mad",
+            AggOp::Share => "share",
+            AggOp::ZScore => "zscore",
+            AggOp::LimitK => "limitk",
+            AggOp::OutliersIqr => "outliers_iqr",
+            AggOp::OutliersMad => "outliers_mad",
+            AggOp::OutliersK => "outliersk",
         }
     }
 
@@ -773,22 +812,62 @@ impl AggOp {
             "bottomk" => AggOp::Bottomk,
             "quantile" => AggOp::Quantile,
             "count_values" => AggOp::CountValues,
+            // MetricsQL's value aggregations.
+            "any" => AggOp::Any,
+            "sum2" => AggOp::Sum2,
+            "geomean" => AggOp::Geomean,
+            "distinct" => AggOp::Distinct,
+            "median" => AggOp::Median,
+            "mode" => AggOp::Mode,
+            "mad" => AggOp::Mad,
+            "share" => AggOp::Share,
+            "zscore" => AggOp::ZScore,
+            "limitk" => AggOp::LimitK,
+            "outliers_iqr" => AggOp::OutliersIqr,
+            "outliers_mad" => AggOp::OutliersMad,
+            "outliersk" => AggOp::OutliersK,
             _ => return None,
         })
     }
 
-    /// `topk` / `bottomk` / `quantile` take a numeric parameter before the
-    /// vector, `count_values` a label name.
+    /// `topk` / `bottomk` / `quantile` / `limitk` / `outliers_mad` /
+    /// `outliersk` take a numeric parameter before the vector, `count_values` a
+    /// label name.
     fn takes_param(self) -> bool {
         matches!(
             self,
-            AggOp::Topk | AggOp::Bottomk | AggOp::Quantile | AggOp::CountValues
+            AggOp::Topk
+                | AggOp::Bottomk
+                | AggOp::Quantile
+                | AggOp::CountValues
+                | AggOp::LimitK
+                | AggOp::OutliersMad
+                | AggOp::OutliersK
         )
     }
 
     /// True when the parameter is a quoted label name rather than a scalar.
     fn takes_label_param(self) -> bool {
         self == AggOp::CountValues
+    }
+
+    /// The aggregations `aggr_over_time(<agg>, v[range])` accepts.
+    ///
+    /// VM's `aggr_over_time` takes *rollup function* names (`avg_over_time`,
+    /// `mad_over_time`, ...), not aggregation names; this evaluator maps the
+    /// plain reducers onto it, so only the ones with a matching rollup are let
+    /// through.
+    fn is_aggr_over_time(self) -> bool {
+        matches!(
+            self,
+            AggOp::Sum
+                | AggOp::Avg
+                | AggOp::Min
+                | AggOp::Max
+                | AggOp::Count
+                | AggOp::Stddev
+                | AggOp::Stdvar
+        )
     }
 }
 
@@ -2490,10 +2569,10 @@ impl Parser {
                         ))
                     }
                 };
-                if op.takes_param() {
+                if !op.is_aggr_over_time() {
                     return bad(format!(
-                        "`{}` takes a parameter and is not an aggregation over_time accepts; \
-                         use quantile_over_time for a quantile",
+                        "`{}` is not an aggregation over_time accepts; the accepted ones are \
+                         sum, avg, min, max, count, stddev and stdvar",
                         op.name()
                     ));
                 }
@@ -2909,7 +2988,9 @@ impl Parser {
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
                  label_value, label_map, label_uppercase, label_lowercase, label_transform, \
                  label_match, label_mismatch, alias, drop_common_labels, drop_empty_series, \
-                 labels_equal, label_graphite_group and limit_offset"
+                 labels_equal, label_graphite_group, limit_offset and the MetricsQL \
+                 aggregations any, sum2, geomean, distinct, median, mode, mad, share, \
+                 zscore, limitk, outliers_iqr, outliers_mad and outliersk"
             )),
         }
     }
@@ -4293,6 +4374,24 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 });
             }
+            if op == AggOp::LimitK {
+                return Ok(Instant {
+                    vector: limitk(&values, param, grouping),
+                    scalar: None,
+                });
+            }
+            if op == AggOp::OutliersMad {
+                return Ok(Instant {
+                    vector: outliers_mad(&values, param, grouping),
+                    scalar: None,
+                });
+            }
+            if op == AggOp::OutliersK {
+                return Ok(Instant {
+                    vector: outliersk(&values, param, grouping),
+                    scalar: None,
+                });
+            }
             return Ok(Instant {
                 vector: topk(op, &values, param as usize, grouping),
                 scalar: None,
@@ -4300,6 +4399,17 @@ impl<'a> Evaluator<'a> {
         }
         if param.is_some() {
             return bad(format!("{} does not take a parameter", op.name()));
+        }
+        // The vector-valued aggregations: one output series per *input* series,
+        // so they cannot go through the scalar folder below.
+        if matches!(
+            op,
+            AggOp::Share | AggOp::ZScore | AggOp::Any | AggOp::OutliersIqr
+        ) {
+            return Ok(Instant {
+                vector: vector_agg(op, &values, grouping),
+                scalar: None,
+            });
         }
 
         let mut groups: BTreeMap<Vec<(String, String)>, Vec<f64>> = BTreeMap::new();
@@ -4348,10 +4458,7 @@ impl<'a> Evaluator<'a> {
             return bad("quantile_over_time needs a quantile parameter");
         }
         if let RangeFunc::AggrOverTime(op) = func {
-            if matches!(
-                op,
-                AggOp::Topk | AggOp::Bottomk | AggOp::Group | AggOp::Quantile | AggOp::CountValues
-            ) {
+            if !op.is_aggr_over_time() {
                 return bad(format!(
                     "`{}` is not an aggregation over_time accepts",
                     op.name()
@@ -4626,8 +4733,75 @@ fn aggregate_values(op: AggOp, values: &[f64]) -> f64 {
             let mean = values.iter().sum::<f64>() / values.len() as f64;
             values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
         }
+        // `aggrFuncSum2`: NaN samples are skipped, an all-NaN group yields NaN.
+        AggOp::Sum2 => {
+            let finite: Vec<f64> = values.iter().copied().filter(|v| !v.is_nan()).collect();
+            if finite.is_empty() {
+                return f64::NAN;
+            }
+            finite.iter().map(|v| v * v).sum()
+        }
+        // `aggrFuncGeomean`: `prod ^ (1/n)` over the non-NaN samples.
+        AggOp::Geomean => {
+            let finite: Vec<f64> = values.iter().copied().filter(|v| !v.is_nan()).collect();
+            if finite.is_empty() {
+                return f64::NAN;
+            }
+            finite
+                .iter()
+                .product::<f64>()
+                .powf(1.0 / finite.len() as f64)
+        }
+        // `aggrFuncDistinct`: the size of a `set[float64]`, so `-0` and `0`
+        // are one value (Go compares map keys by `==`).
+        AggOp::Distinct => {
+            let mut seen: Vec<u64> = Vec::with_capacity(values.len());
+            for value in values.iter().copied().filter(|v| !v.is_nan()) {
+                let bits = if value == 0.0 { 0 } else { value.to_bits() };
+                if !seen.contains(&bits) {
+                    seen.push(bits);
+                }
+            }
+            if seen.is_empty() {
+                f64::NAN
+            } else {
+                seen.len() as f64
+            }
+        }
+        // `aggrFuncMedian`: `quantile(0.5, …)` over the non-NaN samples.
+        AggOp::Median => {
+            let mut sorted: Vec<f64> = values.iter().copied().filter(|v| !v.is_nan()).collect();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            quantile_of(&sorted, 0.5)
+        }
+        // `aggrFuncMode`: `modeNoNaNs(NaN, …)` over the non-NaN samples.
+        AggOp::Mode => {
+            let mut finite: Vec<f64> = values.iter().copied().filter(|v| !v.is_nan()).collect();
+            mode_no_nans(f64::NAN, &mut finite)
+        }
+        // `getPerPointMADs` over a single point: the median of the absolute
+        // deviations from the group's median.
+        AggOp::Mad => {
+            let mut sorted: Vec<f64> = values.iter().copied().filter(|v| !v.is_nan()).collect();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let median = quantile_of(&sorted, 0.5);
+            let mut deviations: Vec<f64> =
+                sorted.iter().map(|value| (value - median).abs()).collect();
+            deviations.sort_by(|a, b| a.total_cmp(b));
+            quantile_of(&deviations, 0.5)
+        }
         // Handled by the caller, which needs the whole vector.
-        AggOp::Topk | AggOp::Bottomk | AggOp::Quantile | AggOp::CountValues => f64::NAN,
+        AggOp::Topk
+        | AggOp::Bottomk
+        | AggOp::Quantile
+        | AggOp::CountValues
+        | AggOp::Any
+        | AggOp::Share
+        | AggOp::ZScore
+        | AggOp::LimitK
+        | AggOp::OutliersIqr
+        | AggOp::OutliersMad
+        | AggOp::OutliersK => f64::NAN,
     }
 }
 
@@ -4709,6 +4883,271 @@ fn count_values(values: &Vector, label: &str, grouping: Option<&Grouping>) -> Ve
     let mut out = Vector::default();
     for (key, count) in counts {
         out.push(key.into_iter().collect(), count as f64);
+    }
+    out
+}
+
+/// VM's `modeNoNaNs`: the value with the longest run in `values`, after
+/// sorting a copy in place. `prevValue` seeds the bookkeeping, which is why the
+/// caller passes NaN at the start of a window.
+fn mode_no_nans(prev_value: f64, values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return prev_value;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mut prev_value = prev_value;
+    let mut j: i64 = -1;
+    let mut max_run = 0i64;
+    let mut mode = prev_value;
+    for (i, value) in values.iter().copied().enumerate() {
+        let i = i as i64;
+        if prev_value == value {
+            continue;
+        }
+        let run = i - j;
+        if run > max_run || mode.is_nan() {
+            max_run = run;
+            mode = prev_value;
+        }
+        j = i;
+        prev_value = value;
+    }
+    let run = values.len() as i64 - j;
+    if run > max_run || mode.is_nan() {
+        mode = prev_value;
+    }
+    mode
+}
+
+/// The aggregations whose result is a subset of the input series, or a
+/// per-series rewrite of them: `any`, `share`, `zscore`, `outliers_iqr`, plus
+/// the three that also take a scalar (`limitk`, `outliers_mad`, `outliersk`).
+///
+/// These keep the input labels — VictoriaMetrics calls `aggrFuncExt` with
+/// `keepOriginal=true` for all of them, so `removeGroupTags` only affects the
+/// grouping key, never the emitted series.
+fn vector_agg(op: AggOp, values: &Vector, grouping: Option<&Grouping>) -> Vector {
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<Point>> = BTreeMap::new();
+    for point in &values.0 {
+        // `aggrPrepareSeries` drops the empty series (all-NaN samples) first.
+        if point.value.is_nan() {
+            continue;
+        }
+        groups
+            .entry(group_key(&point.labels, grouping))
+            .or_default()
+            .push(point.clone());
+    }
+    let mut out = Vector::default();
+    match op {
+        // `aggrFuncAny`: the first series of each group, unchanged.
+        AggOp::Any => {
+            for (_, group) in groups {
+                if let Some(point) = group.first() {
+                    out.push(point.labels.clone(), point.value);
+                }
+            }
+        }
+        // `aggrFuncShare`: every non-negative value divided by the group's sum
+        // of non-negative values; negative and NaN samples become NaN.
+        AggOp::Share => {
+            for (_, group) in groups {
+                let sum: f64 = group
+                    .iter()
+                    .map(|point| point.value)
+                    .filter(|value| *value >= 0.0)
+                    .sum();
+                for point in group {
+                    let value = if point.value < 0.0 {
+                        f64::NAN
+                    } else {
+                        point.value / sum
+                    };
+                    out.push(point.labels.clone(), value);
+                }
+            }
+        }
+        // `aggrFuncZScore`: `(v - avg) / stddev` with the population standard
+        // deviation, computed by VM's running (Welford) update.
+        AggOp::ZScore => {
+            for (_, group) in groups {
+                let mut avg = 0.0;
+                let mut count = 0.0;
+                let mut q = 0.0;
+                for point in &group {
+                    count += 1.0;
+                    let avg_new = avg + (point.value - avg) / count;
+                    q += (point.value - avg) * (point.value - avg_new);
+                    avg = avg_new;
+                }
+                let stddev = (q / count).sqrt();
+                for point in group {
+                    out.push(point.labels.clone(), (point.value - avg) / stddev);
+                }
+            }
+        }
+        // `aggrFuncOutliersIQR`: keep the series with at least one sample
+        // outside `[q1 - 1.5*IQR, q3 + 1.5*IQR]`.
+        //
+        // VM computes the bounds per point in time across the group and keeps a
+        // *series* if any of its points escapes them. Here every series has a
+        // single point, so the same filter keeps exactly the points that are
+        // outside their own bounds.
+        AggOp::OutliersIqr => {
+            for (_, group) in groups {
+                let (lower, upper) = iqr_bounds(&group);
+                for point in group {
+                    if point.value > upper || point.value < lower {
+                        out.push(point.labels.clone(), point.value);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// VM's `getPerPointIQRBounds` for a single point in time: the 25th and 75th
+/// percentiles plus/minus 1.5 IQR.
+fn iqr_bounds(group: &[Point]) -> (f64, f64) {
+    let mut sorted: Vec<f64> = group.iter().map(|point| point.value).collect();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let q1 = quantile_of(&sorted, 0.25);
+    let q3 = quantile_of(&sorted, 0.75);
+    let iqr = 1.5 * (q3 - q1);
+    (q1 - iqr, q3 + iqr)
+}
+
+/// `limitk(k, v)`: sort each group by the xxhash of its metric name and keep
+/// the first `k`. VM's `getHash` hashes the metric group followed by every
+/// tag's name and value, in the metric name's (sorted) tag order.
+fn limitk(values: &Vector, k: f64, grouping: Option<&Grouping>) -> Vector {
+    let limit = if k.is_nan() {
+        0
+    } else {
+        float_to_int_bounded(k).max(0) as usize
+    };
+    if limit == 0 {
+        return Vector::default();
+    }
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<Point>> = BTreeMap::new();
+    for point in &values.0 {
+        if point.value.is_nan() {
+            continue;
+        }
+        groups
+            .entry(group_key(&point.labels, grouping))
+            .or_default()
+            .push(point.clone());
+    }
+    let mut out = Vector::default();
+    for (_, group) in groups {
+        let mut hashed: Vec<(u64, Point)> = group
+            .into_iter()
+            .map(|point| (metric_name_hash(&point.labels), point))
+            .collect();
+        hashed.sort_by_key(|(hash, _)| *hash);
+        for (_, point) in hashed.into_iter().take(limit) {
+            out.push(point.labels.clone(), point.value);
+        }
+    }
+    out
+}
+
+/// VM's `getHash`: xxhash64 over `__name__` (its "metric group") followed by
+/// each tag's name and value, in sorted order.
+fn metric_name_hash(labels: &LabelSet) -> u64 {
+    let mut digest = xxhash_rust::xxh64::Xxh64::new(0);
+    if let Some(name) = labels.get("__name__") {
+        digest.update(name.as_bytes());
+    }
+    for (name, value) in labels {
+        if name == "__name__" {
+            continue;
+        }
+        digest.update(name.as_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.digest()
+}
+
+/// `outliers_mad(tolerance, v)`: keep the series with at least one sample more
+/// than `tolerance * MAD` away from the group's median.
+///
+/// VM computes a per-point median and MAD across the group, then multiplies the
+/// MAD by the tolerance for that point; this evaluator has one point per
+/// series, so the same arithmetic collapses to a single median/MAD pair.
+fn outliers_mad(values: &Vector, tolerance: f64, grouping: Option<&Grouping>) -> Vector {
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<Point>> = BTreeMap::new();
+    for point in &values.0 {
+        if point.value.is_nan() {
+            continue;
+        }
+        groups
+            .entry(group_key(&point.labels, grouping))
+            .or_default()
+            .push(point.clone());
+    }
+    let mut out = Vector::default();
+    for (_, group) in groups {
+        let mut sorted: Vec<f64> = group.iter().map(|point| point.value).collect();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let median = quantile_of(&sorted, 0.5);
+        let mut deviations: Vec<f64> = sorted.iter().map(|value| (value - median).abs()).collect();
+        deviations.sort_by(|a, b| a.total_cmp(b));
+        let bound = quantile_of(&deviations, 0.5) * tolerance;
+        // VM keeps a whole series when any of its points escapes the bound;
+        // with one point per series that is a per-point filter.
+        for point in group {
+            if (point.value - median).abs() > bound {
+                out.push(point.labels.clone(), point.value);
+            }
+        }
+    }
+    out
+}
+
+/// `outliersk(k, v)`: the `k` series with the largest squared distance from the
+/// group's median, in descending order (`getRangeTopKTimeseries` with
+/// `isReverse=false` sorts ascending by the score and then reverses).
+fn outliersk(values: &Vector, k: f64, grouping: Option<&Grouping>) -> Vector {
+    let limit = if k.is_nan() {
+        0
+    } else {
+        float_to_int_bounded(k).max(0) as usize
+    };
+    if limit == 0 {
+        return Vector::default();
+    }
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<Point>> = BTreeMap::new();
+    for point in &values.0 {
+        if point.value.is_nan() {
+            continue;
+        }
+        groups
+            .entry(group_key(&point.labels, grouping))
+            .or_default()
+            .push(point.clone());
+    }
+    let mut out = Vector::default();
+    for (_, group) in groups {
+        let mut sorted: Vec<f64> = group.iter().map(|point| point.value).collect();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let median = quantile_of(&sorted, 0.5);
+        // `lessWithNaNs` never sees a NaN here: the points were filtered above.
+        let score = |point: &Point| (point.value - median).powi(2);
+        // `getRangeTopKTimeseries` sorts ascending by the score, keeps the last
+        // `k` (by blanking the rest), then reverses — so the answer is the `k`
+        // largest scores, descending. `sort.Slice` is unstable in Go, so the
+        // order of equal scores is unspecified there; this keeps it stable and
+        // then reverses it, which is one of Go's possible orders.
+        let mut order: Vec<usize> = (0..group.len()).collect();
+        order.sort_by(|a, b| score(&group[*a]).total_cmp(&score(&group[*b])));
+        order.reverse();
+        for index in order.into_iter().take(limit) {
+            out.push(group[index].labels.clone(), group[index].value);
+        }
     }
     out
 }
@@ -5152,29 +5591,7 @@ fn apply_range_func(
         // sorting, with VM's index bookkeeping transcribed as is.
         RangeFunc::ModeOverTime => {
             let mut values: Vec<f64> = samples.iter().map(|s| s.value).collect();
-            values.sort_by(|a, b| a.total_cmp(b));
-            let mut prev_value = f64::NAN;
-            let mut j: i64 = -1;
-            let mut max_run = 0i64;
-            let mut mode = f64::NAN;
-            for (i, value) in values.iter().copied().enumerate() {
-                let i = i as i64;
-                if prev_value == value {
-                    continue;
-                }
-                let run = i - j;
-                if run > max_run || mode.is_nan() {
-                    max_run = run;
-                    mode = prev_value;
-                }
-                j = i;
-                prev_value = value;
-            }
-            let run = values.len() as i64 - j;
-            if run > max_run || mode.is_nan() {
-                mode = prev_value;
-            }
-            Some(mode)
+            Some(mode_no_nans(f64::NAN, &mut values))
         }
         // `rollupIncreases`: like `changes`, but only upward steps count, with
         // VM's 1e-12 relative tolerance for float noise. The first sample only
@@ -6809,8 +7226,8 @@ mod tests {
         // Errors name the problem.
         assert!(parse_err("aggr_over_time(5, m[5m])").contains("aggregation name"));
         assert!(parse_err("aggr_over_time(nonsense, m[5m])").contains("not an aggregation"));
-        assert!(parse_err("aggr_over_time(topk, m[5m])").contains("takes a parameter"));
-        assert!(parse_err("aggr_over_time(quantile, m[5m])").contains("takes a parameter"));
+        assert!(parse_err("aggr_over_time(topk, m[5m])").contains("not an aggregation"));
+        assert!(parse_err("aggr_over_time(quantile, m[5m])").contains("not an aggregation"));
         assert!(parse_err("predict_linear(m[5m])").contains("expected Comma but found"));
     }
 
@@ -8559,6 +8976,168 @@ mod tests {
         // Population variance of 1,2,3,4 is 1.25.
         assert!((aggregate_values(AggOp::Stdvar, &values) - 1.25).abs() < 1e-12);
         assert!((aggregate_values(AggOp::Stddev, &values) - 1.25f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_metricsql_value_aggregations() {
+        let values = [1.0, 2.0, 3.0, 4.0];
+        // `aggrFuncSum2` is the sum of squares.
+        assert_eq!(aggregate_values(AggOp::Sum2, &values), 30.0);
+        // `aggrFuncGeomean` is `prod ^ (1/n)`: (1*2*3*4)^(1/4) =
+        // sqrt(sqrt(24)).
+        let geomean = aggregate_values(AggOp::Geomean, &values);
+        assert!((geomean - 24f64.powf(0.25)).abs() < 1e-12, "got {geomean}");
+        assert_eq!(aggregate_values(AggOp::Distinct, &values), 4.0);
+        // `quantile(0.5, [1,2,3,4])` interpolates between 2 and 3.
+        assert_eq!(aggregate_values(AggOp::Median, &values), 2.5);
+        // `modeNoNaNs`: with no repeated value the longest run is the first
+        // one, which is how VM's bookkeeping falls out.
+        assert_eq!(aggregate_values(AggOp::Mode, &values), 1.0);
+        assert_eq!(aggregate_values(AggOp::Mode, &[1.0, 2.0, 3.0, 3.0]), 3.0);
+        // `mad`: median of |v - 2.5| = |1.5,0.5,0.5,1.5|, whose median is the
+        // 0.5/1.5 midpoint 1.
+        assert_eq!(aggregate_values(AggOp::Mad, &values), 1.0);
+        // NaN is a gap: `sum2` and `geomean` skip it, and an all-NaN group is
+        // NaN.
+        assert_eq!(aggregate_values(AggOp::Sum2, &[1.0, f64::NAN, 2.0]), 5.0);
+        assert_eq!(aggregate_values(AggOp::Geomean, &[4.0, f64::NAN]), 4.0);
+        assert!(aggregate_values(AggOp::Sum2, &[f64::NAN]).is_nan());
+        assert!(aggregate_values(AggOp::Distinct, &[f64::NAN]).is_nan());
+        // `-0` and `0` are one map key in Go, so `distinct` counts them once.
+        assert_eq!(aggregate_values(AggOp::Distinct, &[0.0, -0.0]), 1.0);
+    }
+
+    #[test]
+    fn test_metricsql_vector_aggregations() {
+        let series = vec![
+            synthetic_labeled("m", &[("instance", "a")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("instance", "b")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("instance", "c")], &[(0, 3.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        // `any` returns one series of the group with its own labels, name kept.
+        assert_eq!(
+            run("any(m)"),
+            vec![(r#"{__name__="m",instance="a"}"#.to_string(), 1.0)]
+        );
+        // `share` divides by the group's non-negative sum (1+2+3 = 6).
+        assert_eq!(
+            run("share(m)"),
+            vec![
+                (r#"{__name__="m",instance="a"}"#.to_string(), 1.0 / 6.0),
+                (r#"{__name__="m",instance="b"}"#.to_string(), 2.0 / 6.0),
+                (r#"{__name__="m",instance="c"}"#.to_string(), 3.0 / 6.0),
+            ]
+        );
+        // `zscore`: avg 2, population stddev sqrt(2/3), so `a` is -sqrt(1.5).
+        let zscore = run("zscore(m)");
+        let stddev = (2.0f64 / 3.0).sqrt();
+        assert_eq!(
+            zscore,
+            vec![
+                (
+                    r#"{__name__="m",instance="a"}"#.to_string(),
+                    (1.0 - 2.0) / stddev
+                ),
+                (r#"{__name__="m",instance="b"}"#.to_string(), 0.0),
+                (
+                    r#"{__name__="m",instance="c"}"#.to_string(),
+                    (3.0 - 2.0) / stddev
+                ),
+            ]
+        );
+        // 1,2,3 has no IQR outlier: q1=1.5, q3=2.5, bounds [0,4].
+        assert!(run("outliers_iqr(m)").is_empty());
+        // A fourth series far away telescopes the bounds and is the outlier.
+        let with_outlier = {
+            let mut series = series.clone();
+            series.push(synthetic_labeled("m", &[("instance", "z")], &[(0, 100.0)]));
+            series
+        };
+        assert_eq!(
+            rendered(&eval_series(with_outlier, "m", "outliers_iqr(m)", 0).vector),
+            vec![(r#"{__name__="m",instance="z"}"#.to_string(), 100.0)]
+        );
+        // `outliers_mad(2, m)`: median 2.5 and MAD 1, so the bound is 2.5 ± 2
+        // and only 100 escapes it.
+        let with_outlier = {
+            let mut series = series.clone();
+            series.push(synthetic_labeled("m", &[("instance", "z")], &[(0, 100.0)]));
+            series
+        };
+        assert_eq!(
+            rendered(&eval_series(with_outlier, "m", "outliers_mad(2, m)", 0).vector),
+            vec![(r#"{__name__="m",instance="z"}"#.to_string(), 100.0)]
+        );
+        // `outliersk(1, m)` picks the series furthest from the median — the
+        // only one with a non-zero distance here.
+        let with_outlier = {
+            let mut series = series.clone();
+            series.push(synthetic_labeled("m", &[("instance", "z")], &[(0, 100.0)]));
+            series
+        };
+        assert_eq!(
+            rendered(&eval_series(with_outlier, "m", "outliersk(1, m)", 0).vector),
+            vec![(r#"{__name__="m",instance="z"}"#.to_string(), 100.0)]
+        );
+        // `limitk` is hash-based, so the assertion is on the count and on the
+        // set being a prefix of the hash order (verified against VM's
+        // `getHash` reference values in `test_metric_name_hash_matches_vm`).
+        let selected = run("limitk(2, m)");
+        assert_eq!(selected.len(), 2);
+        let expected = hash_sorted_prefix(&series, 2);
+        assert_eq!(selected, expected);
+        assert!(run("limitk(0, m)").is_empty());
+    }
+
+    /// The expected `limitk` answer: point labels in xxhash order.
+    fn hash_sorted_prefix(series: &[SeriesSamples], limit: usize) -> Vec<(String, f64)> {
+        let mut hashed: Vec<(u64, String, f64)> = series
+            .iter()
+            .map(|series| {
+                let mut labels = labels_of(series);
+                labels.insert(
+                    "__name__".to_string(),
+                    String::from_utf8_lossy(&series.metric_name).into_owned(),
+                );
+                (
+                    metric_name_hash(&labels),
+                    label_string(&labels),
+                    series.samples[0].value,
+                )
+            })
+            .collect();
+        hashed.sort_by_key(|(hash, _, _)| *hash);
+        let mut out: Vec<(String, f64)> = hashed
+            .into_iter()
+            .take(limit)
+            .map(|(_, labels, value)| (labels, value))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    #[test]
+    fn test_metric_name_hash_matches_vm() {
+        // Reference values from VictoriaMetrics' `getHash` (Go's
+        // `github.com/cespare/xxhash/v2`, seeded with 0): the metric group
+        // followed by each tag's name and value in sorted order.
+        let hash = |name: Option<&str>, labels: &[(&str, &str)]| {
+            let mut set: LabelSet = labels
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            if let Some(name) = name {
+                set.insert("__name__".to_string(), name.to_string());
+            }
+            metric_name_hash(&set)
+        };
+        assert_eq!(hash(None, &[("__name__", "x")]), 6665539201184043299);
+        assert_eq!(hash(Some("m"), &[]), 13415755381228090088);
+        assert_eq!(hash(Some("m"), &[("instance", "a")]), 5953712989859708780);
+        assert_eq!(hash(Some("m"), &[("instance", "b")]), 36738780650153961);
+        assert_eq!(hash(Some("m"), &[("instance", "c")]), 1453846441280961190);
+        assert_eq!(hash(Some("m"), &[("instance", "d")]), 15688669754200327500);
     }
 
     #[test]
