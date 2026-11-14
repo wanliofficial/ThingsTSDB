@@ -247,7 +247,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     （`histogram_quantile` / `histogram_quantiles` / `histogram_fraction` /
     `histogram_share` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
-    count_values`，支持
+    count_values`，以及 MetricsQL 的 `any/sum2/geomean/distinct/median/mode/mad/
+    share/zscore/limitk/outliers_iqr/outliers_mad/outliersk`（见下面单独一条），支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
     并保留分组标签，与 Prometheus 一致。不写 `by`/`without` 时按官方文档「聚合
     全部标签维度」处理，即整个向量并成一条无标签序列（`sum(m)` 只有一个

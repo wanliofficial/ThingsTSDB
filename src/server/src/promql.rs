@@ -33,7 +33,10 @@
 //!   `end()`, `range()`, `step()`, and the generators `time`, `pi`, `vector`,
 //!   plus MetricsQL's `default`;
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
-//!   `stdvar`, `topk`, `bottomk`, `quantile`, with `by` / `without`;
+//!   `stdvar`, `topk`, `bottomk`, `quantile`, plus MetricsQL's `any`, `sum2`,
+//!   `geomean`, `distinct`, `median`, `mode`, `mad`, `share`, `zscore`,
+//!   `limitk`, `outliers_iqr`, `outliers_mad` and `outliersk`, with `by` /
+//!   `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
 //!   scalars or a vector and a scalar, vector matching between two vectors
 //!   (`on` / `ignoring`, `group_left` / `group_right`), and the set operators
