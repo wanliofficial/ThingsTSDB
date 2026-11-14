@@ -248,8 +248,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `histogram_share` 见下面单独几条）
   - **聚合**：`sum/avg/min/max/count/group/stddev/stdvar/topk/bottomk/quantile/
     count_values`，以及 MetricsQL 的 `any/sum2/geomean/distinct/median/mode/mad/
-    share/zscore/limitk/outliers_iqr/outliers_mad/outliersk/quantiles`（见下面
-    单独条目），支持
+    share/zscore/limitk/outliers_iqr/outliers_mad/outliersk/quantiles/histogram`（见
+    下面单独条目），支持
     `by (...)`（前置与后置两种写法）与 `without (...)`；聚合结果去掉 `__name__`
     并保留分组标签，与 Prometheus 一致。不写 `by`/`without` 时按官方文档「聚合
     全部标签维度」处理，即整个向量并成一条无标签序列（`sum(m)` 只有一个
@@ -557,7 +557,30 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：单/多分位、越界分位（`±Inf`）、`by (job)`、同名标签覆盖、
     `%g` 标签值（`100000`→`"100000"`、`1e6`→`"1e+06"`）、NaN 是缺口、
     标量输入、两种分组写法与解析期参数校验。
-
+- 已完成（2026-11-14）：MetricsQL 的 `histogram(v)`（`app/vmselect/promql/aggr.go`
+  的 `aggrFuncHistogram` + `app/vmselect/promql/transform.go` 的
+  `vmrangeBucketsToLE`，原生直方图实现在
+  `github.com/VictoriaMetrics/metrics` 的 `histogram.go`）：
+  - 每个 step 把一组值喂进 VM 的原生直方图：`Update` 丢弃 NaN 与负数，按
+    `(log10(v) + 9) * 18` 定桶（`[1e-9, 1e18)` 上每十进制 18 桶），**恰好是
+    10 的整数幂的值挪到低一档桶**，好让 `le` 保持 Prometheus 的「小于等于」语义；
+    另有下溢桶 `0...1.000e-09` 与上溢桶 `1.000e+18...+Inf`；
+  - 每个非空桶是一条 `vmrange="<start>...<end>"` 序列，桶边界照抄
+    `initBucketRanges`：从 `1e-9` 起**逐次乘** `10^(1/18)`（不是 `powi`，因为
+    后续要把格式化后的字符串再解析成浮点做缺口判定，浮点路径必须一致），两端都走
+    Go 的 `%.3e`（一位整数 + 三位小数 + 两位指数，如 `8.799e-01`）；
+  - 再走 `vmrangeBucketsToLE`：按上界排序、计数为 0 的桶跳过（并入下一个非空桶）、
+    与前一个桶之间有缺口时补一条 `le=<当前桶下界>` 的序列（下溢桶的下界是 `0`，
+    正好等于 VM `xsPrev` 的零值，所以它不补）、同界桶的计数相加、末桶若不到
+    `+Inf` 则追加一条空的 `+Inf`（由最后的累计过程接住总数）；
+  - 最后一遍把计数做成**累计**，即 Prometheus `_bucket` 的形状；
+  - `histogram` 是标准聚合，所以 `by`/`without` 都支持（分组键走 `group_key`，
+    结果不含 `__name__`），分组标签与 `le` 并列；标量被当作一条无标签序列的一条
+    观测；全 NaN/负数的组不产出任何序列（VM 的 `removeEmptySeries` 之后再无桶）；
+  - 测试：`visit` 与 `le` 的输出逐条对照一份 Go 端口（`1,2,3,4` 的 9 条序列、
+    单值、`1,100` 的缺口、`1e-12` 下溢、`1e19` 上溢、`1,10,100,1000` 的 10 的幂
+    语义、NaN/负数被丢弃、全 NaN 为空），桶边界表在两端与 `1e18` 上逐条核对，
+    另测 `histogram(m)`、`histogram by (job) (m)` 与标量输入的分组/标签形状。
 - 已完成（2026-11-14）：MetricsQL 的 `sort_by_label_numeric(v, "label", ...)` /
   `sort_by_label_numeric_desc` 与 `union(v1, v2, ...)`（同属
   `app/vmselect/promql/transform.go`，`newTransformFuncNumericSort` /

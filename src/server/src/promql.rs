@@ -35,8 +35,8 @@
 //! * aggregations — `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`,
 //!   `stdvar`, `topk`, `bottomk`, `quantile`, plus MetricsQL's `any`, `sum2`,
 //!   `geomean`, `distinct`, `median`, `mode`, `mad`, `share`, `zscore`,
-//!   `limitk`, `outliers_iqr`, `outliers_mad` and `outliersk`, with `by` /
-//!   `without`;
+//!   `limitk`, `outliers_iqr`, `outliers_mad`, `outliersk`, `quantiles` and
+//!   `histogram`, with `by` / `without`;
 //! * binary operators — arithmetic and comparison (with `bool`) between two
 //!   scalars or a vector and a scalar, vector matching between two vectors
 //!   (`on` / `ignoring`, `group_left` / `group_right`), and the set operators
@@ -1610,6 +1610,12 @@ pub enum Expr {
     },
     /// `time()` — the evaluation instant in seconds.
     Time,
+    /// MetricsQL `histogram(v)` — a native histogram built from the group's
+    /// values, one output series per non-empty bucket.
+    Histogram {
+        expr: Box<Expr>,
+        grouping: Option<Grouping>,
+    },
     /// `start()` / `end()` / `range()` / `step()` — the query's own time range
     /// and step, as seconds. Prometheus folds them into number literals before
     /// evaluation (`foldQueryContextFunctions`); an instant query has no step,
@@ -1695,6 +1701,7 @@ impl Expr {
                 }
             }
             Expr::HistogramStat { expr, .. } => expr.selectors(out),
+            Expr::Histogram { expr, .. } => expr.selectors(out),
             Expr::Quantiles {
                 expr, quantiles, ..
             } => {
@@ -1856,6 +1863,9 @@ impl Expr {
                 }
             }
             Expr::HistogramStat { expr, .. } => {
+                expr.widen_window(query_start_ms, query_end_ms, start, end)
+            }
+            Expr::Histogram { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
             }
             Expr::Quantiles {
@@ -2382,6 +2392,16 @@ impl Parser {
                     Ok(Expr::Quantiles {
                         label,
                         quantiles,
+                        expr: Box::new(expr),
+                        grouping,
+                    })
+                } else if name == "histogram" && matches!(self.peek(), Some(Token::Ident(_))) {
+                    // The prefix form: `histogram by (job) (v)`.
+                    let grouping = self.grouping()?;
+                    self.expect(Token::LParen)?;
+                    let expr = self.expression(0)?;
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::Histogram {
                         expr: Box::new(expr),
                         grouping,
                     })
@@ -3007,6 +3027,18 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(Expr::Time)
             }
+            // `histogram(v)`: VM builds a native histogram out of the group's
+            // values at each step, so it takes the vector directly. The
+            // grouping modifier may follow the call, like `topk`.
+            "histogram" => {
+                let expr = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                let grouping = self.grouping()?;
+                Ok(Expr::Histogram {
+                    expr: Box::new(expr),
+                    grouping,
+                })
+            }
             "start" | "end" | "range" | "step" => {
                 self.expect(Token::RParen)?;
                 let context = match name {
@@ -3052,7 +3084,7 @@ impl Parser {
                  sort_by_label_desc, sort_by_label_numeric and sort_by_label_numeric_desc, \
                  histogram_quantiles, histogram_fraction, histogram_share, \
                  histogram_avg, \
-                 histogram_stddev, histogram_stdvar, max_of, min_of, union, \
+                 histogram_stddev, histogram_stdvar, histogram, max_of, min_of, union, \
                  the query-context \
                  functions start, end, range, step, and the label functions label_replace, \
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
@@ -3492,6 +3524,20 @@ impl<'a> Evaluator<'a> {
                 bad("a string literal is only valid as the label argument of count_values")
             }
             Expr::Time => Ok(Instant::scalar(at_ms as f64 / 1_000.0)),
+            Expr::Histogram { expr, grouping } => {
+                let instant = self.eval(expr, at_ms)?;
+                let values = if let Some(scalar) = instant.scalar {
+                    let mut vector = Vector::default();
+                    vector.push(BTreeMap::new(), scalar);
+                    vector
+                } else {
+                    instant.vector
+                };
+                Ok(Instant {
+                    vector: histogram_agg(&values, grouping.as_ref()),
+                    scalar: None,
+                })
+            }
             Expr::QueryContext(context) => {
                 // `step()` is only defined for a range query; Prometheus'
                 // `foldQueryContextFunctions` leaves it at 0 for an instant
@@ -6192,6 +6238,258 @@ fn classic_buckets(function: &str, vector: &Vector) -> Result<ClassicHistograms>
         groups.entry(labels).or_default().push((upper, point.value));
     }
     Ok(groups)
+}
+
+/// MetricsQL's `histogram(v)` — a native histogram built from the group's
+/// values, one output series per non-empty bucket.
+///
+/// Follows `aggrFuncHistogram`: per step, every group's values go into a
+/// `metrics.Histogram` (`lib/.../metrics/histogram.go`), each non-zero bucket
+/// becomes one series whose `vmrange` label is `"<start>...<end>"`, and the
+/// series set is then converted to Prometheus-compatible `le` buckets by
+/// `vmrangeBucketsToLE` (cumulative counters, gaps filled with the previous
+/// bucket's count, `+Inf` appended).
+///
+/// The native histogram ignores NaNs and negative values, and files each value
+/// by `(log10(v) + 9) * 18`; a value that is an exact power of ten goes to the
+/// lower bucket so the bounds stay Prometheus-`le`-compatible.
+fn histogram_agg(vector: &Vector, grouping: Option<&Grouping>) -> Vector {
+    // Group like the other aggregations; `group_key` already drops `__name__`.
+    let mut groups: BTreeMap<Vec<(String, String)>, Vec<f64>> = BTreeMap::new();
+    for point in &vector.0 {
+        groups
+            .entry(group_key(&point.labels, grouping))
+            .or_default()
+            .push(point.value);
+    }
+    let mut out = Vector::default();
+    for (key, values) in groups {
+        let mut histogram = VmHistogram::default();
+        for value in values {
+            histogram.update(value);
+        }
+        let labels: LabelSet = key.into_iter().collect();
+        for (le, count) in histogram.to_le_buckets() {
+            let mut labels = labels.clone();
+            labels.insert("le".to_string(), le);
+            out.push(labels, count);
+        }
+    }
+    out
+}
+
+/// VictoriaMetrics' native `metrics.Histogram`: fixed log-decimal buckets over
+/// `[1e-9, 1e18)`, plus an underflow and an overflow counter.
+///
+/// `Update` is `lib/.../metrics/histogram.go`'s: NaN and negative values are
+/// dropped, and the bucket index is `(log10(v) - e10Min) * bucketsPerDecimal`,
+/// with exact powers of ten moved one bucket down.
+#[derive(Debug, Default, Clone)]
+struct VmHistogram {
+    /// Non-zero bucket counters: `(decimal bucket, offset)` → count. A map
+    /// rather than the fixed 27×18 array, because a group only ever fills a
+    /// handful of buckets.
+    buckets: BTreeMap<(usize, usize), u64>,
+    lower: u64,
+    upper: u64,
+}
+
+/// `e10Min` / `e10Max` / `bucketsPerDecimal` from the VM histogram.
+const VM_E10_MIN: i32 = -9;
+const VM_E10_MAX: i32 = 18;
+const VM_BUCKETS_PER_DECIMAL: i32 = 18;
+const VM_DECIMAL_BUCKETS: i32 = VM_E10_MAX - VM_E10_MIN;
+const VM_BUCKETS_COUNT: i32 = VM_DECIMAL_BUCKETS * VM_BUCKETS_PER_DECIMAL;
+
+impl VmHistogram {
+    /// VM's `Histogram.Update`.
+    fn update(&mut self, value: f64) {
+        if value.is_nan() || value < 0.0 {
+            return;
+        }
+        let bucket_index =
+            (value.log10() - f64::from(VM_E10_MIN)) * f64::from(VM_BUCKETS_PER_DECIMAL);
+        if bucket_index < 0.0 {
+            self.lower += 1;
+            return;
+        }
+        if bucket_index >= f64::from(VM_BUCKETS_COUNT) {
+            self.upper += 1;
+            return;
+        }
+        let mut index = bucket_index as usize;
+        if bucket_index == index as f64 && index > 0 {
+            // An exact 10^n belongs to the lower bucket, so that `le` bounds
+            // mean "less or equal" the way Prometheus reads them.
+            index -= 1;
+        }
+        let decimal = index / VM_BUCKETS_PER_DECIMAL as usize;
+        let offset = index % VM_BUCKETS_PER_DECIMAL as usize;
+        *self.buckets.entry((decimal, offset)).or_insert(0) += 1;
+    }
+
+    /// The bucket bounds and counts, in the order `VisitNonZeroBuckets` yields
+    /// them, already converted to Prometheus `le` buckets.
+    fn to_le_buckets(&self) -> Vec<(String, f64)> {
+        // Raw `vmrange` buckets first: underflow, then each non-empty bucket in
+        // index order, then overflow — VM's visit order.
+        let mut ranges: Vec<(String, u64)> = Vec::new();
+        if self.lower > 0 {
+            ranges.push((vm_lower_bucket_range(), self.lower));
+        }
+        for (&(decimal, offset), &count) in &self.buckets {
+            let index = decimal * VM_BUCKETS_PER_DECIMAL as usize + offset;
+            ranges.push((vm_range(index), count));
+        }
+        if self.upper > 0 {
+            ranges.push((vm_upper_bucket_range(), self.upper));
+        }
+        vmrange_buckets_to_le(&ranges)
+    }
+}
+
+/// `vmrangeBucketsToLE`'s core, for one metric's bucket set.
+///
+/// Each `vmrange` is `"<start>...<end>"`; the buckets are sorted by their upper
+/// bound, zero-count buckets are skipped (their range merges into the next
+/// non-zero one), a gap between two buckets is filled with a `le` series at the
+/// current bucket's start, and the counters are finally made cumulative. A
+/// `+Inf` bucket is appended unless the last bucket already ends at `+Inf`.
+///
+/// VM tracks the previous bucket's end starting from `0`, so the underflow
+/// bucket (`"0...1.000e-09"`) does not get a gap filler of its own.
+fn vmrange_buckets_to_le(ranges: &[(String, u64)]) -> Vec<(String, f64)> {
+    struct Bucket {
+        start: f64,
+        end: f64,
+        start_str: String,
+        end_str: String,
+        count: u64,
+    }
+    let mut buckets: Vec<Bucket> = Vec::with_capacity(ranges.len());
+    for (vmrange, count) in ranges {
+        let Some((start_str, end_str)) = vmrange.split_once("...") else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (start_str.parse::<f64>(), end_str.parse::<f64>()) else {
+            continue;
+        };
+        buckets.push(Bucket {
+            start,
+            end,
+            start_str: start_str.to_string(),
+            end_str: end_str.to_string(),
+            count: *count,
+        });
+    }
+    buckets.sort_by(|a, b| a.end.total_cmp(&b.end));
+
+    // Bucket counts in `le`-label order, before the cumulative pass. VM keys
+    // the already-emitted buckets by their bound so a gap filler and a real
+    // bucket sharing a bound collapse into one series.
+    let mut le: Vec<(String, f64)> = Vec::with_capacity(buckets.len() + 2);
+    let mut slots: BTreeMap<String, usize> = BTreeMap::new();
+    let mut prev_end: Option<f64> = Some(0.0);
+    for bucket in &buckets {
+        if bucket.count == 0 {
+            // A zero bucket is merged into the next non-zero one, so it gets no
+            // series of its own.
+            continue;
+        }
+        if prev_end != Some(bucket.start) && !slots.contains_key(&bucket.start_str) {
+            // A gap between the previous bucket and this one: the running
+            // count at this bucket's start is a `le` series of its own. It
+            // contributes no observations, so its entry is zero here.
+            slots.insert(bucket.start_str.clone(), le.len());
+            le.push((bucket.start_str.clone(), 0.0));
+        }
+        let slot = match slots.get(&bucket.end_str) {
+            Some(slot) => *slot,
+            None => {
+                slots.insert(bucket.end_str.clone(), le.len());
+                le.push((bucket.end_str.clone(), 0.0));
+                le.len() - 1
+            }
+        };
+        // A native histogram has one bucket per bound, but a bound can also
+        // have been created by the gap filler above; VM merges the two, and at
+        // a single step merging counts is the only sensible reading.
+        le[slot].1 += bucket.count as f64;
+        prev_end = Some(bucket.end);
+    }
+
+    let ends_at_inf = le.last().map(|(bound, _)| bound == "+Inf").unwrap_or(false);
+    if !le.is_empty() && !ends_at_inf {
+        // The `+Inf` bucket is created empty and picks up the running total
+        // from the cumulative pass below, which is how VM's `copyTS` builds it
+        // (it zeroes the values before returning the series).
+        le.push(("+Inf".to_string(), 0.0));
+    }
+
+    // Prometheus `_bucket` series are cumulative: each `le` holds the count of
+    // observations at or below its bound.
+    let mut running = 0.0;
+    for (_, count) in le.iter_mut() {
+        running += *count;
+        *count = running;
+    }
+    le
+}
+
+/// `fmt.Sprintf("%.3e", 1e-9)`: the lower bound of VM's native histogram.
+fn vm_lower_bucket_range() -> String {
+    format!("0...{}", go_format_e3(1e-9))
+}
+
+/// `fmt.Sprintf("%.3e", 1e18) + "...+Inf"`: the upper bound.
+fn vm_upper_bucket_range() -> String {
+    format!("{}...+Inf", go_format_e3(1e18))
+}
+
+/// The `i`-th bucket's `"<start>...<end>"`, built exactly the way
+/// `initBucketRanges` builds them: start at `1e-9`, multiply by `10^(1/18)`
+/// once per bucket, and format both ends with `%.3e`.
+///
+/// The multiplication is iterative rather than `powi(i)` because the bounds are
+/// compared as parsed floats afterwards, so a different last digit from a
+/// different floating-point path would change the gap detection.
+fn vm_range(index: usize) -> String {
+    let boundaries = vm_bucket_bounds();
+    // `boundaries[i]` is the start of bucket `i`; the table has one extra entry
+    // for the end of the last bucket.
+    format!("{}...{}", boundaries[index], boundaries[index + 1])
+}
+
+/// The formatted bucket boundaries: `bucketsCount + 1` of them, starting at
+/// `1e-9` and multiplying by `10^(1/18)` each step — VM's `initBucketRanges`.
+fn vm_bucket_bounds() -> &'static [String] {
+    static BOUNDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    BOUNDS.get_or_init(|| {
+        let multiplier = 10f64.powf(1.0 / f64::from(VM_BUCKETS_PER_DECIMAL));
+        let mut value = 1e-9f64; // math.Pow10(e10Min)
+        let mut bounds = Vec::with_capacity(VM_BUCKETS_COUNT as usize + 1);
+        bounds.push(go_format_e3(value));
+        for _ in 0..VM_BUCKETS_COUNT {
+            value *= multiplier;
+            bounds.push(go_format_e3(value));
+        }
+        bounds
+    })
+}
+
+/// Go's `fmt.Sprintf("%.3e", value)`: one digit before the point, exactly three
+/// after, and an `e±dd` exponent.
+fn go_format_e3(value: f64) -> String {
+    let scientific = format!("{value:.3e}");
+    // Rust writes `1.000e-9`; Go writes `1.000e-09`.
+    match scientific.split_once('e') {
+        Some((mantissa, exponent)) => {
+            let exponent: i32 = exponent.parse().expect("`{:.3e}` writes an integer");
+            let sign = if exponent < 0 { '-' } else { '+' };
+            format!("{mantissa}e{sign}{:02}", exponent.abs())
+        }
+        None => scientific,
+    }
 }
 
 /// `histogram_fraction(lower, upper, v)` for classic `le` buckets.
@@ -9351,6 +9649,162 @@ mod tests {
     fn test_metricsql_quantiles_parse_errors() {
         assert!(parse_err(r#"quantiles("q", m)"#).contains("at least one quantile"));
         assert!(parse_err(r#"quantiles(0.5, m)"#).contains("needs a quoted string"));
+    }
+
+    /// Reference values from a Go port of VM's `metrics.Histogram` +
+    /// `vmrangeBucketsToLE`, run against the same inputs.
+    fn histogram_le(values: &[f64]) -> Vec<(String, f64)> {
+        let mut histogram = VmHistogram::default();
+        for value in values {
+            histogram.update(*value);
+        }
+        histogram.to_le_buckets()
+    }
+
+    fn le_pairs(pairs: &[(&str, f64)]) -> Vec<(String, f64)> {
+        pairs
+            .iter()
+            .map(|(le, count)| ((*le).to_string(), *count))
+            .collect()
+    }
+
+    #[test]
+    fn test_metricsql_histogram_matches_vm() {
+        // VM's bucket bounds are `%.3e` values from an iterative ×10^(1/18)
+        // walk; each value lands in the bucket whose upper bound is the first
+        // one at or above it, and every bucket adds a gap-filler `le` series at
+        // its own start, so the output has two series per non-empty bucket.
+        assert_eq!(
+            histogram_le(&[1.0, 2.0, 3.0, 4.0]),
+            le_pairs(&[
+                ("8.799e-01", 0.0),
+                ("1.000e+00", 1.0),
+                ("1.896e+00", 1.0),
+                ("2.154e+00", 2.0),
+                ("2.783e+00", 2.0),
+                ("3.162e+00", 3.0),
+                ("3.594e+00", 3.0),
+                ("4.084e+00", 4.0),
+                ("+Inf", 4.0),
+            ])
+        );
+        // A single observation.
+        assert_eq!(
+            histogram_le(&[5.0]),
+            le_pairs(&[("4.642e+00", 0.0), ("5.275e+00", 1.0), ("+Inf", 1.0)])
+        );
+        // A gap between two populated buckets keeps both and stays cumulative.
+        assert_eq!(
+            histogram_le(&[1.0, 100.0]),
+            le_pairs(&[
+                ("8.799e-01", 0.0),
+                ("1.000e+00", 1.0),
+                ("8.799e+01", 1.0),
+                ("1.000e+02", 2.0),
+                ("+Inf", 2.0),
+            ])
+        );
+        // The underflow bucket starts at 0, which is also VM's initial
+        // "previous bucket end", so it grows no gap filler of its own.
+        assert_eq!(
+            histogram_le(&[1e-12]),
+            le_pairs(&[("1.000e-09", 1.0), ("+Inf", 1.0)])
+        );
+        // The overflow bucket's range is already `+Inf`, so no extra bucket is
+        // appended, and its gap filler keeps the `le` series cumulative.
+        assert_eq!(
+            histogram_le(&[1e19]),
+            le_pairs(&[("1.000e+18", 0.0), ("+Inf", 1.0)])
+        );
+        // Exact powers of ten go to the lower bucket: `le=1` counts the 1.
+        assert_eq!(
+            histogram_le(&[1.0, 10.0, 100.0, 1000.0]),
+            le_pairs(&[
+                ("8.799e-01", 0.0),
+                ("1.000e+00", 1.0),
+                ("8.799e+00", 1.0),
+                ("1.000e+01", 2.0),
+                ("8.799e+01", 2.0),
+                ("1.000e+02", 3.0),
+                ("8.799e+02", 3.0),
+                ("1.000e+03", 4.0),
+                ("+Inf", 4.0),
+            ])
+        );
+        // NaNs and negative values are dropped by `Update`.
+        assert_eq!(
+            histogram_le(&[f64::NAN, -5.0, 3.0]),
+            le_pairs(&[("2.783e+00", 0.0), ("3.162e+00", 1.0), ("+Inf", 1.0)])
+        );
+        // An all-NaN/negative group has no buckets at all.
+        assert_eq!(histogram_le(&[f64::NAN, -1.0]), Vec::new());
+    }
+
+    #[test]
+    fn test_metricsql_histogram_bounds_match_vm() {
+        // The formatted bounds that `initBucketRanges` produces, checked at the
+        // edges and at the `1e18` overflow boundary.
+        let bounds = vm_bucket_bounds();
+        assert_eq!(bounds[0], "1.000e-09");
+        assert_eq!(bounds[1], "1.136e-09");
+        assert_eq!(bounds[2], "1.292e-09");
+        assert_eq!(bounds[483], "6.813e+17");
+        assert_eq!(bounds[484], "7.743e+17");
+        assert_eq!(bounds[485], "8.799e+17");
+        assert_eq!(bounds[486], "1.000e+18");
+        assert_eq!(vm_lower_bucket_range(), "0...1.000e-09");
+        assert_eq!(vm_upper_bucket_range(), "1.000e+18...+Inf");
+    }
+
+    #[test]
+    fn test_metricsql_histogram_aggregation() {
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api"), ("i", "1")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "api"), ("i", "2")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("job", "db"), ("i", "3")], &[(0, 100.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        // No grouping: all three values in one histogram. `rendered()`
+        // sorts by the label string, where `+` sorts before the digits.
+        assert_eq!(
+            run("histogram(m)"),
+            vec![
+                ("{le=\"+Inf\"}".to_string(), 3.0),
+                ("{le=\"1.000e+00\"}".to_string(), 1.0),
+                ("{le=\"1.000e+02\"}".to_string(), 3.0),
+                ("{le=\"1.896e+00\"}".to_string(), 1.0),
+                ("{le=\"2.154e+00\"}".to_string(), 2.0),
+                ("{le=\"8.799e+01\"}".to_string(), 2.0),
+                ("{le=\"8.799e-01\"}".to_string(), 0.0),
+            ]
+        );
+        // `by (job)` gives one histogram per job; the grouping label survives
+        // next to `le` and `__name__` is dropped.
+        assert_eq!(
+            run("histogram by (job) (m)"),
+            vec![
+                ("{job=\"api\",le=\"+Inf\"}".to_string(), 2.0),
+                ("{job=\"api\",le=\"1.000e+00\"}".to_string(), 1.0),
+                ("{job=\"api\",le=\"1.896e+00\"}".to_string(), 1.0),
+                ("{job=\"api\",le=\"2.154e+00\"}".to_string(), 2.0),
+                ("{job=\"api\",le=\"8.799e-01\"}".to_string(), 0.0),
+                ("{job=\"db\",le=\"+Inf\"}".to_string(), 1.0),
+                ("{job=\"db\",le=\"1.000e+02\"}".to_string(), 1.0),
+                ("{job=\"db\",le=\"8.799e+01\"}".to_string(), 0.0),
+            ]
+        );
+        // The suffix spelling puts the same histogram out.
+        assert_eq!(run("histogram(m) by (job)"), run("histogram by (job) (m)"));
+        // A scalar is one unlabelled observation.
+        let scalar = eval_series(Vec::new(), "m", "histogram(1)", 0);
+        assert_eq!(
+            rendered(&scalar.vector),
+            vec![
+                ("{le=\"+Inf\"}".to_string(), 1.0),
+                ("{le=\"1.000e+00\"}".to_string(), 1.0),
+                ("{le=\"8.799e-01\"}".to_string(), 0.0),
+            ]
+        );
     }
 
     #[test]
