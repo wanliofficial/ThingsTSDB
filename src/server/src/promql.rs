@@ -1404,6 +1404,34 @@ impl HistogramStatOp {
     }
 }
 
+/// The bitwise operation behind MetricsQL's `bitmap_and` / `bitmap_or` /
+/// `bitmap_xor`, applied per sample between the vector and a scalar mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitmapOp {
+    And,
+    Or,
+    Xor,
+}
+
+impl BitmapOp {
+    fn parse(name: &str) -> Option<BitmapOp> {
+        Some(match name {
+            "bitmap_and" => BitmapOp::And,
+            "bitmap_or" => BitmapOp::Or,
+            "bitmap_xor" => BitmapOp::Xor,
+            _ => return None,
+        })
+    }
+
+    fn apply(self, a: u64, b: u64) -> u64 {
+        match self {
+            BitmapOp::And => a & b,
+            BitmapOp::Or => a | b,
+            BitmapOp::Xor => a ^ b,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(f64),
@@ -1593,6 +1621,17 @@ pub enum Expr {
         limit: Box<Expr>,
         expr: Box<Expr>,
     },
+    /// MetricsQL `bitmap_and(v, mask)` / `bitmap_or(v, mask)` /
+    /// `bitmap_xor(v, mask)` — a per-sample bitwise AND/OR/XOR of the vector's
+    /// values with a scalar mask. Each non-NaN value is truncated to an integer
+    /// (Go's float→uint64 conversion) and combined with the mask; a NaN in
+    /// either operand yields NaN. `__name__` is dropped like the other
+    /// transform functions.
+    Bitmap {
+        op: BitmapOp,
+        mask: Box<Expr>,
+        expr: Box<Expr>,
+    },
     /// MetricsQL's `histogram_avg` / `histogram_stddev` / `histogram_stdvar`
     /// over classic `le` buckets.
     HistogramStat {
@@ -1717,6 +1756,10 @@ impl Expr {
             Expr::Histogram { expr, .. } => expr.selectors(out),
             Expr::BucketsLimit { limit, expr } => {
                 limit.selectors(out);
+                expr.selectors(out);
+            }
+            Expr::Bitmap { mask, expr, .. } => {
+                mask.selectors(out);
                 expr.selectors(out);
             }
             Expr::Quantiles {
@@ -1889,6 +1932,10 @@ impl Expr {
             }
             Expr::BucketsLimit { limit, expr } => {
                 limit.widen_window(query_start_ms, query_end_ms, start, end);
+                expr.widen_window(query_start_ms, query_end_ms, start, end);
+            }
+            Expr::Bitmap { mask, expr, .. } => {
+                mask.widen_window(query_start_ms, query_end_ms, start, end);
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
             }
             Expr::Quantiles {
@@ -2944,6 +2991,21 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            // `bitmap_and(v, mask)` / `bitmap_or` / `bitmap_xor`: VM's
+            // `newTransformBitmap`. A vector and a scalar mask, combined
+            // bitwise per sample.
+            "bitmap_and" | "bitmap_or" | "bitmap_xor" => {
+                let op = BitmapOp::parse(name).expect("name matched above");
+                let expr = self.expression(0)?;
+                self.expect(Token::Comma)?;
+                let mask = self.expression(0)?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Bitmap {
+                    op,
+                    mask: Box::new(mask),
+                    expr: Box::new(expr),
+                })
+            }
             "clamp" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::Comma)?;
@@ -3138,7 +3200,8 @@ impl Parser {
                  sort_by_label_desc, sort_by_label_numeric and sort_by_label_numeric_desc, \
                  histogram_quantiles, histogram_fraction, histogram_share, \
                  histogram_avg, histogram_stddev, histogram_stdvar, histogram, \
-                 buckets_limit, max_of, min_of, union, the query-context \
+                 buckets_limit, bitmap_and, bitmap_or, bitmap_xor, max_of, min_of, union, \
+                 the query-context \
                  functions start, end, range, step, and the label functions label_replace, \
                  label_join, label_set, label_del, label_keep, label_copy, label_move, \
                  label_value, label_map, label_uppercase, label_lowercase, label_transform, \
@@ -3866,6 +3929,17 @@ impl<'a> Evaluator<'a> {
                 let limit = self.scalar_of(limit, at_ms)?;
                 Ok(Instant {
                     vector: buckets_limit(limit, &instant.vector)?,
+                    scalar: None,
+                })
+            }
+            Expr::Bitmap { op, mask, expr } => {
+                let instant = self.eval(expr, at_ms)?;
+                if instant.scalar.is_some() {
+                    return bad("bitmap functions need an instant vector, not a scalar");
+                }
+                let mask = self.scalar_of(mask, at_ms)?;
+                Ok(Instant {
+                    vector: bitmap(op, mask, &instant.vector)?,
                     scalar: None,
                 })
             }
@@ -6385,6 +6459,55 @@ fn buckets_limit(limit_raw: f64, vector: &Vector) -> Result<Vector> {
         }
     }
     Ok(out)
+}
+
+/// MetricsQL's `bitmap_and(v, mask)` / `bitmap_or(v, mask)` / `bitmap_xor(v,
+/// mask)` — a per-sample bitwise AND/OR/XOR of the vector's values with a
+/// scalar mask.
+///
+/// Each non-NaN value is truncated to an integer and combined with the mask;
+/// a NaN in either the value or the mask yields NaN. `__name__` is dropped, the
+/// other labels are kept, matching VM's `doTransformValues`.
+fn bitmap(op: &BitmapOp, mask: f64, vector: &Vector) -> Result<Vector> {
+    let mut out = Vector::default();
+    for point in &vector.0 {
+        let value = if point.value.is_nan() || mask.is_nan() {
+            f64::NAN
+        } else {
+            (op.apply(go_f64_to_u64(point.value), go_f64_to_u64(mask))) as f64
+        };
+        let mut labels = point.labels.clone();
+        labels.remove("__name__");
+        out.push(labels, value);
+    }
+    Ok(out)
+}
+
+/// Go's `uint64(f)` on amd64: truncate toward zero, and for values outside
+/// `[0, 2^64)` yield the "integer indefinite" `0x8000_0000_0000_0000`. Values
+/// in `[2^63, 2^64)` take the unsigned path that adds the high bit back.
+///
+/// Rust's `as` casts saturate (NaN → 0, out of range → 0 or `u64::MAX`), so the
+/// conversion is spelled out to match Go bit-for-bit.
+fn go_f64_to_u64(value: f64) -> u64 {
+    if value.is_nan() || value.is_infinite() {
+        return 0x8000_0000_0000_0000;
+    }
+    let truncated = value.trunc();
+    if truncated >= 0.0 {
+        if truncated < 9223372036854775808.0 {
+            truncated as u64
+        } else if truncated < 18446744073709551616.0 {
+            ((truncated - 9223372036854775808.0) as u64) | 0x8000_0000_0000_0000
+        } else {
+            0x8000_0000_0000_0000
+        }
+    } else if truncated >= -9223372036854775808.0 {
+        // Two's complement reinterpretation of the truncated negative value.
+        (truncated as i64) as u64
+    } else {
+        0x8000_0000_0000_0000
+    }
 }
 
 /// Groups a vector of classic `le` buckets into one histogram per label set.
@@ -10556,6 +10679,88 @@ mod tests {
         assert!(parse_err(r#"buckets_limit("3", latency_bucket)"#).contains("string"));
         // A scalar argument is not a bucket vector and is refused.
         let error = eval_err(synthetic("m", &[(0, 1.0)]), "m", "buckets_limit(3, 3)", 0);
+        assert!(error.contains("not a scalar"));
+    }
+
+    #[test]
+    fn test_bitmap_functions_combine_per_sample() {
+        // Two samples so every output carries its own label set.
+        let series = vec![
+            synthetic_labeled("m", &[("instance", "a")], &[(0, 12.0)]),
+            synthetic_labeled("m", &[("instance", "b")], &[(0, 10.0)]),
+        ];
+        // 12 & 10 = 8, 12 | 10 = 14, 12 ^ 10 = 6.
+        let and = eval_series(series.clone(), "m", "bitmap_and(m, 10)", 0);
+        let or = eval_series(series.clone(), "m", "bitmap_or(m, 10)", 0);
+        let xor = eval_series(series.clone(), "m", "bitmap_xor(m, 10)", 0);
+        let vals = |v: &Instant| {
+            let mut got: Vec<(String, f64)> = v
+                .vector
+                .0
+                .iter()
+                .map(|p| (p.labels["instance"].clone(), p.value))
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            got
+        };
+        assert_eq!(
+            vals(&and),
+            vec![("a".to_string(), 8.0), ("b".to_string(), 10.0)]
+        );
+        assert_eq!(
+            vals(&or),
+            vec![("a".to_string(), 14.0), ("b".to_string(), 10.0)]
+        );
+        assert_eq!(
+            vals(&xor),
+            vec![("a".to_string(), 6.0), ("b".to_string(), 0.0)]
+        );
+        // `__name__` is dropped, the other labels are kept.
+        for point in &and.vector.0 {
+            assert!(!point.labels.contains_key("__name__"));
+            assert!(point.labels.contains_key("instance"));
+        }
+    }
+
+    #[test]
+    fn test_bitmap_functions_match_go_conversion() {
+        // Values outside the exact-integer domain follow Go's uint64(float).
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let run = |value: f64, mask: f64, op: BitmapOp| {
+            let mut vector = Vector::default();
+            vector.push(BTreeMap::new(), value);
+            bitmap(&op, mask, &vector).unwrap()
+        };
+        let first = |v: &Vector| v.0[0].value;
+        // Truncation toward zero: 3.9 & 1 == 3 & 1 == 1.
+        assert_eq!(first(&run(3.9, 1.0, BitmapOp::And)), (3u64 & 1u64) as f64);
+        // NaN in either operand yields NaN.
+        assert!(first(&run(f64::NAN, 1.0, BitmapOp::And)).is_nan());
+        assert!(first(&run(1.0, f64::NAN, BitmapOp::Or)).is_nan());
+        // +Inf converts to Go's indefinite, 0x8000000000000000, so the high bit
+        // is set: +Inf | 1 == 0x8000000000000001.
+        assert!(approx(
+            first(&run(f64::INFINITY, 1.0, BitmapOp::Or)),
+            9223372036854775809.0
+        ));
+        // A negative value wraps two's complement: -5 & 0xff == (2^64 - 5) &
+        // 0xff.
+        assert!(approx(
+            first(&run(-5.0, 255.0, BitmapOp::And)),
+            (18446744073709551611u64 & 255u64) as f64
+        ));
+        // A value in [2^63, 2^64) keeps its low bits after the high-bit add.
+        assert!(approx(
+            first(&run(1.8e19, 1.0, BitmapOp::And)),
+            (18000000000000000000u64 & 1u64) as f64
+        ));
+        // A mask given as a single-sample vector works too.
+        assert_eq!(first(&run(12.0, 10.0, BitmapOp::Xor)), 6.0);
+    }
+
+    #[test]
+    fn test_bitmap_functions_reject_a_scalar() {
+        let error = eval_err(synthetic("m", &[(0, 1.0)]), "m", "bitmap_and(3, 3)", 0);
         assert!(error.contains("not a scalar"));
     }
 

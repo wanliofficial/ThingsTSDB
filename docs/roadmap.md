@@ -461,6 +461,18 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     （6 桶 → `le` 2/4/8）；`limit` 抬到 3、`<= 0` 报错；字符串字面量解析期报错；
     缺 `le` 的序列被跳过、不产出；经求值器端到端保留 `__name__` 与原始 `le` 文本、
     标量输入报错。
+- 已完成（2026-11-14）：MetricsQL 的 `bitmap_and(v, mask)` / `bitmap_or(v, mask)` /
+  `bitmap_xor(v, mask)`（`transform.go` 的 `newTransformBitmap`），逐样本把向量的值
+  与标量掩码做位运算：
+  - 每个非 NaN 值按 Go 的 `uint64(float)` 截断成整数（向零截断，`[2^63, 2^64)`
+    走无符号路径补回高位，越界/NaN/Inf 得「整数不定」`0x8000000000000000`），再与
+    掩码做 `&` / `|` / `^`；值或掩码任一为 NaN 时结果 NaN；
+  - 丢掉 `__name__`、保留其余标签（照抄 VM 的 `doTransformValues`），与 `abs` 等
+    一元变换一致；
+  - `go_f64_to_u64` 逐位复刻 Go amd64 的转换（Rust 的 `as` 会饱和，不能直接照搬）；
+  - 测试：12 &/|/^ 10 == 8/14/6；按 instance 分组独立合并（10 & 10 == 10）；
+    3.9 向零截断为 3；NaN 传播；`+Inf` 得不定值（`+Inf | 1` 置高位）；负数环绕
+    （`-5 & 0xff`）；`[2^63, 2^64)` 保留低位；标量输入报错。
 - 已完成（2026-11-14）：MetricsQL 的阈值 rollup `count_eq|le|gt|ne_over_time` /
   `share_eq|le|gt_over_time` / `sum_eq|le|gt_over_time` 与 `duration_over_time`
   （`app/vmselect/promql/rollup.go` 的 `newRollupFilter` / `newRollupAvgFilter` /
@@ -912,6 +924,20 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `use-start-timestamps` 特性填充的每序列起始时间），本服务没有这条数据通路。
   这三类缺的是**存储/引擎能力**而不是函数实现，硬写只会给出看似成功、实则空或
   伪造的结果。
+- 剩余未实现的 VictoriaMetrics transform 函数（**明确不做**，理由记在这里）：
+  - `now()`：直接返回当前墙钟秒数（`time.Now()`），与本服务固定求值时刻的确定性
+    求值模型相悖，且无法稳定测试；
+  - `rand(seed)` / `rand_normal(seed)` / `rand_exponential(seed)`：结果依赖 Go
+    `math/rand` 的 PRNG 序列，需逐位复刻且该算法跨 step 有状态（每 step 前移一次
+    抽样），与逐 `Instant` 模型冲突；
+  - `timezone_offset(tz)`：按 IANA 时区名返回每样本偏移，需要时区数据库，与本服务
+    「不引入时区库、用纯整数历法」的既定设计冲突；
+  - `range_*` / `running_*` / `keep_last_value` / `keep_next_value` / `interpolate` /
+    `smooth_exponential` / `remove_resets`：都修正**整段序列**（跨 step 才有意义），
+    逐 `Instant` 求值时每个 step 只有一个样本，会退化成恒等或空结果，与已明确不做的
+    跨 step 变换同类。
+  这些要么是 wall-clock / 外部库依赖，要么需要 VM 的整段序列求值模型，本服务的逐
+  `Instant` 架构无法忠实支持。
 
 
   查询路径（索引解析 + 标签重建 + 数据扫描）；legacy 每 metric 的 series-key
