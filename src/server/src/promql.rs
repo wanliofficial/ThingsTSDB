@@ -1549,7 +1549,13 @@ pub enum Expr {
     /// `vector(scalar)` lifts a scalar into a one-sample vector.
     Vector(Box<Expr>),
     /// `scalar(v)` — the sole value of a one-sample vector, NaN otherwise.
-    Scalar(Box<Expr>),
+    ///
+    /// MetricsQL also accepts a string literal (`scalar("1.5")`); `literal`
+    /// carries it so evaluation parses it instead of reading a sample.
+    Scalar {
+        expr: Box<Expr>,
+        literal: Option<String>,
+    },
     /// `clamp(v, min, max)` — both bounds are scalars, and `max < min` yields
     /// an empty result rather than the input.
     Clamp {
@@ -1677,7 +1683,7 @@ impl Expr {
             | Expr::SortByLabel { expr, .. }
             | Expr::Absent(expr)
             | Expr::Vector(expr) => expr.selectors(out),
-            Expr::Scalar(expr) => expr.selectors(out),
+            Expr::Scalar { expr, .. } => expr.selectors(out),
             Expr::Clamp { expr, min, max } => {
                 expr.selectors(out);
                 min.selectors(out);
@@ -1839,7 +1845,9 @@ impl Expr {
             | Expr::SortByLabel { expr, .. }
             | Expr::Absent(expr)
             | Expr::Vector(expr) => expr.widen_window(query_start_ms, query_end_ms, start, end),
-            Expr::Scalar(expr) => expr.widen_window(query_start_ms, query_end_ms, start, end),
+            Expr::Scalar { expr, .. } => {
+                expr.widen_window(query_start_ms, query_end_ms, start, end)
+            }
             Expr::Clamp { expr, min, max } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end);
                 min.widen_window(query_start_ms, query_end_ms, start, end);
@@ -2943,9 +2951,25 @@ impl Parser {
                 })
             }
             "scalar" => {
-                let expr = self.expression(0)?;
+                // VM's transformScalar accepts a string literal and parses it
+                // as a float ("1.5" -> 1.5, anything else unparseable -> NaN),
+                // which Prometheus refuses. Track that case so evaluation can
+                // parse the literal directly without reading a sample.
+                // `expression()` rejects a bare string, so take the literal
+                // here before falling back to an ordinary argument.
+                let (expr, literal) = match self.peek() {
+                    Some(Token::Str(text)) => {
+                        let text = text.clone();
+                        self.next();
+                        (Expr::Str(text.clone()), Some(text))
+                    }
+                    _ => (self.expression(0)?, None),
+                };
                 self.expect(Token::RParen)?;
-                Ok(Expr::Scalar(Box::new(expr)))
+                Ok(Expr::Scalar {
+                    expr: Box::new(expr),
+                    literal,
+                })
             }
             "sort" | "sort_desc" => {
                 let expr = self.expression(0)?;
@@ -3710,7 +3734,12 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 })
             }
-            Expr::Scalar(expr) => {
+            Expr::Scalar { expr, literal } => {
+                // VM's `scalar("1.5")` parses the literal, answering NaN when
+                // it is not a number; a non-literal argument reads the sample.
+                if let Some(text) = literal {
+                    return Ok(Instant::scalar(text.parse::<f64>().unwrap_or(f64::NAN)));
+                }
                 let instant = self.eval(expr, at_ms)?;
                 // Prometheus returns NaN unless exactly one float sample is
                 // present; a scalar argument is already such a sample.
@@ -8892,6 +8921,30 @@ mod tests {
         // A scalar argument is already a single sample.
         assert_eq!(
             eval_series(Vec::new(), "m", "scalar(3)", 0).scalar,
+            Some(3.0)
+        );
+        // MetricsQL's `scalar()` parses a string literal as a float and
+        // answers NaN when the text is not a number; Prometheus refuses the
+        // string outright.
+        assert_eq!(
+            eval_series(Vec::new(), "m", r#"scalar("1.5")"#, 0).scalar,
+            Some(1.5)
+        );
+        assert_eq!(
+            eval_series(Vec::new(), "m", r#"scalar("1e3")"#, 0).scalar,
+            Some(1000.0)
+        );
+        // An overflowing exponent answers +Inf, still without an error.
+        assert_eq!(
+            eval_series(Vec::new(), "m", r#"scalar("1e400")"#, 0).scalar,
+            Some(f64::INFINITY)
+        );
+        assert!(eval_series(Vec::new(), "m", r#"scalar("abc")"#, 0)
+            .scalar
+            .unwrap()
+            .is_nan());
+        assert_eq!(
+            eval_series(Vec::new(), "m", r#"scalar("3")"#, 0).scalar,
             Some(3.0)
         );
     }

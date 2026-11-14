@@ -671,7 +671,9 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     即 NaN 会传播，不会被钳成边界（Rust 的 `f64::min/max` 会忽略 NaN，因此
     `clamp` / `clamp_min` / `clamp_max` 统一改用 `go_min` / `go_max`）；
   - `scalar(v)`：恰好 1 个浮点样本时返回该值，0 个或多个返回 `NaN`，结果是
-    `resultType=scalar`；
+    `resultType=scalar`；MetricsQL 还额外接受**字符串字面量**，按 Go 的
+    `strconv.ParseFloat` 解析为浮点数（`"1e3"`→1000、`"1e400"`→`+Inf`），
+    无法解析时返回 `NaN` 而非报错，而 Prometheus 会直接拒绝该形式；
   - `deriv(v[range])`：最小二乘斜率（单位「每秒」），与 `predict_linear` 共用
     同一份 `linear_regression`。样本少于 2 个时该序列不出现；全等序列的斜率是
     精确的 0（避免浮点噪声），全为 Infinity 时按 Prometheus 返回 NaN；
@@ -688,7 +690,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     (0.5, m)` 也支持），缺参数在解析期报错；`aggr_over_time` 仍拒绝它并提示改用
     `quantile_over_time`。
   - 测试：`clamp` 的上下界/`max<min` 空结果/NaN 传播；`scalar` 的 1 个、0 个、
-    多个样本与标量参数；`deriv` 的斜率、常量序列、单样本消失以及与
+    多个样本与标量参数，以及 MetricsQL 的字符串字面量形式
+    （`"1.5"`/`"1e3"`/`"abc"`/`"3"`）；`deriv` 的斜率、常量序列、单样本消失以及与
     `predict_linear` 的斜率一致；日期函数在闰日 2024-02-29T13:45:00Z 上的
     全部分量与 `year()` 的求值时刻语义；`quantile` 的插值、分组、越界与 NaN；
     解析测试覆盖全部新函数。
