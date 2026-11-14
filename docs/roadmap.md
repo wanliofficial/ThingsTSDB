@@ -691,7 +691,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `quantile_over_time`。
   - 测试：`clamp` 的上下界/`max<min` 空结果/NaN 传播；`scalar` 的 1 个、0 个、
     多个样本与标量参数，以及 MetricsQL 的字符串字面量形式
-    （`"1.5"`/`"1e3"`/`"1e400"`/`"abc"`/`"3"`）；`deriv` 的斜率、常量序列、单样本消失以及与
+    （`"1.5"`/`"1e3"`/`"1e400"`/`"abc"`/`"3"`）；`deriv` 的斜率、常量序列、
+    单样本消失以及与
     `predict_linear` 的斜率一致；日期函数在闰日 2024-02-29T13:45:00Z 上的
     全部分量与 `year()` 的求值时刻语义；`quantile` 的插值、分组、越界与 NaN；
     解析测试覆盖全部新函数。
