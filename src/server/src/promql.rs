@@ -6971,6 +6971,26 @@ fn bucket_stat(op: HistogramStatOp, buckets: &[(f64, f64)]) -> f64 {
     }
 }
 
+/// The relative tolerance Prometheus' `histogram_quantile` uses when deciding
+/// that two adjacent bucket counts differ only by float-precision noise and so
+/// should be treated as equal (`smallDeltaTolerance` in `promql/quantile.go`).
+const SMALL_DELTA_TOLERANCE: f64 = 1e-12;
+
+/// Prometheus' `almost.Equal` (`prometheus/common/math.RelativelyEqual`):
+/// true when `a` and `b` are within `tolerance` of the larger of their
+/// magnitudes. NaN is never equal to anything; infinities are equal only to
+/// themselves.
+fn relatively_equal(a: f64, b: f64, tolerance: f64) -> bool {
+    if a.is_nan() || b.is_nan() {
+        return false;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return a == b;
+    }
+    let delta = (a - b).abs();
+    delta <= (tolerance * a.abs()).max(tolerance * b.abs())
+}
+
 /// Prometheus' `BucketQuantile` for classic histograms.
 ///
 /// Buckets are sorted by upper bound, buckets sharing a bound are coalesced
@@ -7010,13 +7030,25 @@ fn bucket_quantile(quantile: f64, buckets: &mut [(f64, f64)]) -> f64 {
             _ => merged.push((upper, count)),
         }
     }
+    // Prometheus' `ensureMonotonicAndIgnoreSmallDeltas`: force the cumulative
+    // counts non-decreasing, but first absorb tiny relative differences
+    // (float-precision artefacts, relative tolerance 1e-12) by treating the two
+    // counts as equal. A corrected bucket does not advance `previous`, so a
+    // later real increase still measures against the last *uncorrected* value.
     let mut previous = merged[0].1;
     for entry in merged.iter_mut().skip(1) {
+        if entry.1 == previous {
+            continue;
+        }
+        if relatively_equal(previous, entry.1, SMALL_DELTA_TOLERANCE) {
+            entry.1 = previous;
+            continue;
+        }
         if entry.1 < previous {
             entry.1 = previous;
-        } else {
-            previous = entry.1;
+            continue;
         }
+        previous = entry.1;
     }
     if merged.len() < 2 {
         return f64::NAN;
@@ -10984,6 +11016,42 @@ mod tests {
         assert!(approx(bucket_quantile(0.5, &mut duplicate), 0.5));
         let mut decreasing = vec![(0.1, 5.0), (0.5, 3.0), (f64::INFINITY, 5.0)];
         assert!(approx(bucket_quantile(0.5, &mut decreasing), 0.05));
+    }
+
+    #[test]
+    fn test_histogram_quantile_ignores_small_delta_artifacts() {
+        // Prometheus' `ensureMonotonicAndIgnoreSmallDeltas` absorbs relative
+        // differences below 1e-12 as float noise *without advancing the
+        // reference count, so a later real increase is measured against the
+        // last clean value. A large-magnitude bucket makes the relative
+        // tolerance bite: a delta of 1 on 1e12 is relatively 1e-12.
+        let approx = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        // 1e12 observations up to 0.1, then 1e12 + 1 up to 0.5 and +Inf.
+        // The +1 is relatively ~1e-12, so it is treated as equal to 1e12 and
+        // `previous` stays at 1e12 rather than creeping up to 1e12 + 1.
+        let buckets = vec![(0.1, 1e12), (0.5, 1e12 + 1.0), (f64::INFINITY, 1e12 + 2.0)];
+        // Median: rank 0.5 * (1e12 + 2) ~ 5e11, which is below the first
+        // bucket's 1e12, so the answer interpolates from 0 to 0.1. The exact
+        // value depends on `previous` not being corrupted by the +1 artefact.
+        let q = bucket_quantile(0.5, &mut buckets.clone());
+        assert!(q.is_finite(), "got {q}");
+        // The three counts collapse to two effective levels (1e12, 1e12+2):
+        // the +1 bucket is noise. rank/(count) uses 1e12 as the base for the
+        // 0.1 bucket, giving 0.1 * (5e11 / 1e12) = 0.05.
+        assert!(approx(q, 0.05), "got {q}");
+
+        // A decrease larger than the tolerance is still clamped, not absorbed.
+        let mut clamped = vec![(0.1, 1e12), (0.5, 1e12 - 1e6), (f64::INFINITY, 1e12)];
+        assert!(approx(bucket_quantile(0.5, &mut clamped), 0.05));
+
+        // `relatively_equal` mirrors prometheus/common's RelativelyEqual.
+        assert!(relatively_equal(1e12, 1e12 + 1.0, 1e-12));
+        assert!(!relatively_equal(1e12, 1e12 + 1e3, 1e-12));
+        assert!(relatively_equal(0.0, 0.0, 1e-12));
+        assert!(!relatively_equal(0.0, 1e-13, 1e-12));
+        assert!(!relatively_equal(f64::NAN, f64::NAN, 1e-12));
+        assert!(relatively_equal(f64::INFINITY, f64::INFINITY, 1e-12));
+        assert!(!relatively_equal(f64::INFINITY, 1.0, 1e-12));
     }
 
     #[test]

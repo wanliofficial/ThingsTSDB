@@ -655,10 +655,15 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     有限桶的上界，不假装知道分布的尾巴；
   - `q` 为 NaN / <0 / >1 分别返回 `NaN` / `-Inf` / `+Inf`；桶不足两个、缺 `+Inf` 桶、
     观测数为 0 返回 `NaN`——这些都是 Prometheus 的既有语义，照抄而不是另造一个数；
+  - 单调性修正按 Prometheus 的 `ensureMonotonicAndIgnoreSmallDeltas`：先把相邻桶计数
+    相对差 < 1e-12 的浮点噪声**吸收**成相等（`relatively_equal`，即 `prometheus/common`
+    的 `RelativelyEqual`），被修正的桶**不推进**参考计数，后续真实增长仍以上一个干净
+    值为基准；超过容差的下降才强制钳平；
   - 结果只保留分组标签（去掉 `le` 与 `__name__`）；每条序列都必须带可解析的 `le`，
     否则按该序列的标签报 `bad_data`：面板漏写 `sum by (le)` 或误传 `_sum`/`_count`
     时会看到原因，而不是一张空图。
-  - 测试：`bucket_quantile` 的插值/`+Inf`/NaN 分支、重复边界与递减计数的修正、
+  - 测试：`bucket_quantile` 的插值/`+Inf`/NaN 分支、重复边界、递减计数的钳平、
+    相对噪声 <1e-12 的吸收（`relatively_equal` 及「不推进参考计数」行为）、
     按标签分组与标签裁剪、缺 `le` 的报错；端到端（actix 路由 + 真实引擎）写入
     1/2/3/4 四个桶后断言 `histogram_quantile(0.5, http_latency_bucket)` 是单条
     无标签的 `0.5`，缺 `le` 的 `histogram_quantile(0.5, http_requests)` 返回 400。
