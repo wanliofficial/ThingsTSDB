@@ -1606,9 +1606,10 @@ pub enum Expr {
         bounds: Option<String>,
         expr: Box<Expr>,
     },
-    /// `histogram_quantiles(v, "label", q1, q2, ...)` — one series per
+    /// `histogram_quantiles("label", q1, q2, ..., v)` — one series per
     /// quantile per classic histogram, with the quantile written into the
-    /// given label.
+    /// given label. The label is the first argument and the buckets series the
+    /// last, matching MetricsQL.
     HistogramQuantiles {
         expr: Box<Expr>,
         label: String,
@@ -2947,33 +2948,37 @@ impl Parser {
                 })
             }
             "histogram_quantiles" => {
-                let expr = self.expression(0)?;
-                self.expect(Token::Comma)?;
+                // VM's signature is histogram_quantiles("phiLabel", phi1, ...,
+                // phiN, buckets): the label is the first argument, the buckets
+                // series the last, and the quantiles fill the middle.
                 let label = self.string_argument(name)?;
                 validate_label_name(&label, name)?;
-                let mut quantiles = Vec::new();
-                while self.eat(&Token::Comma) {
-                    quantiles.push(self.expression(0)?);
+                self.expect(Token::Comma)?;
+                // Read the remaining comma-separated expressions; the last is
+                // the buckets series, everything before it a quantile.
+                let mut rest = Vec::new();
+                loop {
+                    rest.push(self.expression(0)?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
                 }
                 self.expect(Token::RParen)?;
-                // Prometheus takes `vector, string` plus at least one variadic
-                // scalar and allows nine more (`ArgTypes` has four entries,
-                // `Variadic` is 9), so one to ten quantiles.
-                if quantiles.is_empty() {
-                    return bad(
-                        "histogram_quantiles needs at least one quantile after the label name",
-                    );
+                if rest.len() < 2 {
+                    return bad("histogram_quantiles needs at least one quantile before \
+                         the buckets series");
                 }
-                if quantiles.len() > 10 {
+                let buckets = rest.pop().expect("checked above");
+                if rest.len() > 10 {
                     return bad(format!(
                         "histogram_quantiles takes at most ten quantiles, got {}",
-                        quantiles.len()
+                        rest.len()
                     ));
                 }
                 Ok(Expr::HistogramQuantiles {
-                    expr: Box::new(expr),
+                    expr: Box::new(buckets),
                     label,
-                    quantiles,
+                    quantiles: rest,
                 })
             }
             // `buckets_limit(limit, v)`: VM's `transformBucketsLimit`. `limit`
@@ -6318,7 +6323,7 @@ fn histogram_quantile(quantile: f64, vector: &Vector) -> Result<Vector> {
     Ok(out)
 }
 
-/// `histogram_quantiles(v, "label", q1, q2, ...)` for classic `le` buckets.
+/// `histogram_quantiles("label", q1, q2, ..., v)` for classic `le` buckets.
 ///
 /// One series per quantile per histogram, with the quantile rendered by Go's
 /// `%g` (via `format_g_percent`) into `label`. `__name__` is dropped and the
@@ -7948,7 +7953,7 @@ mod tests {
             r#"rate(http_requests{job="api"}[5m] offset 1h)"#,
             "sort_desc(http_requests)",
             "histogram_quantile(0.9, http_latency_bucket)",
-            "histogram_quantiles(http_latency_bucket, \"quantile\", 0.5, 0.9)",
+            "histogram_quantiles(\"quantile\", 0.5, 0.9, http_latency_bucket)",
             "histogram_quantile(0.5, sum by (le) (rate(http_latency_bucket[5m])))",
             "absent(http_requests)",
             "vector(1)",
@@ -11225,7 +11230,7 @@ mod tests {
         let instant = eval_series(
             series,
             "latency_bucket",
-            "histogram_quantiles(latency_bucket, \"quantile\", 0.5, 1)",
+            "histogram_quantiles(\"quantile\", 0.5, 1, latency_bucket)",
             0,
         );
         assert_eq!(
@@ -11237,31 +11242,69 @@ mod tests {
         );
         // Bad arguments: no quantile, too many quantiles, an invalid label
         // name, and a scalar input.
-        assert!(parse_err("histogram_quantiles(latency_bucket, \"q\")")
+        assert!(parse_err("histogram_quantiles(\"q\", latency_bucket)")
             .contains("at least one quantile"));
         let too_many = format!(
-            "histogram_quantiles(latency_bucket, \"q\", {})",
+            "histogram_quantiles(\"q\", {}, latency_bucket)",
             "0.5, ".repeat(10) + "0.5"
         );
         assert!(parse_err(&too_many).contains("at most ten quantiles"));
         assert!(
-            parse_err("histogram_quantiles(latency_bucket, \"q x\", 0.5)")
+            parse_err("histogram_quantiles(\"q x\", 0.5, latency_bucket)")
                 .contains("invalid label name")
         );
         let error = eval_err(
             synthetic("latency_bucket", &[(0, 1.0)]),
             "latency_bucket",
-            "histogram_quantiles(latency_bucket, \"q\", 0.5)",
+            "histogram_quantiles(\"q\", 0.5, latency_bucket)",
             0,
         );
         assert!(error.contains("needs a `le` label"));
         let error = eval_err(
             synthetic("m", &[(0, 1.0)]),
             "m",
-            "histogram_quantiles(1, \"q\", 0.5)",
+            "histogram_quantiles(\"q\", 0.5, 1)",
             0,
         );
         assert!(error.contains("not a scalar"));
+    }
+
+    #[test]
+    fn test_histogram_quantiles_argument_order_matches_vm() {
+        // MetricsQL's signature is histogram_quantiles("phiLabel", phi1, ...,
+        // phiN, buckets): the label is FIRST and the buckets series LAST. A
+        // query written the other way round (buckets first) is a parse error,
+        // exactly as VM's getString(args[0]) rejects a non-string first arg.
+        let series = vec![
+            synthetic_labeled("latency_bucket", &[("le", "0.1")], &[(0, 2.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "0.5")], &[(0, 4.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "1")], &[(0, 6.0)]),
+            synthetic_labeled("latency_bucket", &[("le", "+Inf")], &[(0, 8.0)]),
+        ];
+        // The canonical VM order evaluates to one series per quantile.
+        let out = eval_series(
+            series,
+            "latency_bucket",
+            "histogram_quantiles(\"quantile\", 0.5, 0.9, latency_bucket)",
+            0,
+        );
+        assert_eq!(
+            rendered(&out.vector),
+            vec![
+                ("{quantile=\"0.5\"}".to_string(), 0.5),
+                ("{quantile=\"0.9\"}".to_string(), 1.0),
+            ]
+        );
+        // Buckets-first is rejected: the first argument must be the string
+        // label, not a metric selector.
+        assert!(
+            parse_err("histogram_quantiles(latency_bucket, \"quantile\", 0.5)")
+                .contains("needs a quoted string")
+        );
+        // A missing label (only quantiles + buckets) is rejected too.
+        assert!(
+            parse_err("histogram_quantiles(0.5, latency_bucket)").contains("needs a quoted string")
+        );
     }
 
     #[test]

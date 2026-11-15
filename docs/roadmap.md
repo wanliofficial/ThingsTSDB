@@ -907,10 +907,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     「instant vector, got scalar」。
   - 测试：区间查询下四个值（100/160/60/15）、算术与 `max_of` 组合、即时查询下
     `step()`/`range()` 为 0、`start()[5m:1m]` 报错，并加入支持表达式清单。
-- 已完成（2026-11-13，2026-11-15 修正分位数标签格式）：`histogram_quantiles(v,
-  "label", q1, q2, ...)`（经典 `le` 桶）。照抄 `transformHistogramQuantiles` 的
-  经典直方图分支：对每个分位数、每个直方图各输出一条序列，值是该分位数的
-  `BucketQuantile`（与 `histogram_quantile` 完全同一份实现）。
+- 已完成（2026-11-13；2026-11-15 修正分位数标签格式与**参数顺序**）：
+  `histogram_quantiles("label", q1, ..., qN, v)`（经典 `le` 桶）。照抄
+  `transformHistogramQuantiles` 的经典直方图分支：对每个分位数、每个直方图各
+  输出一条序列，值是该分位数的 `BucketQuantile`（与 `histogram_quantile` 完全同一份
+  实现）。**参数顺序**对齐 MetricsQL：标签在**第一个**参数、分位数在中间、桶
+  序列在**最后一个**（VM 的 `getString(args[0])` 取标签、`args[len-1]` 取桶）；
+  早先误写成 `(v, "label", q1...)` 会让 VM 语法的查询解析失败，已改正。
 - **分位数标签用 Go 的 `%g`**（`format_g_percent`）：`histogram_quantiles` 是
   MetricsQL 函数，VM 用 `fmt.Sprintf("%g", phi)` 渲染标签，**不是** Prometheus 的
   OpenMetrics `FormatOpenMetricsFloat`——两者都基于 `strconv.FormatFloat(f,'g',-1,64)`，
@@ -929,8 +932,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     略去）。
   - 测试：`format_g_percent` 按 Go 实测值逐条对照（`1`/`0`/`-0`→`"-0"`/`-1`/`NaN`/
     `±Inf`、常见分位数、`100000`/`999999`/`1e+06`/`1.234567e+06`/`1e-05`/`1e-07`/
-    `1e+21`/`1.2345678901234569e+23`）；`histogram_quantiles` 对 2/4/6/8 桶给出中位数 0.5、
-    q=0.9 落到最后一个有限桶上界 1、q=1 标签为 `"1"` 且值为 1.0；越界与 NaN 分位数照样各出一条
+    `1e+21`/`1.2345678901234569e+23`）；`histogram_quantiles` 参数顺序为
+    `("label", q..., v)`，桶在前（旧写法）被解析器报「needs a quoted string」；
+    对 2/4/6/8 桶给出中位数 0.5、q=0.9 落到最后一个有限桶上界 1、q=1 标签为 `"1"`
+    且值为 1.0；越界与 NaN 分位数照样各出一条
     `-Inf`/`+Inf`/`NaN`，标签是**请求的分位数**（`"-0.5"`/`"1.5"`/`"NaN"`）而不是
     结果值；同名标签被覆盖；经求值器
     端到端丢弃 `__name__`；缺 `le`、标量输入、零个分位数、11 个分位数、非法标签名
