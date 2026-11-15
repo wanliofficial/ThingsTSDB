@@ -7539,11 +7539,13 @@ fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
             }
         }
         MathFunc::Round => {
-            if to_nearest == 0.0 {
-                value
-            } else {
-                (value / to_nearest).round() * to_nearest
-            }
+            // Prometheus' funcRound: round half up via `floor(f*n + 0.5)/n`
+            // where `n = 1/toNearest`. This differs from a plain "round half
+            // away from zero": for negatives `round(-2.5)` is -2 (not -3), and
+            // `toNearest = 0` yields NaN (1/0 = +Inf propagates), not the
+            // input.
+            let to_nearest_inverse = 1.0 / to_nearest;
+            (value * to_nearest_inverse + 0.5).floor() / to_nearest_inverse
         }
         MathFunc::Sin => value.sin(),
         MathFunc::Cos => value.cos(),
@@ -9271,6 +9273,37 @@ mod tests {
         // NaN instead of becoming a bound.
         let nan = synthetic("m", &[(0, f64::NAN)]);
         assert!(eval_synthetic(nan, "m", "clamp(m, 1, 9)", 0)[0].1.is_nan());
+    }
+
+    #[test]
+    fn test_round_matches_prometheus_half_up() {
+        // Prometheus' funcRound rounds half up (`floor(f*n + 0.5)/n`, n =
+        // 1/toNearest), which for negatives ties toward +Inf (-2.5 -> -2), not
+        // away from zero, and makes toNearest = 0 answer NaN rather than the
+        // input.
+        let series = synthetic_labeled("m", &[("v", "x")], &[(0, 1.0)]);
+        let run = |query: &str| eval_synthetic(series.clone(), "m", query, 0)[0].1;
+        // Round half up, positive and negative ties.
+        assert_eq!(run("round(m)"), 1.0);
+        assert_eq!(run("round(2.5)"), 3.0);
+        assert_eq!(run("round(-2.5)"), -2.0);
+        assert_eq!(run("round(-0.5)"), 0.0);
+        assert_eq!(run("round(-0.6)"), -1.0);
+        assert_eq!(run("round(3.7)"), 4.0);
+        assert_eq!(run("round(-3.7)"), -4.0);
+        // Explicit toNearest.
+        assert_eq!(run("round(m, 2)"), 2.0);
+        assert_eq!(run("round(25, 10)"), 30.0);
+        assert_eq!(run("round(35, 10)"), 40.0);
+        assert_eq!(run("round(2.45, 1)"), 2.0);
+        assert_eq!(run("round(2.5, 0.1)"), 2.5);
+        // toNearest = 0 yields NaN, matching Prometheus (1/0 = +Inf
+        // propagation).
+        assert!(run("round(m, 0)").is_nan());
+        assert!(run("round(5, 0)").is_nan());
+        // NaN value propagates.
+        let nan = synthetic_labeled("m", &[("v", "x")], &[(0, f64::NAN)]);
+        assert!(eval_synthetic(nan, "m", "round(m)", 0)[0].1.is_nan());
     }
 
     #[test]

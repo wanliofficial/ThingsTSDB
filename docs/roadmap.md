@@ -717,6 +717,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `max < min` 返回**空向量**（不是原值）。NaN 走 Go `math.Min/Max` 的语义，
     即 NaN 会传播，不会被钳成边界（Rust 的 `f64::min/max` 会忽略 NaN，因此
     `clamp` / `clamp_min` / `clamp_max` 统一改用 `go_min` / `go_max`）；
+  - `round(v[, to_nearest])`：按 Prometheus `funcRound` 的**半向上**（向 +∞）取整，
+    即 `floor(f*n + 0.5)/n`（`n = 1/to_nearest`），而非「半远离零」——所以
+    `round(-2.5) = -2`（不是 `-3`）、`round(-0.5) = 0`；`to_nearest = 0` 时按
+    Prometheus 返回 `NaN`（`1/0 = +Inf` 传播），而不是原值；
   - `scalar(v)`：恰好 1 个浮点样本时返回该值，0 个或多个返回 `NaN`，结果是
     `resultType=scalar`；MetricsQL 还额外接受**字符串字面量**，按 Go 的
     `strconv.ParseFloat` 解析为浮点数（`"1e3"`→1000、`"1e400"`→`+Inf`），
@@ -742,6 +746,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     单样本消失以及与
     `predict_linear` 的斜率一致；日期函数在闰日 2024-02-29T13:45:00Z 上的
     全部分量与 `year()` 的求值时刻语义；`quantile` 的插值、分组、越界与 NaN；
+    `round` 的半向上（`round(-2.5) = -2`）、`to_nearest = 0` 得 NaN；
     解析测试覆盖全部新函数。
 - 已完成（2026-11-12）：`present_over_time` 与 `mad_over_time`（PromQL 区间函数）。
   - `present_over_time(v[range])`：区间内只要有一条样本就返回 `1`（值本身不参与，
