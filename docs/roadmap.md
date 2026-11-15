@@ -727,7 +727,9 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     无法解析时返回 `NaN` 而非报错，而 Prometheus 会直接拒绝该形式；
   - `deriv(v[range])`：最小二乘斜率（单位「每秒」），与 `predict_linear` 共用
     同一份 `linear_regression`。样本少于 2 个时该序列不出现；全等序列的斜率是
-    精确的 0（避免浮点噪声），全为 Infinity 时按 Prometheus 返回 NaN；
+    精确的 0（避免浮点噪声），全为 Infinity 时按 Prometheus 返回 NaN。四个和
+    （`sumX/sumY/sumXY/sumX2`）用 Prometheus 同款 Kahan（Neumaier）累加，长区间
+    不再丢失朴素 `+=` 会损失的精度（500 样本 1e8 基线时斜率差 ~4e-11）；
   - 日期函数 `day_of_month` / `day_of_week` / `day_of_year` / `days_in_month` /
     `hour` / `minute` / `month` / `year`：参数可选。有参数时把每个样本的
     **值**当作 Unix 秒（UTC，向下取整后计算，样本自身的时间戳不参与）；无参数

@@ -6055,13 +6055,21 @@ fn linear_regression(samples: &[SamplePoint], origin_ms: i64) -> (f64, f64) {
     let mut sum_y = 0.0;
     let mut sum_xy = 0.0;
     let mut sum_x2 = 0.0;
+    // Prometheus accumulates through `kahansum.Inc`, so a long range vector
+    // keeps the precision a naive `+=` would lose. The compensation terms are
+    // folded into the sums afterwards, exactly as `linearRegression` does.
+    let (mut c_x, mut c_y, mut c_xy, mut c_x2) = (0.0, 0.0, 0.0, 0.0);
     for sample in samples {
         let x = (sample.timestamp - origin_ms) as f64 / 1_000.0;
-        sum_x += x;
-        sum_y += sample.value;
-        sum_xy += x * sample.value;
-        sum_x2 += x * x;
+        (sum_x, c_x) = kahan_inc(x, sum_x, c_x);
+        (sum_y, c_y) = kahan_inc(sample.value, sum_y, c_y);
+        (sum_xy, c_xy) = kahan_inc(x * sample.value, sum_xy, c_xy);
+        (sum_x2, c_x2) = kahan_inc(x * x, sum_x2, c_x2);
     }
+    sum_x += c_x;
+    sum_y += c_y;
+    sum_xy += c_xy;
+    sum_x2 += c_x2;
     let cov_xy = sum_xy - sum_x * sum_y / n;
     let var_x = sum_x2 - sum_x * sum_x / n;
     let slope = if var_x == 0.0 { 0.0 } else { cov_xy / var_x };
@@ -9407,6 +9415,34 @@ mod tests {
     }
 
     #[test]
+    fn test_linear_regression_uses_kahan_summation() {
+        // 500 samples stressing cancellation: values near 1e8 with a 1e-3/s
+        // trend plus alternating 1e-4 noise. Naive `+=` loses precision here;
+        // Prometheus accumulates through kahansum, so the fit matches the
+        // Kahan ground truth (cross-checked against a Go port of
+        // linearRegression) rather than the naive result, which differs by
+        // ~4e-11 on the slope and ~1.3e-7 on the intercept.
+        let mut samples = Vec::with_capacity(500);
+        for i in 0..500i64 {
+            let t = i * 15_000;
+            let noise = if i % 2 == 0 { 1e-4 } else { -1e-4 };
+            samples.push(SamplePoint {
+                timestamp: t,
+                value: 1e8 + (t as f64 / 1e3) * 1e-3 + noise,
+            });
+        }
+        let (slope, intercept) = linear_regression(&samples, 0);
+        // Go ground truth with Kahan summation: slope 0.00099999983999936,
+        // intercept 1.0000000000000061e8. The tolerances are tighter than the
+        // naive-vs-Kahan gap, so a regression to plain summation fails.
+        assert!((slope - 0.00099999983999936).abs() < 1e-13, "slope {slope}");
+        assert!(
+            (intercept - 1.0000000000000061e8).abs() < 1e-9,
+            "intercept {intercept}"
+        );
+    }
+
+    #[test]
     fn test_date_functions_read_sample_values_as_unix_seconds() {
         // 2024-02-29T13:45:00Z — a leap day, so `days_in_month` and
         // `day_of_year` are both exercised.
@@ -11049,6 +11085,13 @@ mod tests {
         assert!(approx(bucket_quantile(0.5, &mut duplicate), 0.5));
         let mut decreasing = vec![(0.1, 5.0), (0.5, 3.0), (f64::INFINITY, 5.0)];
         assert!(approx(bucket_quantile(0.5, &mut decreasing), 0.05));
+        // Negative buckets: the lowest bound is implicitly -Inf, and a quantile
+        // landing in a bucket whose upper bound is <= 0 answers that bound
+        // (Prometheus' `b == 0 && buckets[0].UpperBound <= 0` case).
+        let mut negative = vec![(-5.0, 2.0), (0.0, 4.0), (f64::INFINITY, 8.0)];
+        assert!(approx(bucket_quantile(0.5, &mut negative), 0.0));
+        let mut lowest_negative = vec![(-5.0, 3.0), (f64::INFINITY, 8.0)];
+        assert!(approx(bucket_quantile(0.1, &mut lowest_negative), -5.0));
     }
 
     #[test]
