@@ -7510,13 +7510,28 @@ fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
     if quantile > 1.0 {
         return f64::INFINITY;
     }
-    let rank = quantile * (sorted.len() - 1) as f64;
-    let lower = rank.floor() as usize;
-    let upper = rank.ceil() as usize;
-    if lower == upper {
+    let n = sorted.len();
+    let rank = quantile * (n - 1) as f64;
+    let lower_f = rank.floor();
+    let lower = lower_f as usize;
+    // Prometheus clamps the upper index to n-1; for a non-integer rank the
+    // ceil already lands on lower+1, but the clamp keeps the last bucket exact.
+    let upper = (lower_f + 1.0).min((n - 1) as f64) as usize;
+    let weight = rank - lower_f;
+    if weight == 0.0 {
         return sorted[lower];
     }
-    sorted[lower] + (sorted[upper] - sorted[lower]) * (rank - lower as f64)
+    let lo = sorted[lower];
+    let hi = sorted[upper];
+    // Identical samples need no interpolation; returning one avoids rounding
+    // error and underflow. Comparing bits distinguishes -0 from +0, so a
+    // -0/+0 pair still interpolates instead of collapsing.
+    if lo == hi && lo.to_bits() == hi.to_bits() {
+        return lo;
+    }
+    // Prometheus interpolates as `lo*(1-weight) + hi*weight`, not the algebraic
+    // `lo + (hi-lo)*weight`; the two orderings differ in the last ULP.
+    lo * (1.0 - weight) + hi * weight
 }
 
 fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
@@ -11367,6 +11382,18 @@ mod tests {
         assert_eq!(quantile_of(&values, 0.5), 2.5);
         assert_eq!(quantile_of(&values, 0.25), 1.75);
         assert!(quantile_of(&values, f64::NAN).is_nan());
+        // Prometheus interpolates as `lo*(1-weight) + hi*weight`; this case
+        // (cross-checked against a Go port) lands one ULP away from the
+        // algebraic `lo + (hi-lo)*weight` the old code used.
+        let spread = [-104.3, -29.2, -23.0, 43.2];
+        assert_eq!(
+            quantile_of(&spread, 0.743_208_562_689_941_6),
+            -7.798_779_449_777_607
+        );
+        // Identical samples short-circuit to the value, not a recomputed
+        // interpolation (avoids rounding error / underflow).
+        assert_eq!(quantile_of(&[5.0, 5.0, 5.0], 0.5), 5.0);
+        assert_eq!(quantile_of(&[7.0], 0.3), 7.0);
     }
 
     #[test]

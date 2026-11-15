@@ -741,13 +741,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `quantile_over_time` 的 `quantile_of`；`q` 为 NaN 时结果是 NaN，`q<0`/`q>1`
     分别是 `-Inf`/`+Inf`。`q` 是必填参数且写在向量前（`quantile by (job)
     (0.5, m)` 也支持），缺参数在解析期报错；`aggr_over_time` 仍拒绝它并提示改用
-    `quantile_over_time`。
+    `quantile_over_time`。插值与 Prometheus `quantile` **逐位一致**：
+    `lo*(1-weight) + hi*weight`（`weight = rank - floor(rank)`），不是代数等价的
+    `lo + (hi-lo)*weight`——后者在约 1/3 的输入上差 1 ULP；相邻样本位相同（含
+    `-0`/`+0`）时直接返回该值，避免重算误差与负零符号丢失。
   - 测试：`clamp` 的上下界/`max<min` 空结果/NaN 传播；`scalar` 的 1 个、0 个、
     多个样本与标量参数，以及 MetricsQL 的字符串字面量形式
     （`"1.5"`/`"1e3"`/`"1e400"`/`"abc"`/`"3"`）；`deriv` 的斜率、常量序列、
     单样本消失以及与
     `predict_linear` 的斜率一致；日期函数在闰日 2024-02-29T13:45:00Z 上的
-    全部分量与 `year()` 的求值时刻语义；`quantile` 的插值、分组、越界与 NaN；
+    全部分量与 `year()` 的求值时刻语义；`quantile` 的逐位插值（1 ULP 回归用例）、
+     分组、越界与 NaN；
     `round` 的半向上（`round(-2.5) = -2`）、`to_nearest = 0` 得 NaN；
     解析测试覆盖全部新函数。
 - 已完成（2026-11-12）：`present_over_time` 与 `mad_over_time`（PromQL 区间函数）。
