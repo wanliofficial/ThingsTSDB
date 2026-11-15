@@ -3726,14 +3726,14 @@ impl<'a> Evaluator<'a> {
             }
             Expr::Sort { dir, expr } => {
                 let mut instant = self.eval(expr, at_ms)?;
-                match dir {
-                    SortDir::Asc => {
-                        instant.vector.0.sort_by(|a, b| a.value.total_cmp(&b.value));
-                    }
-                    SortDir::Desc => {
-                        instant.vector.0.sort_by(|a, b| b.value.total_cmp(&a.value));
-                    }
-                }
+                // VM sorts by the last *non-NaN* value of each series, treating
+                // NaN as larger than any number and skipping trailing NaNs.
+                // Here each output point carries a single value, so the "last
+                // non-NaN" is the value itself unless it is NaN.
+                instant
+                    .vector
+                    .0
+                    .sort_by(|a, b| sort_by_value_order(a.value, b.value, *dir));
                 Ok(instant)
             }
             Expr::SortByLabel { desc, labels, expr } => {
@@ -7263,6 +7263,26 @@ fn must_parse_num(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(f64::NAN)
 }
 
+/// The ordering VM's `sort` / `sort_desc` apply to two sample values.
+///
+/// Mirrors `newTransformFuncSort`'s comparator: NaN is treated as larger than
+/// any number (a NaN sorts last ascending, first descending), and the two
+/// NaNs compare equal. `SortDir::Asc` puts the smaller value first; `Desc`
+/// reverses it.
+fn sort_by_value_order(a: f64, b: f64, dir: SortDir) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let order = match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    };
+    match dir {
+        SortDir::Asc => order,
+        SortDir::Desc => order.reverse(),
+    }
+}
+
 /// Orders two label sets for `sort_by_label` / `sort_by_label_desc`.
 ///
 /// Follows Prometheus' `funcSortByLabel`: walk the requested labels in order,
@@ -8333,6 +8353,49 @@ mod tests {
         };
         assert_eq!(order("sort_by_label(m, \"job\")"), vec!["a", "b"]);
         assert_eq!(order("sort_by_label_desc(m, \"job\")"), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn test_sort_orders_by_value_and_handles_nan_like_vm() {
+        // VM's newTransformFuncSort compares the last non-NaN value and treats
+        // NaN as larger than any number, so a NaN series sorts last ascending
+        // (and first descending). Equal values keep their input order, so the
+        // tiebreaks stay deterministic.
+        let series = vec![
+            synthetic_labeled("m", &[("instance", "a")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("instance", "b")], &[(0, f64::NAN)]),
+            synthetic_labeled("m", &[("instance", "c")], &[(0, 1.0)]),
+        ];
+        let order = |query: &str| -> Vec<String> {
+            eval_series(series.clone(), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.labels["instance"].clone())
+                .collect()
+        };
+        assert_eq!(order("sort(m)"), vec!["c", "a", "b"]);
+        assert_eq!(order("sort_desc(m)"), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn test_sort_ties_keep_input_order() {
+        // Equal values compare Equal, so a stable sort keeps the input order in
+        // both directions — VM's comparator has no label tiebreak either.
+        let series = vec![
+            synthetic_labeled("m", &[("instance", "a")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("instance", "b")], &[(0, 1.0)]),
+        ];
+        let order = |query: &str| -> Vec<String> {
+            eval_series(series.clone(), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.labels["instance"].clone())
+                .collect()
+        };
+        assert_eq!(order("sort(m)"), vec!["a", "b"]);
+        assert_eq!(order("sort_desc(m)"), vec!["a", "b"]);
     }
 
     #[test]

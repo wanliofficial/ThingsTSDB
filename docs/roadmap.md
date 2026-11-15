@@ -633,6 +633,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `"1"`/`"01"` 保持输入顺序、`a.b` 这类标签名可解析、缺标签名与裸标识符报错；
     `union` 跨选择器的去重与先出现者胜、`union(1, 2)` 的两条无名序列、
     `union(1, m)` 的单条无标签标量序列，以及 `union()` / `union(m,)` 的报错。
+- 已完成（2026-11-14）：MetricsQL 的 `sort(v)` / `sort_desc(v)`
+   （`transform.go` 的 `newTransformFuncSort`）按 VM 的 NaN 语义排序：
+   - VM 的比较器取每条序列**最后一个非 NaN 值**，并把 NaN 视为大于任何数——
+     所以 NaN 序列升序排最后、降序排最前；本服务的逐 `Instant` 引擎里每条
+     输出点只带一个值，「最后一个非 NaN」即该值本身（除非它是 NaN）；
+   - 相等值比较为 Equal，稳定排序保持输入顺序（VM 的比较器在相等时同样返回
+     false，没有标签平局打破）；
+   - 之前用 `f64::total_cmp` 直接比末值，与 VM 在末值为 NaN 时的位置不一致；
+     现在改用 `sort_by_value_order` 复刻 VM 的比较器；
+   - 测试：值 2/NaN/1 三序列升序得 `c,a,b`（NaN 最后）、降序得 `b,a,c`
+     （NaN 最前）；相等值升序降序都保持输入顺序。
 - 已完成（2026-11-11）：`histogram_quantile(q, v)`（经典直方图的 `le` 桶）。
   Grafana 的延迟面板几乎都写成 `histogram_quantile(0.9, sum by (le) (rate(x_bucket[5m])))`，
   之前这个函数会被当作未知函数拒绝。实现按 Prometheus 的 `BucketQuantile`：
