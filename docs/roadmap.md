@@ -907,15 +907,19 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     「instant vector, got scalar」。
   - 测试：区间查询下四个值（100/160/60/15）、算术与 `max_of` 组合、即时查询下
     `step()`/`range()` 为 0、`start()[5m:1m]` 报错，并加入支持表达式清单。
-- 已完成（2026-11-13）：`histogram_quantiles(v, "label", q1, q2, ...)`（经典 `le` 桶）。
-  照抄 `funcHistogramQuantiles` 的经典直方图分支：对每个分位数、每个直方图各输出
-  一条序列，值是该分位数的 `BucketQuantile`（与 `histogram_quantile` 完全同一份
-  实现），并把分位数用 `labels.FormatOpenMetricsFloat` 写进给定标签。
-  - `FormatOpenMetricsFloat` 是 Go 的 `strconv.FormatFloat(f, 'g', -1, 64)`（最短往返、
-    十进制指数落在 `[-4, 6)` 时用定点、否则 `d.dddde±dd`）再补一条「结果里既没有
-    `.` 也没有 `e` 就追加 `.0`」；`1`/`0`/`-1`/`NaN`/`±Inf` 走硬编码分支，且 `-0`
-    因为 Go 用 `f == 0` 比较也返回 `"0.0"`。`{:e}` 在 Rust 里给出与 Go 相同的
-    最短数字与指数，所以只需按 Go 的规则摆放小数点。
+- 已完成（2026-11-13，2026-11-15 修正分位数标签格式）：`histogram_quantiles(v,
+  "label", q1, q2, ...)`（经典 `le` 桶）。照抄 `transformHistogramQuantiles` 的
+  经典直方图分支：对每个分位数、每个直方图各输出一条序列，值是该分位数的
+  `BucketQuantile`（与 `histogram_quantile` 完全同一份实现）。
+- **分位数标签用 Go 的 `%g`**（`format_g_percent`）：`histogram_quantiles` 是
+  MetricsQL 函数，VM 用 `fmt.Sprintf("%g", phi)` 渲染标签，**不是** Prometheus 的
+  OpenMetrics `FormatOpenMetricsFloat`——两者都基于 `strconv.FormatFloat(f,'g',-1,64)`，
+  但 `%g` **绝不补 `.0`**，而 OpenMetrics 会在既无 `.` 也无 `e` 时补一条。所以
+  `q=1` 渲染为 `"1"`（不是 `"1.0"`）、`q=100000` 为 `"100000"`（不是 `"100000.0"`）、
+  `q=0` 为 `"0"`。NaN/`+Inf`/`-Inf` 保持 Go 的拼写（`"NaN"`/`"+Inf"`/`"-Inf"`），
+  真正的负零 `format_g_percent(-0.0)` 得到 `"-0"`（`%g` 保留符号位）。有限值委托
+  `go_format_g`（不补 `.0`），`{:e}` 在 Rust 里给出与 Go 相同的最短数字与指数，
+  所以只需按 Go 的规则摆放小数点。
   - 分位数标签是 `labels.Builder.Set` 语义：分组里已有同名标签时**覆盖**；
     标签名按本仓库既有约定校验（`count_values`/`label_replace` 同样在解析期校验）。
   - 参数个数照 Prometheus 的 `ArgTypes`/`Variadic` 折算：至少 1 个、最多 10 个
@@ -923,10 +927,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 越界分位数（`q<0`/`q>1`/NaN）**不是错误**：Prometheus 只发 warning，照样输出
     一条 `-Inf`/`+Inf`/`NaN` 的序列，这里同样输出（没有 annotation 通道，warning
     略去）。
-  - 测试：`format_open_metrics_float` 按 Go 实测值逐条对照（`1.0`/`0.0`/`-0`/`NaN`/
-    `±Inf`、常见分位数、`100000.0`、`123456.0`、`1e+06`、`1.234567e+06`、`1e-05`、
-    `1e-07`、`1e+21`）；`histogram_quantiles` 对 2/4/6/8 桶给出中位数 0.5、q=0.9
-    落到最后一个有限桶上界 1、`q=1` 为 1.0；越界与 NaN 分位数照样各出一条
+  - 测试：`format_g_percent` 按 Go 实测值逐条对照（`1`/`0`/`-0`→`"-0"`/`-1`/`NaN`/
+    `±Inf`、常见分位数、`100000`/`999999`/`1e+06`/`1.234567e+06`/`1e-05`/`1e-07`/
+    `1e+21`/`1.2345678901234569e+23`）；`histogram_quantiles` 对 2/4/6/8 桶给出中位数 0.5、
+    q=0.9 落到最后一个有限桶上界 1、q=1 标签为 `"1"` 且值为 1.0；越界与 NaN 分位数照样各出一条
     `-Inf`/`+Inf`/`NaN`，标签是**请求的分位数**（`"-0.5"`/`"1.5"`/`"NaN"`）而不是
     结果值；同名标签被覆盖；经求值器
     端到端丢弃 `__name__`；缺 `le`、标量输入、零个分位数、11 个分位数、非法标签名

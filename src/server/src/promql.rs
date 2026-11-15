@@ -5493,24 +5493,16 @@ fn format_float_g(value: f64) -> String {
     format!("{value}")
 }
 
-/// `labels.FormatOpenMetricsFloat`: Go's shortest `%g` formatting, with `".0"`
-/// appended when the result would otherwise contain neither a `'.'` nor an
-/// `'e'`.
+/// Go's `fmt.Sprintf("%g", value)`: the shortest `%g` form, with Go's exact
+/// spelling for NaN (`"NaN"`), +Inf (`"+Inf"`) and -Inf (`"-Inf"`). Finite
+/// values defer to `go_format_g`, which never forces a trailing `.0` — so `1`
+/// renders as `"1"` and `100000` as `"100000"`, unlike OpenMetrics'
+/// `FormatOpenMetricsFloat`.
 ///
-/// Used for the quantile label of `histogram_quantiles`, where Prometheus
-/// writes the quantile through this exact function, so `0.5` becomes `"0.5"`
-/// and `1` becomes `"1.0"`.
-fn format_open_metrics_float(value: f64) -> String {
-    // Go compares before looking at the sign, so `-0` is `"0.0"` too.
-    if value == 1.0 {
-        return "1.0".to_string();
-    }
-    if value == 0.0 {
-        return "0.0".to_string();
-    }
-    if value == -1.0 {
-        return "-1.0".to_string();
-    }
+/// Used for the quantile label of `histogram_quantiles`, where MetricsQL
+/// renders the quantile through `%g`, so `0.5` becomes `"0.5"` and `1` becomes
+/// `"1"`.
+fn format_g_percent(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
     }
@@ -5521,12 +5513,7 @@ fn format_open_metrics_float(value: f64) -> String {
             "+Inf".to_string()
         };
     }
-    let mut out = go_format_g(value);
-    // Go looks for `e` and `.` only — never `E` — because `'g'` is lowercase.
-    if !out.contains(['e', '.']) {
-        out.push_str(".0");
-    }
-    out
+    go_format_g(value)
 }
 
 /// Go's `strconv.FormatFloat(value, 'g', -1, 64)`: the shortest decimal that
@@ -6333,8 +6320,8 @@ fn histogram_quantile(quantile: f64, vector: &Vector) -> Result<Vector> {
 
 /// `histogram_quantiles(v, "label", q1, q2, ...)` for classic `le` buckets.
 ///
-/// One series per quantile per histogram, with the quantile rendered by
-/// `format_open_metrics_float` into `label`. `__name__` is dropped and the
+/// One series per quantile per histogram, with the quantile rendered by Go's
+/// `%g` (via `format_g_percent`) into `label`. `__name__` is dropped and the
 /// bucket groups are the same ones `histogram_quantile` uses; a quantile
 /// outside `[0, 1]` still produces a series (Prometheus only warns), whose
 /// value is `-Inf`, `+Inf` or `NaN`.
@@ -6342,11 +6329,11 @@ fn histogram_quantiles(quantiles: &[f64], label: &str, vector: &Vector) -> Resul
     let groups = classic_buckets("histogram_quantiles", vector)?;
     let mut out = Vector::default();
     for quantile in quantiles {
-        let name = format_open_metrics_float(*quantile);
+        let name = format_g_percent(*quantile);
         for (labels, buckets) in &groups {
-            // Each quantile gets its own copy of the buckets so
-            // `BucketQuantile` can sort and coalesce in place; Prometheus
-            // reuses the slice and relies on those steps being idempotent.
+            // VM's `transformHistogramQuantiles` calls `copyTimeseries` on the
+            // input for every quantile, so each gets its own copy of the
+            // buckets that `BucketQuantile` can sort and coalesce in place.
             let mut buckets = buckets.clone();
             let mut labels = labels.clone();
             labels.insert(label.to_string(), name.clone());
@@ -11131,16 +11118,21 @@ mod tests {
     }
 
     #[test]
-    fn test_format_open_metrics_float() {
-        // Ground truth from Go's `labels.FormatOpenMetricsFloat`.
-        assert_eq!(format_open_metrics_float(1.0), "1.0");
-        assert_eq!(format_open_metrics_float(0.0), "0.0");
-        // `-0` compares equal to `0`, so Go answers "0.0" for it too.
-        assert_eq!(format_open_metrics_float(-0.0), "0.0");
-        assert_eq!(format_open_metrics_float(-1.0), "-1.0");
-        assert_eq!(format_open_metrics_float(f64::NAN), "NaN");
-        assert_eq!(format_open_metrics_float(f64::INFINITY), "+Inf");
-        assert_eq!(format_open_metrics_float(f64::NEG_INFINITY), "-Inf");
+    fn test_format_g_percent() {
+        // Ground truth from Go's `fmt.Sprintf("%g", v)`. This is the MetricsQL
+        // `histogram_quantiles` label formatter — NOT OpenMetrics'
+        // FormatOpenMetricsFloat: `%g` never forces a trailing ".0".
+        assert_eq!(format_g_percent(1.0), "1");
+        assert_eq!(format_g_percent(0.0), "0");
+        // `%g` keeps the sign of a genuine negative zero ("-0"); only a +0
+        // literal folds to "0".
+        assert_eq!(format_g_percent(-0.0), "-0");
+        assert_eq!(format_g_percent(-1.0), "-1");
+        assert_eq!(format_g_percent(10.0), "10");
+        assert_eq!(format_g_percent(3.0), "3");
+        assert_eq!(format_g_percent(f64::NAN), "NaN");
+        assert_eq!(format_g_percent(f64::INFINITY), "+Inf");
+        assert_eq!(format_g_percent(f64::NEG_INFINITY), "-Inf");
         // The usual quantiles are plain shortest decimals.
         for (value, want) in [
             (0.5, "0.5"),
@@ -11149,22 +11141,22 @@ mod tests {
             (0.999, "0.999"),
             (1.5, "1.5"),
             (-0.5, "-0.5"),
+            (2.0 / 3.0, "0.6666666666666666"),
             (0.0001, "0.0001"),
         ] {
-            assert_eq!(format_open_metrics_float(value), want);
+            assert_eq!(format_g_percent(value), want);
         }
-        // Go switches to exponent form at a decimal exponent of 6 and below
-        // -4; inside that window the number is written out in full and gets a
-        // trailing ".0" when it would otherwise have no point.
-        assert_eq!(format_open_metrics_float(100_000.0), "100000.0");
-        assert_eq!(format_open_metrics_float(123_456.0), "123456.0");
-        assert_eq!(format_open_metrics_float(1e6), "1e+06");
-        assert_eq!(format_open_metrics_float(1_234_567.0), "1.234567e+06");
-        assert_eq!(format_open_metrics_float(1e-5), "1e-05");
-        assert_eq!(format_open_metrics_float(1e-7), "1e-07");
-        assert_eq!(format_open_metrics_float(1e21), "1e+21");
+        // `%g` writes whole numbers without a ".0", and switches to exponent
+        // form at a decimal exponent of 6 and below -4 — again with no ".0".
+        assert_eq!(format_g_percent(100_000.0), "100000");
+        assert_eq!(format_g_percent(999_999.0), "999999");
+        assert_eq!(format_g_percent(1e6), "1e+06");
+        assert_eq!(format_g_percent(1_234_567.0), "1.234567e+06");
+        assert_eq!(format_g_percent(1e-5), "1e-05");
+        assert_eq!(format_g_percent(1e-7), "1e-07");
+        assert_eq!(format_g_percent(1e21), "1e+21");
         assert_eq!(
-            format_open_metrics_float(1.2345678901234569e23),
+            format_g_percent(1.2345678901234569e23),
             "1.2345678901234569e+23"
         );
     }
@@ -11240,7 +11232,7 @@ mod tests {
             rendered(&instant.vector),
             vec![
                 ("{quantile=\"0.5\"}".to_string(), 0.5),
-                ("{quantile=\"1.0\"}".to_string(), 1.0),
+                ("{quantile=\"1\"}".to_string(), 1.0),
             ]
         );
         // Bad arguments: no quantile, too many quantiles, an invalid label
