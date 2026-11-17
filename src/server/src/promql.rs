@@ -143,7 +143,10 @@
 //! `search_downsampled` uses, so a wide range query reads raw points; routing
 //! rollup-aware evaluation is a separate piece of work, noted in the roadmap.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap, HashSet},
+};
 
 use metric_engine::{MatcherType, SamplePoint, SearchRequest, SeriesSamples};
 
@@ -5228,14 +5231,33 @@ fn topk(op: AggOp, values: &Vector, k: usize, grouping: Option<&Grouping>) -> Ve
     let mut out = Vector::default();
     for (_, mut group) in groups {
         match op {
-            AggOp::Bottomk => group.sort_by(|a, b| a.value.total_cmp(&b.value)),
-            _ => group.sort_by(|a, b| b.value.total_cmp(&a.value)),
+            AggOp::Bottomk => group.sort_by(|a, b| prom_rank_cmp(a.value, b.value, false)),
+            _ => group.sort_by(|a, b| prom_rank_cmp(a.value, b.value, true)),
         }
         for point in group.into_iter().take(k) {
             out.push(point.labels.clone(), point.value);
         }
     }
     out
+}
+
+/// The ranking `topk` / `bottomk` use to fill their `k` slots.
+///
+/// Prometheus builds a heap whose `Less` reports NaN as the smallest value, but
+/// the aggregation only swaps it out for a *real* sample (`heap[0].F < s.F ||
+/// (IsNaN(heap[0].F) && !IsNaN(s.F))`), and the final `sort.Reverse` leaves
+/// NaNs at the end. The net effect, for both directions, is that a NaN is worse
+/// than every number and only fills a slot when there are fewer than `k` real
+/// values. `f64::total_cmp` cannot express that: it sorts NaN above `+Inf`, so
+/// `topk` would happily return `NaN` as the largest sample.
+fn prom_rank_cmp(a: f64, b: f64, descending: bool) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) if descending => b.partial_cmp(&a).expect("both values are numbers"),
+        (false, false) => a.partial_cmp(&b).expect("both values are numbers"),
+    }
 }
 
 /// `quantile(q, v)`, grouped like the other aggregations.
@@ -5775,10 +5797,17 @@ fn apply_range_func(
             }
             Some(last.value - samples[samples.len() - 2].value)
         }
+        // Prometheus' `funcChanges` only counts a step where the value really
+        // changed: `cur != prev && !(IsNaN(cur) && IsNaN(prev))`. Rust's `!=`
+        // is already `true` for NaN/NaN, so the explicit NaN-pair exemption has
+        // to be spelled out or a gap would be counted as a change.
         RangeFunc::Changes => Some(
             samples
                 .windows(2)
-                .filter(|pair| pair[0].value != pair[1].value)
+                .filter(|pair| {
+                    let (before, after) = (pair[0].value, pair[1].value);
+                    after != before && !(before.is_nan() && after.is_nan())
+                })
                 .count() as f64,
         ),
         RangeFunc::Resets => Some(
@@ -5794,18 +5823,8 @@ fn apply_range_func(
         // Prometheus' `funcAvgOverTime`: the same hybrid sum/incremental-mean
         // strategy as the `avg` aggregation.
         RangeFunc::AvgOverTime => Some(kahan_mean(&values(samples))),
-        RangeFunc::MinOverTime => Some(
-            samples
-                .iter()
-                .map(|s| s.value)
-                .fold(f64::INFINITY, f64::min),
-        ),
-        RangeFunc::MaxOverTime => Some(
-            samples
-                .iter()
-                .map(|s| s.value)
-                .fold(f64::NEG_INFINITY, f64::max),
-        ),
+        RangeFunc::MinOverTime => Some(extreme_over_time(samples, RangeFunc::MinOverTime)),
+        RangeFunc::MaxOverTime => Some(extreme_over_time(samples, RangeFunc::MaxOverTime)),
         RangeFunc::LastOverTime => Some(last.value),
         // Prometheus' `funcStdvarOverTime`: a Kahan-compensated Welford pass,
         // so both the mean and the accumulated squared deviations carry a
@@ -6482,6 +6501,26 @@ fn set_vectors(
 /// The timestamp (in seconds) of the sample a `compareOverTime`-style scan
 /// settles on, following Prometheus' loop exactly: start from the first
 /// sample and replace the extreme when the comparison holds.
+/// Prometheus' `compareOverTime` for `min_over_time` / `max_over_time`: seed
+/// with the first sample, then keep a sample only when it beats the running
+/// extreme (`<` / `>`) or the running extreme is already NaN. So an all-NaN
+/// series answers NaN, and a NaN in the middle is skipped because every
+/// comparison against it is false — a plain `fold(INFINITY, f64::min)` gets
+/// both of those wrong.
+fn extreme_over_time(samples: &[SamplePoint], func: RangeFunc) -> f64 {
+    let mut best = samples[0].value;
+    for sample in &samples[1..] {
+        let wins = match func {
+            RangeFunc::MinOverTime => sample.value < best || best.is_nan(),
+            _ => sample.value > best || best.is_nan(),
+        };
+        if wins {
+            best = sample.value;
+        }
+    }
+    best
+}
+
 fn timestamp_of_extreme(samples: &[SamplePoint], wins: impl Fn(f64, f64) -> bool) -> Option<f64> {
     let first = samples.first()?;
     let mut best = first.value;
@@ -10711,6 +10750,117 @@ mod tests {
             apply_range_func(RangeFunc::CountOverTime, &samples, 4_000, None, None),
             Some(4.0)
         );
+    }
+
+    /// `changes` does not count a NaN→NaN step as a change, because Prometheus
+    /// compares with `cur != prev && !(IsNaN(cur) && IsNaN(prev))`. A bare `!=`
+    /// would see `NaN != NaN` as true and report a change at every gap.
+    #[test]
+    fn test_changes_ignores_nan_to_nan() {
+        let make = |values: &[f64]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| SamplePoint {
+                    timestamp: i as i64 * 1_000,
+                    value: *v,
+                })
+                .collect()
+        };
+        let changes = |values: &[f64]| {
+            apply_range_func(RangeFunc::Changes, &make(values), 10_000, None, None)
+        };
+        // Two gaps in a row: the pair is NaN→NaN, so neither step changed.
+        assert_eq!(changes(&[f64::NAN, f64::NAN, f64::NAN]), Some(0.0));
+        // A real value appearing after NaN is a change; the NaN itself is not.
+        assert_eq!(changes(&[1.0, f64::NAN]), Some(1.0));
+        assert_eq!(changes(&[f64::NAN, 2.0]), Some(1.0));
+        // And an ordinary change still counts.
+        assert_eq!(changes(&[1.0, 2.0, 2.0, 3.0]), Some(2.0));
+    }
+
+    /// `min_over_time` / `max_over_time` seed with the first sample and also
+    /// restart when the running extreme is NaN (`(cur > max) || IsNaN(max)`).
+    /// The old `fold(INFINITY, f64::min)` answered `+Inf` for an all-NaN
+    /// series.
+    #[test]
+    fn test_min_max_over_time_follow_prometheus_nan_seeding() {
+        let make = |values: &[f64]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| SamplePoint {
+                    timestamp: i as i64 * 1_000,
+                    value: *v,
+                })
+                .collect()
+        };
+        let run = |func: RangeFunc, values: &[f64]| {
+            apply_range_func(func, &make(values), 10_000, None, None)
+        };
+        let all_nan = [f64::NAN, f64::NAN];
+        assert!(run(RangeFunc::MinOverTime, &all_nan).unwrap().is_nan());
+        assert!(run(RangeFunc::MaxOverTime, &all_nan).unwrap().is_nan());
+        // A real sample after a leading NaN replaces it (the running extreme is
+        // NaN, so the next value always wins).
+        assert_eq!(
+            run(RangeFunc::MinOverTime, &[f64::NAN, 3.0, 5.0]),
+            Some(3.0)
+        );
+        assert_eq!(
+            run(RangeFunc::MaxOverTime, &[f64::NAN, 3.0, 5.0]),
+            Some(5.0)
+        );
+        // A NaN in the middle never wins: both comparisons against it are
+        // false.
+        assert_eq!(
+            run(RangeFunc::MinOverTime, &[4.0, f64::NAN, 6.0]),
+            Some(4.0)
+        );
+        assert_eq!(
+            run(RangeFunc::MaxOverTime, &[4.0, f64::NAN, 6.0]),
+            Some(6.0)
+        );
+        // Singletons and ordinary input are unchanged.
+        assert_eq!(run(RangeFunc::MinOverTime, &[7.0]), Some(7.0));
+        assert_eq!(run(RangeFunc::MinOverTime, &[3.0, 1.0, 2.0]), Some(1.0));
+        assert_eq!(run(RangeFunc::MaxOverTime, &[3.0, 1.0, 2.0]), Some(3.0));
+    }
+
+    /// `topk` / `bottomk` treat NaN as worse than any number — it only fills a
+    /// slot when there are fewer than `k` real values. `f64::total_cmp` would
+    /// instead sort NaN above `+Inf`, so `topk` answered `NaN` as the largest.
+    /// Both output orders put NaN last: `topk` is descending, `bottomk`
+    /// ascending, and Prometheus' final `sort.Reverse` leaves NaN at the end of
+    /// either.
+    #[test]
+    fn test_topk_and_bottomk_rank_nan_last() {
+        let eval = |query: &str| -> Vec<f64> {
+            let series = vec![
+                synthetic_labeled("m", &[("i", "nan")], &[(0, f64::NAN)]),
+                synthetic_labeled("m", &[("i", "one")], &[(0, 1.0)]),
+                synthetic_labeled("m", &[("i", "two")], &[(0, 2.0)]),
+                synthetic_labeled("m", &[("i", "three")], &[(0, 3.0)]),
+            ];
+            eval_series(series, "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.value)
+                .collect()
+        };
+        // Three real values fill k=3, so NaN never appears.
+        assert_eq!(eval("topk(3, m)"), vec![3.0, 2.0, 1.0]);
+        assert_eq!(eval("bottomk(3, m)"), vec![1.0, 2.0, 3.0]);
+        // k=4 has to take the NaN as well, and it lands at the end either way.
+        let top = eval("topk(4, m)");
+        assert_eq!(top.len(), 4);
+        assert_eq!(top[..3], [3.0, 2.0, 1.0]);
+        assert!(top[3].is_nan(), "topk put NaN first: {top:?}");
+        let bottom = eval("bottomk(4, m)");
+        assert_eq!(bottom.len(), 4);
+        assert_eq!(bottom[..3], [1.0, 2.0, 3.0]);
+        assert!(bottom[3].is_nan(), "bottomk put NaN first: {bottom:?}");
     }
 
     #[test]

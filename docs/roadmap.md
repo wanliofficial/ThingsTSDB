@@ -941,6 +941,28 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `0.012499988079074598`、`1e16+{0..3}` 区间方差 3、溢出输入 `avg` 为 0；
     另有 NaN 播种和 `aggr_over_time` 等价的用例；活服务冒烟逐项复现同样的值，
     日志 0 error。
+- 已完成（2026-11-18）：`changes()`、`min_over_time` / `max_over_time`、`topk` /
+  `bottomk` 的 NaN 语义对齐 Prometheus。这是一类「NaN 比较恒为假」的坑：Rust 与
+  Go 在这一点上行为相同，但**朴素写法**（`!=`、`fold(INFINITY, f64::min)`、
+  `total_cmp`）都会把 NaN 当成普通值，于是与上游分道扬镳：
+  - `changes(v[range])`：照抄 `funcChanges` 的
+    `cur != prev && !(IsNaN(cur) && IsNaN(prev))`。裸 `!=` 会把 `NaN != NaN`
+    看成 `true`，于是每个「连续两拍都是空缺」的区间都被误记成一次变化；
+  - `min_over_time` / `max_over_time`：照抄 `compareOverTime`——用首个样本播种，
+    仅当 `cur < best`（`>`）**或 `best` 是 NaN** 时替换。旧写法
+    `fold(INFINITY, f64::min)` 对全 NaN 序列返回 `+Inf`/`-Inf`，现在返回 NaN；
+    中间插入的 NaN 不参与（与 NaN 比较恒为假）；`ts_of_min/max_over_time` 用的
+    `>=`/`<=` 与「取最后一个并列者」规则此前已对上，不动；
+  - `topk` / `bottomk`：上游用小顶堆填 `k` 个槽位，堆的 `Less` 把 NaN 当成**最小**
+    值，但只在遇到**真实样本**时才把它换掉（`heap[0] < s || (IsNaN(heap[0]) &&
+    !IsNaN(s))`），最后 `sort.Reverse` 又把 NaN 甩到末尾——净效果是 NaN 永远比任何
+    数字差、只有真实值不足 `k` 个时才占位。`f64::total_cmp` 恰恰相反（把 NaN 排在
+    `+Inf` 之上），会让 `topk` 把 NaN 当作最大样本返回。改为显式的
+    `prom_rank_cmp`：NaN 恒比数字差，普通值正常比较；
+  - 两条输出顺序也照上游：`topk` 降序、`bottomk` 升序，NaN 在两者里都落在末尾；
+  - 测试：`changes` 的 NaN→NaN 为 0、单边 NaN 为 1；全 NaN 区间的 min/max 为
+    NaN、前导 NaN 被真实值替换、中段 NaN 不参与；`topk(3, ...)` 不含 NaN 而
+    `topk(4, ...)` 把 NaN 放在末尾（bottomk 同理）；活服务冒烟逐项复现，日志 0 error。
 - 已完成（2026-11-13）：`max_of(a, b)` / `min_of(a, b)`（两个标量进、一个标量出）。
   Prometheus 把它们当作时长表达式里的辅助函数（`max_of(step(), 5s)`），同时也
   接受普通数字。语义照抄 `funcMaxOf` / `funcMinOf`，与 `max`/`min` 聚合的 NaN
