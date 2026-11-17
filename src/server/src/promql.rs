@@ -5883,8 +5883,12 @@ fn apply_range_func_in(
                 }
             }
             // Without a window there is nothing to extrapolate towards, which
-            // is how the unit tests drive the function.
+            // is how the unit tests drive the function. Upstream still refuses
+            // a single sample here (no average interval to extrapolate by).
             let Some(window) = extrapolation else {
+                if samples.len() < 2 {
+                    return None;
+                }
                 if func == RangeFunc::Increase {
                     return Some(result);
                 }
@@ -10957,6 +10961,14 @@ mod tests {
             apply_range_func(RangeFunc::Increase, &make(&full), 60_000, None, None),
             Some(60.0)
         );
+        // A single sample has no average interval, so nothing is emitted — the
+        // same rule the windowed path applies.
+        assert_eq!(
+            apply_range_func(RangeFunc::Increase, &make(&[(0, 1.0)]), 60_000, None, None),
+            None
+        );
+        assert_eq!(run(RangeFunc::Increase, &[(0, 1.0)], minute), None);
+        assert_eq!(run(RangeFunc::Delta, &[(0, 1.0)], minute), None);
     }
 
     /// `min_over_time` / `max_over_time` seed with the first sample and also
