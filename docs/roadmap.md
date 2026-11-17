@@ -311,8 +311,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - `aggr_over_time(<agg>, v[range])`——聚合名可裸写也可加引号（`avg` / `"avg"`），
     接受 `sum/avg/min/max/count/stddev/stdvar`；`topk`/`bottomk` 要额外参数、
     `group` 对时间轴无意义，解析期即拒绝并点名；
-  - `absent_over_time(v[range])`——区间内一条样本都没有时返回单条**无标签**的 `1`，
-    否则返回空（与 Prometheus 同名函数同义）；
+  - `absent_over_time(v[range])`——区间内一条样本都没有时返回单条 `1`，否则返回空
+    （与 Prometheus 同名函数同义）；`1` 的**标签**同样照 Prometheus 从区间向量选择器的
+    等值匹配器推导（`absent` 同款 `createLabelsForAbsentFunction`：非等值匹配器删除
+    对应标签、子查询/非选择器参数退化为无标签 `1`）；
   - `tmin_over_time` / `tmax_over_time`——返回极值样本的**时间戳**（秒）而不是值；
   - `predict_linear(v[range], t)`——对区间内样本做最小二乘直线拟合，从最后一个样本
     再外推 `t` 秒（与 Prometheus 的实现一致：拟合斜率而非取端点差）；

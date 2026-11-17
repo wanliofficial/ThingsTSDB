@@ -42,13 +42,14 @@
 //!   (`on` / `ignoring`, `group_left` / `group_right`), and the set operators
 //!   `and` / `or` / `unless`;
 //! * a MetricsQL subset on top of PromQL — `aggr_over_time(<agg>, v[range])`,
-//!   `absent_over_time`, `tmin_over_time` / `tmax_over_time`,
-//!   `predict_linear(v[range], t)`, the `*_over_time` family, the label helpers
-//!   `label_set` / `label_del` / `label_keep` / `label_copy` / `label_move` /
-//!   `label_value` / `alias`, the label transforms `label_map` /
-//!   `label_uppercase` / `label_lowercase` / `label_transform` / `label_match`
-//!   / `label_mismatch`, and the classic-bucket summary functions
-//!   `histogram_avg` / `histogram_stddev` / `histogram_stdvar`.
+//!   `absent_over_time`（像 `absent` 一样，把等值匹配器写进它的 `1`）、
+//!   `tmin_over_time` / `tmax_over_time`、`predict_linear(v[range], t)`、 the
+//!   `*_over_time` family, the label helpers `label_set` / `label_del` /
+//!   `label_keep` / `label_copy` / `label_move` / `label_value` / `alias`, the
+//!   label transforms `label_map` / `label_uppercase` / `label_lowercase` /
+//!   `label_transform` / `label_match` / `label_mismatch`, and the
+//!   classic-bucket summary functions `histogram_avg` / `histogram_stddev` /
+//!   `histogram_stdvar`.
 //!
 //! The parameterised range functions that put the range vector first —
 //! `predict_linear`, `double_exponential_smoothing` and `integral` — are
@@ -4850,11 +4851,14 @@ impl<'a> Evaluator<'a> {
         }
         let mut vector = Vector::default();
         // `absent_over_time` is the one range function whose answer is "1" when
-        // nothing matched: Prometheus returns a single label-less 1 for a
-        // selector with no samples in the range, and nothing otherwise.
+        // nothing matched. Prometheus derives the answer's labels from the
+        // range vector's selector the same way `absent` does (see
+        // `absent_labels`): a subquery or a non-selector argument gives a bare
+        // `{} 1`.
         if func == RangeFunc::AbsentOverTime {
             if matrix.0.is_empty() {
-                vector.push(BTreeMap::new(), 1.0);
+                let labels: LabelSet = absent_labels(expr).into_iter().collect();
+                vector.push(labels, 1.0);
             }
             return Ok(Instant {
                 vector,
@@ -11519,6 +11523,43 @@ mod tests {
             series,
             r#"x{job="a",foo="bar"}"#,
             r#"absent(x{job="a",foo="bar"})"#,
+            0,
+        );
+        assert!(out.vector.is_empty());
+    }
+
+    #[test]
+    fn test_absent_over_time_labels_follow_prometheus() {
+        // Prometheus' absent_over_time derives its labels the same way absent()
+        // does, from the range vector's selector.
+        let empty = |query: &str| rendered(&eval_series(vec![], r#"x{job="a"}"#, query, 0).vector);
+        // `absent_over_time(x{job="a",foo="bar"}[1h])` -> `{job="a",foo="bar"}
+        // 1`.
+        assert_eq!(
+            empty(r#"absent_over_time(x{job="a",foo="bar"}[1h])"#),
+            vec![("{foo=\"bar\",job=\"a\"}".to_string(), 1.0)]
+        );
+        // A non-equality matcher deletes the label it names.
+        assert_eq!(
+            empty(r#"absent_over_time(x{job="a",instance=~".*"}[1h])"#),
+            vec![("{job=\"a\"}".to_string(), 1.0)]
+        );
+        // A repeated equality matcher deletes the label (historic behaviour).
+        assert_eq!(
+            empty(r#"absent_over_time(x{job="a",job="b"}[1h])"#),
+            vec![("{}".to_string(), 1.0)]
+        );
+        // A subquery has no selector to read, so the answer is a bare `{} 1`.
+        assert_eq!(
+            empty(r#"absent_over_time(sum(x{job="a"})[1h:5m])"#),
+            vec![("{}".to_string(), 1.0)]
+        );
+        // A selector that has samples in the range yields nothing.
+        let series = vec![synthetic_labeled("x", &[("job", "a")], &[(0, 4.0)])];
+        let out = eval_series(
+            series,
+            r#"x{job="a"}"#,
+            r#"absent_over_time(x{job="a"}[1m])"#,
             0,
         );
         assert!(out.vector.is_empty());
