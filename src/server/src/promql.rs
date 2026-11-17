@@ -120,6 +120,21 @@
 //! cumulative count, the first interval starts at zero, and the `+Inf` bucket
 //! is skipped because it has no midpoint.
 //!
+//! The summary aggregations do not fold with a plain `+=`. `sum` and
+//! `sum_over_time` accumulate through `kahan_inc`, Prometheus' Neumaier
+//! `kahansum.Inc` (an infinite intermediate sum drops the compensation, and a
+//! final infinite sum is returned without adding it back, since `±Inf + c`
+//! could only be `NaN`). `avg` and `avg_over_time` are the *hybrid* strategy:
+//! they keep the Kahan sum as long as it stays finite and only switch to the
+//! incremental mean `mean += f/n - mean/n` once it would overflow, which is why
+//! `avg([1e308, 1e308, -1e308, -1e308])` is exactly 0 rather than `Inf - Inf`.
+//! `stdvar` / `stddev` walk Welford's online recurrence, while the over_time
+//! pair uses a *Kahan-compensated* Welford; those are two separate code paths
+//! upstream and they disagree on `1e16 + {0,1,2,3}` (5 versus 3), so each is
+//! transcribed from its own source rather than shared. MetricsQL's
+//! `aggr_over_time(<agg>, v[range])` delegates to the same-named `*_over_time`
+//! function so the two entry points cannot drift apart.
+//!
 //! Evaluation asks the engine for each selector's raw samples over the union
 //! window once, then evaluates the expression per step. One scan per selector
 //! instead of one query per step, and the per-step selection follows
@@ -5083,16 +5098,49 @@ fn aggregate_values(op: AggOp, values: &[f64]) -> f64 {
         return f64::NAN;
     }
     match op {
-        AggOp::Sum => values.iter().sum(),
-        AggOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
-        AggOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
-        AggOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        AggOp::Sum => kahan_sum(values),
+        AggOp::Avg => kahan_mean(values),
+        // Prometheus seeds the running extreme with the group's first sample
+        // and only replaces it when `acc < f` / `acc > f`, plus a NaN restart.
+        // A group of all NaNs therefore ends on `NaN`, and one that starts with
+        // NaN still picks up the first real sample.
+        AggOp::Min => {
+            let mut acc = values[0];
+            for &value in &values[1..] {
+                if acc > value || acc.is_nan() {
+                    acc = value;
+                }
+            }
+            acc
+        }
+        AggOp::Max => {
+            let mut acc = values[0];
+            for &value in &values[1..] {
+                if acc < value || acc.is_nan() {
+                    acc = value;
+                }
+            }
+            acc
+        }
         AggOp::Count => values.len() as f64,
         AggOp::Group => 1.0,
         AggOp::Stddev => aggregate_values(AggOp::Stdvar, values).sqrt(),
+        // Welford's online variance, transcribed from the `STDVAR` arm of
+        // Prometheus' `aggregation` (it seeds the mean with the first sample
+        // and then folds each later one in). A naive two-pass sum would agree
+        // on well-conditioned input but drifts once the mean is large relative
+        // to the spread.
         AggOp::Stdvar => {
-            let mean = values.iter().sum::<f64>() / values.len() as f64;
-            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
+            let mut mean = values[0];
+            let mut value = 0.0;
+            let mut count = 1.0;
+            for &sample in &values[1..] {
+                count += 1.0;
+                let delta = sample - mean;
+                mean += delta / count;
+                value += delta * (sample - mean);
+            }
+            value / count
         }
         // `aggrFuncSum2`: NaN samples are skipped, an all-NaN group yields NaN.
         AggOp::Sum2 => {
@@ -5740,10 +5788,12 @@ fn apply_range_func(
                 .count() as f64,
         ),
         RangeFunc::CountOverTime => Some(samples.len() as f64),
-        RangeFunc::SumOverTime => Some(samples.iter().map(|s| s.value).sum()),
-        RangeFunc::AvgOverTime => {
-            Some(samples.iter().map(|s| s.value).sum::<f64>() / samples.len() as f64)
-        }
+        // Prometheus' `funcSumOverTime`: Kahan-compensated fold (see
+        // `kahan_sum`).
+        RangeFunc::SumOverTime => Some(kahan_sum(&values(samples))),
+        // Prometheus' `funcAvgOverTime`: the same hybrid sum/incremental-mean
+        // strategy as the `avg` aggregation.
+        RangeFunc::AvgOverTime => Some(kahan_mean(&values(samples))),
         RangeFunc::MinOverTime => Some(
             samples
                 .iter()
@@ -5757,15 +5807,20 @@ fn apply_range_func(
                 .fold(f64::NEG_INFINITY, f64::max),
         ),
         RangeFunc::LastOverTime => Some(last.value),
+        // Prometheus' `funcStdvarOverTime`: a Kahan-compensated Welford pass,
+        // so both the mean and the accumulated squared deviations carry a
+        // compensation term.
         RangeFunc::StdvarOverTime => {
-            let mean = samples.iter().map(|s| s.value).sum::<f64>() / samples.len() as f64;
-            Some(
-                samples
-                    .iter()
-                    .map(|s| (s.value - mean).powi(2))
-                    .sum::<f64>()
-                    / samples.len() as f64,
-            )
+            let mut count = 0.0;
+            let (mut mean, mut c_mean) = (0.0, 0.0);
+            let (mut aux, mut c_aux) = (0.0, 0.0);
+            for sample in samples {
+                count += 1.0;
+                let delta = sample.value - (mean + c_mean);
+                (mean, c_mean) = kahan_inc(delta / count, mean, c_mean);
+                (aux, c_aux) = kahan_inc(delta * (sample.value - (mean + c_mean)), aux, c_aux);
+            }
+            Some((aux + c_aux) / count)
         }
         RangeFunc::StddevOverTime => {
             let variance =
@@ -5781,8 +5836,25 @@ fn apply_range_func(
         // `absent_over_time` is answered by `range_func` from the matrix being
         // empty or not, so it never needs a per-series value.
         RangeFunc::AbsentOverTime => None,
-        // MetricsQL: aggregate over time with a named aggregation.
-        RangeFunc::AggrOverTime(op) => Some(aggregate_values(op, &values(samples))),
+        // MetricsQL's `aggr_over_time(<agg>, v[range])` is defined as running
+        // the aggregation of that name over the range, so it must give exactly
+        // the same answer as the equivalent `*_over_time` function — including
+        // their Kahan / Welford numeric behaviour.
+        RangeFunc::AggrOverTime(op) => {
+            let equivalent = match op {
+                AggOp::Sum => RangeFunc::SumOverTime,
+                AggOp::Avg => RangeFunc::AvgOverTime,
+                AggOp::Min => RangeFunc::MinOverTime,
+                AggOp::Max => RangeFunc::MaxOverTime,
+                AggOp::Count => RangeFunc::CountOverTime,
+                AggOp::Stddev => RangeFunc::StddevOverTime,
+                AggOp::Stdvar => RangeFunc::StdvarOverTime,
+                // `range_func` rejects every other aggregation before we get
+                // here (see `is_aggr_over_time`).
+                _ => return None,
+            };
+            apply_range_func(equivalent, samples, range_ms, param, param2)
+        }
         // The timestamp of the extreme sample, in seconds (Prometheus reports
         // `timestamp()`-shaped numbers, not samples).
         RangeFunc::TMinOverTime => samples
@@ -6084,6 +6156,58 @@ fn kahan_inc(inc: f64, sum: f64, c: f64) -> (f64, f64) {
         c += (inc - t) + sum;
     }
     (t, c)
+}
+
+/// The fold Prometheus uses for `sum(...)` and `sum_over_time(...)`: seed the
+/// accumulator with the first value, Kahan-add the rest, then fold the
+/// compensation in. An infinite accumulator is returned as is, because adding
+/// `c` to it could only turn `±Inf` into `NaN`.
+fn kahan_sum(values: &[f64]) -> f64 {
+    let mut sum = values[0];
+    let mut c = 0.0;
+    for &value in &values[1..] {
+        (sum, c) = kahan_inc(value, sum, c);
+    }
+    if sum.is_infinite() {
+        sum
+    } else {
+        sum + c
+    }
+}
+
+/// `avg(...)`, following the hybrid strategy Prometheus adopted after
+/// [issue #16714]: sum with Kahan compensation while that sum stays finite, and
+/// only fall back to the incremental mean (`mean += f/n - mean/n`) once it
+/// would overflow — at which point the mean is recomputed from the partial sum
+/// and the compensation is rescaled to match.
+fn kahan_mean(values: &[f64]) -> f64 {
+    let (mut sum, mut count) = (values[0], 1.0);
+    let (mut mean, mut c) = (0.0, 0.0);
+    let mut incremental = false;
+    for &value in &values[1..] {
+        count += 1.0;
+        if !incremental {
+            let (new_sum, new_c) = kahan_inc(value, sum, c);
+            if !new_sum.is_infinite() {
+                sum = new_sum;
+                c = new_c;
+                continue;
+            }
+            // The running sum would overflow, so from here on track the mean
+            // directly: the partial sum and its compensation both shrink by the
+            // count they were accumulated over.
+            incremental = true;
+            mean = sum / (count - 1.0);
+            c /= count - 1.0;
+        }
+        let q = (count - 1.0) / count;
+        (mean, c) = kahan_inc(value / count, q * mean, q * c);
+    }
+    if incremental {
+        mean + c
+    } else {
+        sum / count + c / count
+    }
 }
 
 /// Prometheus' `calcTrendValue`: the damped trend, with `i == 0` meaning "the
@@ -8186,6 +8310,48 @@ mod tests {
         assert!(values.len() == 3);
     }
 
+    /// MetricsQL's `aggr_over_time(<agg>, v[range])` must give exactly the
+    /// answer of the same-named `*_over_time` function, so the two never drift.
+    #[test]
+    fn test_aggr_over_time_delegates_to_the_over_time_function() {
+        let samples = |values: &[f64]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| SamplePoint {
+                    timestamp: i as i64 * 10_000,
+                    value: *v,
+                })
+                .collect()
+        };
+        let cases: [(AggOp, RangeFunc); 7] = [
+            (AggOp::Sum, RangeFunc::SumOverTime),
+            (AggOp::Avg, RangeFunc::AvgOverTime),
+            (AggOp::Min, RangeFunc::MinOverTime),
+            (AggOp::Max, RangeFunc::MaxOverTime),
+            (AggOp::Count, RangeFunc::CountOverTime),
+            (AggOp::Stddev, RangeFunc::StddevOverTime),
+            (AggOp::Stdvar, RangeFunc::StdvarOverTime),
+        ];
+        // Values picked so the numeric path matters: the Kahan sum cancels to 2
+        // where the naive one gives 1, and the Welford variance is 3 vs the
+        // two-pass 5.
+        for values in [
+            vec![1e16, 1.0, -1e16, 1.0],
+            vec![1e16, 1e16 + 1.0, 1e16 + 2.0, 1e16 + 3.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+        ] {
+            let series = samples(&values);
+            for (op, func) in cases {
+                assert_eq!(
+                    apply_range_func(RangeFunc::AggrOverTime(op), &series, 60_000, None, None),
+                    apply_range_func(func, &series, 60_000, None, None),
+                    "{op:?} vs {func:?} on {values:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_present_and_mad_over_time() {
         let samples = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
@@ -8690,6 +8856,61 @@ mod tests {
         // No argument at all is refused; a missing one is a syntax error.
         assert!(parse_err("union()").contains("at least one argument"));
         assert!(parse_err("union(m,)").contains("expected"));
+    }
+
+    /// `sum_over_time` / `avg_over_time` use the same Kahan forms as the
+    /// aggregations, and `stdvar_over_time` / `stddev_over_time` use
+    /// Prometheus' Kahan-Welford pass. Goldens from a Go port.
+    #[test]
+    fn test_over_time_kahan_and_welford_match_prometheus() {
+        let samples = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+                .collect()
+        };
+        let run = |func: RangeFunc, values: &[f64]| {
+            let series = samples(
+                &values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as i64 * 10_000, *v))
+                    .collect::<Vec<_>>(),
+            );
+            apply_range_func(func, &series, 60_000, None, None)
+        };
+        // Catastrophic cancellation: naive sums answer 1 / 0.25, Kahan 2 / 0.5.
+        let cancel = [1e16, 1.0, -1e16, 1.0];
+        assert_eq!(run(RangeFunc::SumOverTime, &cancel), Some(2.0));
+        assert_eq!(run(RangeFunc::AvgOverTime, &cancel), Some(0.5));
+        assert_eq!(
+            run(RangeFunc::SumOverTime, &[1.0, 1e16, 1.0, -1e16]),
+            Some(2.0)
+        );
+
+        // Welford variance, where the two-pass sum loses bits.
+        let welford = [1e9 + 0.1, 1e9 + 0.2, 1e9 + 0.3, 1e9 + 0.4];
+        assert_eq!(
+            run(RangeFunc::StdvarOverTime, &welford),
+            Some(0.012_499_988_079_074_598)
+        );
+        assert_eq!(
+            run(RangeFunc::StddevOverTime, &welford),
+            Some(0.111_803_345_562_977_66)
+        );
+        // The Kahan-Welford over_time pass and the plain-Welford aggregation
+        // differ on this one (3 vs 5), so pin both.
+        let extreme = [1e16, 1e16 + 1.0, 1e16 + 2.0, 1e16 + 3.0];
+        assert_eq!(run(RangeFunc::StdvarOverTime, &extreme), Some(3.0));
+        // Ordinary input still gives the textbook answer.
+        let plain = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(run(RangeFunc::SumOverTime, &plain), Some(10.0));
+        assert_eq!(run(RangeFunc::AvgOverTime, &plain), Some(2.5));
+        assert_eq!(run(RangeFunc::StdvarOverTime, &plain), Some(1.25));
+        assert_eq!(run(RangeFunc::StddevOverTime, &plain), Some(1.25f64.sqrt()));
+        // `avg_over_time` also survives an overflowing running sum.
+        let overflow = [1e308, 1e308, -1e308, -1e308];
+        assert_eq!(run(RangeFunc::AvgOverTime, &overflow), Some(0.0));
     }
 
     #[test]
@@ -9981,6 +10202,69 @@ mod tests {
         // Population variance of 1,2,3,4 is 1.25.
         assert!((aggregate_values(AggOp::Stdvar, &values) - 1.25).abs() < 1e-12);
         assert!((aggregate_values(AggOp::Stddev, &values) - 1.25f64.sqrt()).abs() < 1e-12);
+    }
+
+    /// Prometheus no longer sums with a plain `+=`: `sum` uses Kahan
+    /// compensation (`kahansum.Inc`), `avg` sums with Kahan until it would
+    /// overflow and then switches to an incremental mean, and `stdvar` walks
+    /// Welford's online recurrence. These goldens come from a Go port of those
+    /// exact routines; the naive Rust folds the port used before disagree.
+    #[test]
+    fn test_aggregations_match_prometheus_kahan_and_welford() {
+        // `[1e16, 1, -1e16, 1]` cancels catastrophically: the naive fold gives
+        // 1 (or 0, depending on order), the compensated one 2.
+        let cancel = [1e16, 1.0, -1e16, 1.0];
+        assert_eq!(aggregate_values(AggOp::Sum, &cancel), 2.0);
+        assert_eq!(aggregate_values(AggOp::Avg, &cancel), 0.5);
+        // A different order puts the big term in the middle; same answer.
+        let reordered = [1.0, 1e16, 1.0, -1e16];
+        assert_eq!(aggregate_values(AggOp::Sum, &reordered), 2.0);
+
+        // Welford vs the old two-pass variance: `1e9 + 0.1 ..= 1e9 + 0.4` has a
+        // mean so much larger than its spread that the two-pass sum loses bits.
+        let welford = [1e9 + 0.1, 1e9 + 0.2, 1e9 + 0.3, 1e9 + 0.4];
+        assert_eq!(
+            aggregate_values(AggOp::Stdvar, &welford),
+            0.012_499_988_079_074_598
+        );
+        assert_eq!(
+            aggregate_values(AggOp::Stddev, &welford),
+            0.111_803_345_562_977_66
+        );
+
+        // `avg` over values whose running sum overflows `f64`: the direct mean
+        // would be `Inf - Inf = NaN`, so Prometheus switches to the incremental
+        // mean and still lands on the exact 0.
+        let overflow = [1e308, 1e308, -1e308, -1e308];
+        assert_eq!(aggregate_values(AggOp::Avg, &overflow), 0.0);
+        // A truly infinite sum stays infinite (the compensation is dropped).
+        assert_eq!(
+            aggregate_values(AggOp::Sum, &[1.0, f64::INFINITY, 2.0]),
+            f64::INFINITY
+        );
+    }
+
+    /// `min`/`max` seed with the group's first sample and restart on NaN, which
+    /// is how Prometheus' aggregation handles a missing value.
+    #[test]
+    fn test_min_max_follow_prometheus_nan_seeding() {
+        // All NaN stays NaN (the old `fold(INFINITY, f64::min)` returned +Inf).
+        assert!(aggregate_values(AggOp::Min, &[f64::NAN, f64::NAN]).is_nan());
+        assert!(aggregate_values(AggOp::Max, &[f64::NAN, f64::NAN]).is_nan());
+        // A NaN in front is skipped once a real sample shows up.
+        assert_eq!(aggregate_values(AggOp::Min, &[f64::NAN, 3.0, 5.0]), 3.0);
+        assert_eq!(aggregate_values(AggOp::Max, &[f64::NAN, 3.0, 5.0]), 5.0);
+        // A NaN in the middle is not a restart: every comparison against NaN is
+        // false, so the running extreme simply ignores it.
+        assert_eq!(
+            aggregate_values(AggOp::Min, &[1.0, f64::NAN, 4.0, 2.0]),
+            1.0
+        );
+        assert_eq!(
+            aggregate_values(AggOp::Max, &[9.0, f64::NAN, 4.0, 2.0]),
+            9.0
+        );
+        assert_eq!(aggregate_values(AggOp::Min, &[7.0]), 7.0);
     }
 
     #[test]

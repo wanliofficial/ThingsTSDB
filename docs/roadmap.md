@@ -906,6 +906,41 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：常数序列三种规则都等于 20、斜坡区隔三种规则（10 / 30 / 20）、NaN 归零、
     单样本等于 0（与 `deriv` 丢弃不同）、五种非法 strategy 都退回梯形，以及
     `integral(m[60s])` 与 `integral(m[60s], 0)` 两种查询写法。
+- 已完成（2026-11-18）：聚合与区间函数的**浮点求和/方差**对齐 Prometheus 的
+  Kahan / Welford 实现（此前一律朴素 `+=` / 两遍法，结果在病态输入上不一致）。
+  逐条照抄当前上游（`promql/engine.go` 的 `aggregation`、`promql/functions.go`
+  的 `funcSumOverTime` / `funcAvgOverTime` / `funcStdvarOverTime`、以及
+  `util/kahansum.Inc`）：
+  - `sum(v)` / `sum_over_time(v[range])`：用 `kahansum.Inc`（Neumaier 变体；
+    中间结果溢出为 Inf 时把补偿项清零）累加，末尾 `sum + c`，若 `sum` 已是 Inf
+    则直接返回它（再 `+c` 只会把 `±Inf` 变成 NaN）。聚合从首个样本播种、
+    `sum_over_time` 从 0 起累加，与 Go 的两种写法一致；
+  - `avg(v)` / `avg_over_time(v[range])`：与上游一样是**混合**策略——只要运行和
+    不溢出就用 Kahan 累加，一旦某步会溢出就改用增量均值
+    `mean += f/n - mean/n`（并用当前计数重算 `mean`、按比例缩放补偿项），
+    返回 `mean + c`。这样 `avg([1e308,1e308,-1e308,-1e308])` 得精确的 0，
+    而「先求和再除」会给出 `Inf - Inf = NaN`；
+  - `stdvar(v)` / `stddev(v)`：**Welford 在线式**（`delta = f - mean;
+    mean += delta/n; value += delta*(f - mean)`），不是两遍法。对
+    `1e9 + {0.1,0.2,0.3,0.4}` 这种「均值远大于散布」的输入，两遍法会因求和丢位
+    而偏离；
+  - `stdvar_over_time` / `stddev_over_time`：**带 Kahan 的 Welford**（均值与
+    平方偏差和各自带补偿项），与聚合的朴素 Welford 是两条不同代码路径——在
+    `1e16 + {0,1,2,3}` 上聚合得 5、区间函数得 3，二者**本就不同**，因此分别照抄；
+  - `min(v)` / `max(v)`：改为「用首个样本播种，仅当 `acc < f` / `acc > f`
+    **或 `acc` 是 NaN** 时替换」。全 NaN 组得 NaN（旧的
+    `fold(INFINITY, f64::min)` 会返回 `+Inf`）；中间插入的 NaN 不触发重启
+    （与 NaN 比较恒为假，被自然忽略）；
+  - MetricsQL 的 `aggr_over_time(<agg>, v[range])` 改为**委托**给同名的
+    `*_over_time` 函数，保证两条入口逐位一致（VM 的定义就是按名字选 rollup）；
+  - 有意**不改**的：VM 语义的 `sum2` / `geomean` / `median` / `mode` / `distinct`
+    聚合与 `share` / `zscore` 等（VM 用朴素累加），保持原样；
+  - 测试：用 Go 版复刻上述例程生成的黄金值做断言——`[1e16,1,-1e16,1]` 求和
+    为 2（朴素为 1 或 0）、9 条 `[1e16, 1×8]` 跨序列求和为
+    `1.0000000000000008e16`（朴素为 `1e16`）、Welford 方差
+    `0.012499988079074598`、`1e16+{0..3}` 区间方差 3、溢出输入 `avg` 为 0；
+    另有 NaN 播种和 `aggr_over_time` 等价的用例；活服务冒烟逐项复现同样的值，
+    日志 0 error。
 - 已完成（2026-11-13）：`max_of(a, b)` / `min_of(a, b)`（两个标量进、一个标量出）。
   Prometheus 把它们当作时长表达式里的辅助函数（`max_of(step(), 5s)`），同时也
   接受普通数字。语义照抄 `funcMaxOf` / `funcMinOf`，与 `max`/`min` 聚合的 NaN
