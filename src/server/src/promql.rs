@@ -4822,6 +4822,33 @@ impl<'a> Evaluator<'a> {
             Expr::Range { range_ms, .. } | Expr::Subquery { range_ms, .. } => *range_ms,
             _ => 0,
         };
+        // `rate` / `increase` / `delta` stretch towards the window edges. A
+        // bare range selector's bounds move with `offset` and `@`, exactly like
+        // the samples `matrix_of` returned; a subquery is rewritten upstream
+        // into a synthetic matrix selector with the same range and offset, so
+        // it extrapolates identically.
+        let extrapolation = match expr {
+            Expr::Range {
+                range_ms,
+                offset_ms,
+                at: pinned,
+                ..
+            }
+            | Expr::Subquery {
+                range_ms,
+                offset_ms,
+                at: pinned,
+                ..
+            } => {
+                let end = self.resolve_at(*pinned, at_ms) - offset_ms;
+                Some(Extrapolation {
+                    range_start: end - range_ms,
+                    range_end: end,
+                    range_ms: *range_ms,
+                })
+            }
+            _ => None,
+        };
         let param = match param {
             Some(param) => Some(self.scalar_of(param, at_ms)?),
             None => None,
@@ -4884,7 +4911,14 @@ impl<'a> Evaluator<'a> {
             });
         }
         for series in &matrix.0 {
-            if let Some(value) = apply_range_func(func, &series.samples, range_ms, param, param2) {
+            if let Some(value) = apply_range_func_in(
+                func,
+                &series.samples,
+                range_ms,
+                param,
+                param2,
+                extrapolation,
+            ) {
                 let mut labels = series.labels.clone();
                 // `first_over_time` and `last_over_time` act like `offset`, so
                 // Prometheus keeps the metric name for them; every other range
@@ -5715,12 +5749,94 @@ fn go_format_g(value: f64) -> String {
     out
 }
 
+/// The evaluation window a rate-style function may extrapolate towards:
+/// `rangeStart` and `rangeEnd` are the range selector's bounds in
+/// milliseconds, with `range` its width.
+///
+/// Prometheus' `extrapolatedRate` stretches a `rate` / `increase` / `delta`
+/// by a factor derived from how far the first and last samples sit from the
+/// window edges, so a series sampled every 15 s still yields a sane rate when
+/// the query step is 1 m. It is only meaningful for a bare range selector, so
+/// subqueries pass `None` and keep the plain slope.
+#[derive(Debug, Clone, Copy)]
+struct Extrapolation {
+    range_start: i64,
+    range_end: i64,
+    range_ms: i64,
+}
+
+/// Prometheus' `extrapolatedRate`, for a bare range selector.
+///
+/// `result` is the already-reset-corrected change over the window. The rate is
+/// then stretched towards the window edges: if the first sample sits within
+/// 1.1 average sample intervals of the start, the change is extrapolated all
+/// the way there, otherwise only by half an interval (the series presumably
+/// begins somewhere in between). The same applies to the end, and for a
+/// counter the start is additionally clamped at the point where the counter
+/// would have been zero, so extrapolation cannot invent negative values.
+fn extrapolate_rate(
+    samples: &[SamplePoint],
+    result: f64,
+    is_counter: bool,
+    is_rate: bool,
+    window: Extrapolation,
+) -> Option<f64> {
+    let first = samples.first()?;
+    let last = samples.last()?;
+    let mut duration_to_start = (first.timestamp - window.range_start) as f64 / 1_000.0;
+    let mut duration_to_end = (window.range_end - last.timestamp) as f64 / 1_000.0;
+    let sampled_interval = (last.timestamp - first.timestamp) as f64 / 1_000.0;
+    let num_samples_minus_one = samples.len() - 1;
+    if num_samples_minus_one == 0 {
+        return None;
+    }
+    let average = sampled_interval / num_samples_minus_one as f64;
+    let threshold = average * 1.1;
+    if duration_to_start >= threshold {
+        duration_to_start = average / 2.0;
+    }
+    if is_counter && result > 0.0 && first.value >= 0.0 {
+        // Where the counter would have crossed zero at the observed slope.
+        let duration_to_zero = sampled_interval * (first.value / result);
+        if duration_to_zero < duration_to_start {
+            duration_to_start = duration_to_zero;
+        }
+    }
+    if duration_to_end >= threshold {
+        duration_to_end = average / 2.0;
+    }
+    let factor = if sampled_interval != 0.0 {
+        (sampled_interval + duration_to_start + duration_to_end) / sampled_interval
+    } else {
+        1.0
+    };
+    // Upstream divides the *factor* by the range before scaling the result,
+    // not the other way around; the two orderings differ in the last ULP.
+    let factor = if is_rate {
+        factor / (window.range_ms as f64 / 1_000.0)
+    } else {
+        factor
+    };
+    Some(result * factor)
+}
+
 fn apply_range_func(
     func: RangeFunc,
     samples: &[SamplePoint],
     range_ms: i64,
     param: Option<f64>,
     param2: Option<f64>,
+) -> Option<f64> {
+    apply_range_func_in(func, samples, range_ms, param, param2, None)
+}
+
+fn apply_range_func_in(
+    func: RangeFunc,
+    samples: &[SamplePoint],
+    range_ms: i64,
+    param: Option<f64>,
+    param2: Option<f64>,
+    extrapolation: Option<Extrapolation>,
 ) -> Option<f64> {
     if samples.is_empty() {
         return None;
@@ -5752,27 +5868,36 @@ fn apply_range_func(
     let first = samples.first()?;
     let last = samples.last()?;
     match func {
-        RangeFunc::Rate | RangeFunc::Increase => {
-            // Counter slope: a decrease means the counter reset, which
-            // Prometheus treats as a drop to zero before continuing.
-            let mut delta = 0.0;
-            let mut previous = first.value;
-            for sample in &samples[1..] {
-                if sample.value >= previous {
-                    delta += sample.value - previous;
-                } else {
-                    delta += sample.value;
+        RangeFunc::Rate | RangeFunc::Increase | RangeFunc::Delta => {
+            // Prometheus' `extrapolatedRate`. A counter's `rate`/`increase`
+            // first folds in every decrease as a reset (a drop to zero), then
+            // stretches the total towards the window edges; `delta` skips the
+            // reset handling but keeps the extrapolation.
+            let is_counter = func != RangeFunc::Delta;
+            let mut result = last.value - first.value;
+            if is_counter {
+                for pair in samples.windows(2) {
+                    if pair[1].value < pair[0].value {
+                        result += pair[0].value;
+                    }
                 }
-                previous = sample.value;
             }
-            if func == RangeFunc::Increase {
-                return Some(delta);
-            }
-            let span_ms = last.timestamp - first.timestamp;
-            if span_ms <= 0 {
-                return None;
-            }
-            Some(delta * 1_000.0 / span_ms as f64)
+            // Without a window there is nothing to extrapolate towards, which
+            // is how the unit tests drive the function.
+            let Some(window) = extrapolation else {
+                if func == RangeFunc::Increase {
+                    return Some(result);
+                }
+                let sampled = (last.timestamp - first.timestamp) as f64 / 1_000.0;
+                if sampled == 0.0 {
+                    return None;
+                }
+                if func == RangeFunc::Delta {
+                    return Some(result);
+                }
+                return Some(result / sampled);
+            };
+            extrapolate_rate(samples, result, is_counter, func == RangeFunc::Rate, window)
         }
         RangeFunc::Irate => {
             if samples.len() < 2 {
@@ -5790,7 +5915,6 @@ fn apply_range_func(
             }
             Some(delta * 1_000.0 / span_ms as f64)
         }
-        RangeFunc::Delta => Some(last.value - first.value),
         RangeFunc::Idelta => {
             if samples.len() < 2 {
                 return None;
@@ -10777,6 +10901,62 @@ mod tests {
         assert_eq!(changes(&[f64::NAN, 2.0]), Some(1.0));
         // And an ordinary change still counts.
         assert_eq!(changes(&[1.0, 2.0, 2.0, 3.0]), Some(2.0));
+    }
+
+    /// `rate` / `increase` / `delta` stretch towards the range window edges,
+    /// following Prometheus' `extrapolatedRate`. Goldens from a Go port.
+    #[test]
+    fn test_rate_extrapolation_matches_prometheus() {
+        let make = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+                .collect()
+        };
+        let run = |func: RangeFunc, values: &[(i64, f64)], window: Extrapolation| {
+            apply_range_func_in(
+                func,
+                &make(values),
+                window.range_ms,
+                None,
+                None,
+                Some(window),
+            )
+        };
+        let minute = Extrapolation {
+            range_start: 0,
+            range_end: 60_000,
+            range_ms: 60_000,
+        };
+        // Samples filling the window exactly: no stretching, factor 1.
+        let full: Vec<(i64, f64)> = (0..=4).map(|i| (i * 15_000, i as f64 * 15.0)).collect();
+        assert_eq!(run(RangeFunc::Rate, &full, minute), Some(1.0));
+        assert_eq!(run(RangeFunc::Increase, &full, minute), Some(60.0));
+
+        // Samples only in the middle (20..40 s of a 60 s window): every gap
+        // exceeds the 11 s threshold, so each shrinks to half an average
+        // interval (5 s) and factor = (20+5+5)/20 = 1.5.
+        let inner = [(20_000, 0.0), (30_000, 10.0), (40_000, 20.0)];
+        assert_eq!(run(RangeFunc::Increase, &inner, minute), Some(25.0));
+        let rate = run(RangeFunc::Rate, &inner, minute).unwrap();
+        assert!((rate - 25.0 / 60.0).abs() < 1e-15, "got {rate}");
+
+        // A counter is clamped where it would have crossed zero: first value 2
+        // over an increase of 10 across 40 s starts only 8 s early.
+        let clamped = [(10_000, 2.0), (50_000, 12.0)];
+        assert_eq!(run(RangeFunc::Increase, &clamped, minute), Some(14.5));
+
+        // `delta` ignores counter resets but still extrapolates.
+        let drop = [(0, 10.0), (30_000, 5.0), (60_000, 20.0)];
+        assert_eq!(run(RangeFunc::Delta, &drop, minute), Some(10.0));
+        // The same series as a counter counts the 10 -> 5 drop as a reset.
+        assert_eq!(run(RangeFunc::Increase, &drop, minute), Some(20.0));
+
+        // Without a window the plain slope is kept (unit-test behaviour).
+        assert_eq!(
+            apply_range_func(RangeFunc::Increase, &make(&full), 60_000, None, None),
+            Some(60.0)
+        );
     }
 
     /// `min_over_time` / `max_over_time` seed with the first sample and also

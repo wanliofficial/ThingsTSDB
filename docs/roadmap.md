@@ -963,6 +963,31 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`changes` 的 NaN→NaN 为 0、单边 NaN 为 1；全 NaN 区间的 min/max 为
     NaN、前导 NaN 被真实值替换、中段 NaN 不参与；`topk(3, ...)` 不含 NaN 而
     `topk(4, ...)` 把 NaN 放在末尾（bottomk 同理）；活服务冒烟逐项复现，日志 0 error。
+- 已完成（2026-11-18）：`rate()` / `increase()` / `delta()` 补上 Prometheus 的
+  **窗口外推**（`extrapolatedRate`）。此前只按「首尾样本差 ÷ 首尾时间差」算斜率，
+  于是查询步长大于采样间隔时结果系统性偏低：窗口里只有中间几个样本时，Prometheus
+  会把变化量朝窗口两端拉伸，而这里不会。逐条照抄上游：
+  - 计数器先处理回绕：相邻样本下降即视为一次 reset，把**前一个样本值**加到总量上
+    （`delta` 是 gauge，不做这步）；
+  - 再算窗口两端到首/末样本的距离 `durationToStart` / `durationToEnd`，以及平均
+    采样间隔；某端距离超过 `1.1 × 平均间隔` 时，说明序列大概在窗口内部才开始/结束，
+    只外推**半个平均间隔**，否则外推到窗口边界；
+  - 计数器额外把起点钳在「计数器为零」的时刻（`sampledInterval * first/result`），
+    以免外推出负数；
+  - `factor = (sampled + start + end) / sampled`，`rate` 再把 **factor** 除以窗口
+    秒数（上游是除 factor 而非除结果，末位 ULP 因此不同，照抄）；`sampled == 0`
+    时 factor 取 1；
+  - 单样本没有平均间隔，直接不输出（`delta` 也一样，与 `deriv` 不同）；
+  - 窗口边界随 `offset` / `@` 平移（和样本一致）；`[range:step]` 子查询上游会被
+    改写成等价的 MatrixSelector，因此同样外推——窗口从 `Range` 与 `Subquery`
+    两种 AST 都取 `offset_ms` / `at`；
+  - 单元测试用 `apply_range_func`（无窗口）走「不外推」路径，因此新增
+    `apply_range_func_in(.., Some(Extrapolation))` 显式传窗口；
+  - 测试：填满窗口的序列 factor 为 1（rate 1/s、increase 60）、只在中间 20–40 s
+    的序列 factor 1.5（increase 25、rate 25/60）、计数器零点钳位（increase 14.5）、
+    含下降的 gauge 用 `delta` 得 10 而按计数器算得 20；活服务冒烟逐项复现同样的
+    值（`0.9999999999999999` 的 rate 是 factor 除法后的浮点末位，与 Go 一致），
+    日志 0 error。
 - 已完成（2026-11-13）：`max_of(a, b)` / `min_of(a, b)`（两个标量进、一个标量出）。
   Prometheus 把它们当作时长表达式里的辅助函数（`max_of(step(), 5s)`），同时也
   接受普通数字。语义照抄 `funcMaxOf` / `funcMinOf`，与 `max`/`min` 聚合的 NaN
