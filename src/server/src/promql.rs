@@ -86,6 +86,14 @@
 //! `ExpandString`; a series whose source value does not match passes through
 //! unchanged, and an empty result deletes the destination label.
 //!
+//! `absent(v)` answers `1` labelled with `v`'s equality matchers when `v` is
+//! empty, exactly as Prometheus' `createLabelsForAbsentFunction` builds them:
+//! metadata labels (any `__` prefix, `__name__` included) are skipped, the
+//! first equality matcher for a name sets that label, and a repeated equality
+//! matcher or a non-equality one deletes it. So
+//! `absent(x{job="a",foo="bar"})` answers `{job="a",foo="bar"} 1`, while
+//! `absent(x{job="a",job="b"})` answers `{} 1`.
+//!
 //! MetricsQL's label helpers follow `transform.go` too: `label_set` applies
 //! its name/value pairs in order and an empty value deletes the label
 //! (`alias` is `label_set` on `__name__`); `label_del` and `label_keep` treat
@@ -1573,7 +1581,17 @@ pub enum Expr {
     /// MetricsQL `union(v1, v2, ...)` — concatenates the arguments' series and
     /// keeps the first occurrence of every label set.
     Union(Vec<Expr>),
-    Absent(Box<Expr>),
+    /// `absent(v)` — `1` with the selector's equality matchers when `v` is
+    /// empty, nothing otherwise.
+    ///
+    /// `labels` is Prometheus' `createLabelsForAbsentFunction` applied to the
+    /// argument at parse time: a raw selector contributes its equality
+    /// matchers (metadata labels skipped, a repeated or non-equality matcher
+    /// deletes the label), anything else contributes nothing.
+    Absent {
+        expr: Box<Expr>,
+        labels: Vec<(String, String)>,
+    },
     /// `vector(scalar)` lifts a scalar into a one-sample vector.
     Vector(Box<Expr>),
     /// `scalar(v)` — the sole value of a one-sample vector, NaN otherwise.
@@ -1728,7 +1746,7 @@ impl Expr {
             }
             Expr::Sort { expr, .. }
             | Expr::SortByLabel { expr, .. }
-            | Expr::Absent(expr)
+            | Expr::Absent { expr, .. }
             | Expr::Vector(expr) => expr.selectors(out),
             Expr::Scalar { expr, .. } => expr.selectors(out),
             Expr::Clamp { expr, min, max } => {
@@ -1898,7 +1916,7 @@ impl Expr {
             }
             Expr::Sort { expr, .. }
             | Expr::SortByLabel { expr, .. }
-            | Expr::Absent(expr)
+            | Expr::Absent { expr, .. }
             | Expr::Vector(expr) => expr.widen_window(query_start_ms, query_end_ms, start, end),
             Expr::Scalar { expr, .. } => {
                 expr.widen_window(query_start_ms, query_end_ms, start, end)
@@ -3137,7 +3155,13 @@ impl Parser {
             "absent" => {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
-                Ok(Expr::Absent(Box::new(expr)))
+                // Prometheus derives the answer's labels from the argument's
+                // equality matchers (see `absent_labels`).
+                let labels = absent_labels(&expr);
+                Ok(Expr::Absent {
+                    expr: Box::new(expr),
+                    labels,
+                })
             }
             "vector" => {
                 let expr = self.expression(0)?;
@@ -3473,6 +3497,47 @@ fn describe(token: Option<Token>) -> String {
         Some(token) => token.describe(),
         None => "end of query".to_string(),
     }
+}
+
+/// Prometheus' `createLabelsForAbsentFunction`: the labels `absent()` writes on
+/// its result when the argument matched nothing.
+///
+/// Only a selector contributes. Prometheus walks the selector's matchers in
+/// order: metadata labels (any name starting with `__`, so `__name__`
+/// included) are skipped, an equality matcher sets its label the first time it
+/// is seen, and anything else — a non-equality matcher, or a second equality
+/// matcher for the same name — deletes that label. That keeps the documented
+/// backwards-compatible behaviour:
+///
+/// ```text
+/// absent(x{job="a",foo="bar"})         -> {job="a",foo="bar"} 1
+/// absent(x{job="a",job="b",foo="bar"}) -> {foo="bar"} 1
+/// absent(x{job!="a"})                  -> {} 1
+/// ```
+fn absent_labels(expr: &Expr) -> Vec<(String, String)> {
+    let matchers = match expr {
+        Expr::Selector { selector, .. } | Expr::Range { selector, .. } => &selector.matchers,
+        // `absent(sum(x))` and friends have no selector to read: Prometheus
+        // answers a bare `1`.
+        _ => return Vec::new(),
+    };
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    // Prometheus' `has`: set on the first equality matcher and never cleared,
+    // so a second equality matcher deletes the label but a following one
+    // cannot bring it back either.
+    let mut seen: HashSet<String> = HashSet::new();
+    for (kind, name, value) in matchers {
+        if name.starts_with("__") {
+            continue;
+        }
+        if *kind == MatcherType::Eq && !seen.contains(name) {
+            labels.insert(name.clone(), value.clone());
+            seen.insert(name.clone());
+        } else {
+            labels.remove(name);
+        }
+    }
+    labels.into_iter().collect()
 }
 
 /// Best-effort rendering of an expression for error messages.
@@ -3819,12 +3884,14 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 })
             }
-            Expr::Absent(expr) => {
+            Expr::Absent { expr, labels } => {
                 let instant = self.eval(expr, at_ms)?;
                 let empty = instant.scalar.is_none() && instant.vector.is_empty();
                 let mut vector = Vector::default();
                 if empty {
-                    vector.push(BTreeMap::new(), 1.0);
+                    // Prometheus answers `1` labelled with the selector's
+                    // equality matchers, not a bare `{}` (see `absent_labels`).
+                    vector.push(labels.iter().cloned().collect(), 1.0);
                 }
                 Ok(Instant {
                     vector,
@@ -11394,6 +11461,67 @@ mod tests {
         // interpolation (avoids rounding error / underflow).
         assert_eq!(quantile_of(&[5.0, 5.0, 5.0], 0.5), 5.0);
         assert_eq!(quantile_of(&[7.0], 0.3), 7.0);
+    }
+
+    #[test]
+    fn test_absent_carries_selector_equality_matchers() {
+        // Prometheus' createLabelsForAbsentFunction: an absent selector writes
+        // its equality matchers into the result instead of a bare `{}`.
+        let absent = |query: &str| {
+            let out = eval_series(vec![], r#"x{job="a",foo="bar"}"#, query, 0);
+            rendered(&out.vector)
+        };
+        // `absent(x{job="a",foo="bar"})` -> `{job="a",foo="bar"} 1`.
+        assert_eq!(
+            absent(r#"absent(x{job="a",foo="bar"})"#),
+            vec![("{foo=\"bar\",job=\"a\"}".to_string(), 1.0)]
+        );
+        // A repeated equality matcher deletes the label (historic behaviour).
+        assert_eq!(
+            absent(r#"absent(x{job="a",job="b",foo="bar"})"#),
+            vec![("{foo=\"bar\"}".to_string(), 1.0)]
+        );
+        // A non-equality matcher deletes the label it names.
+        assert_eq!(
+            absent(r#"absent(x{job!="a"})"#),
+            vec![("{}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            absent(r#"absent(x{job=~"a",foo="bar"})"#),
+            vec![("{foo=\"bar\"}".to_string(), 1.0)]
+        );
+        // A later non-equality matcher wins over an earlier equality one...
+        assert_eq!(
+            absent(r#"absent(x{job="a",foo="bar",foo!="b"})"#),
+            vec![("{job=\"a\"}".to_string(), 1.0)]
+        );
+        // ...but a later equality matcher survives an earlier non-equality one,
+        // because Prometheus' `has` map is only set by the equality branch.
+        assert_eq!(
+            absent(r#"absent(x{job!="a",job="b"})"#),
+            vec![("{job=\"b\"}".to_string(), 1.0)]
+        );
+        // Metadata labels (`__` prefix) never reach the result.
+        assert_eq!(
+            absent(r#"absent(x{__aaa="1",job="a"})"#),
+            vec![("{job=\"a\"}".to_string(), 1.0)]
+        );
+        // A bare selector and a non-selector argument both answer `{} 1`.
+        assert_eq!(absent("absent(x)"), vec![("{}".to_string(), 1.0)]);
+        assert_eq!(absent("absent(sum(x))"), vec![("{}".to_string(), 1.0)]);
+        // When the selector is present the answer is empty.
+        let series = vec![synthetic_labeled(
+            "x",
+            &[("job", "a"), ("foo", "bar")],
+            &[(0, 7.0)],
+        )];
+        let out = eval_series(
+            series,
+            r#"x{job="a",foo="bar"}"#,
+            r#"absent(x{job="a",foo="bar"})"#,
+            0,
+        );
+        assert!(out.vector.is_empty());
     }
 
     #[test]

@@ -764,6 +764,20 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`present_over_time` 对普通序列与全 NaN 序列都返回 1、空区间不出现；
     `mad_over_time` 对 `[1,2,3,4]` 得 1、单样本得 0、含 NaN 得 NaN；解析测试
     覆盖两个新函数名。
+- 已完成（2026-11-17）：`absent(v)` 的结果标签对齐 Prometheus 的
+  `createLabelsForAbsentFunction`。此前参数为空时恒返回**无标签**的 `1`；现在把
+  选择器的**等值匹配器**带进结果：
+  - 只对选择器（`Selector`/`Range`）生效：按匹配器书写顺序遍历，跳过 metadata
+    标签（任何 `__` 开头的名字，`__name__` 在内），`=` 匹配器首次出现时写入该
+    标签，其余情况（`!=`/`=~`/`!~`，或同名 `=` 再次出现）删除该标签；
+  - 因此 `absent(x{job="a",foo="bar"})` → `{job="a",foo="bar"} 1`，
+    `absent(x{job="a",job="b",foo="bar"})` → `{foo="bar"} 1`（历史兼容行为），
+    `absent(x{job!="a"})` → `{} 1`；参数不是选择器（如 `absent(sum(x))`）时仍是
+    无标签的 `1`，选择器命中了样本时结果为空向量；
+  - 标签在解析期按上面的规则算好并存进 `Expr::Absent`，求值时只在空向量上写出；
+  - 测试：上面各例、`__` 前缀标签被跳过、以及「后置 `=` 绕过前置 `!=`」
+    （Prometheus 的 `has` 只由 `=` 分支置位，所以 `{job!="a",job="b"}` 里
+    `job="b"` 会保留）；活服务冒烟逐条验证同样的标签，日志 0 error。
 - 已完成（2026-11-13）：`histogram_fraction(lower, upper, v)`（经典 `le` 桶）。
   `bucket_fraction` 逐行照抄 Prometheus：区间 `(lower, upper]` 内的观测占比，
   `lower` 正数时不含、负数时含，`upper` 反之（由仅在桶内部插值推出），首个桶
