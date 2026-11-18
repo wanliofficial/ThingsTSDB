@@ -312,6 +312,13 @@ fn bad<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::Bad(message.into()))
 }
 
+/// Prometheus' labelset-collision error. Upstream raises it from evaluation,
+/// so it is an execution error (`error_type() == "execution"`), but the message
+/// is the one users copy from.
+fn same_labelset_error() -> Error {
+    Error::Exec("vector cannot contain metrics with the same labelset".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Lexer
 // ---------------------------------------------------------------------------
@@ -646,6 +653,10 @@ type LabelSet = BTreeMap<String, String>;
 /// The match key of a label set: the label pairs that decide whether two
 /// series on the two sides of a binary operation are the same series.
 type MatchKey = Vec<(String, String)>;
+
+/// The output rows a range query accumulates: the label set a series is
+/// reported under, and the `(timestamp, value)` points gathered for it so far.
+type SeriesRows = HashMap<MatchKey, (LabelSet, Vec<(i64, f64)>)>;
 
 /// The match key of a label set under `matching`.
 ///
@@ -1224,10 +1235,11 @@ impl DateFunc {
     /// The component of the instant `unix_secs`, in UTC, exactly as
     /// `dateWrapper` reads it.
     ///
-    /// Prometheus converts each sample's value with `int64(el.F)`, which in Go
-    /// **truncates towards zero** — so `-0.5` s is the epoch, not the second
-    /// before it. `days_in_month` counts by asking for the 32nd day of the
-    /// month, which Go normalises back into the last day of that month.
+    /// Prometheus converts each sample's value with
+    /// `int64(math.Floor(el.F))`, so `-0.5` s belongs to the *preceding*
+    /// second (`promql/functions.go`, PR #20056: truncation put `-0.5` s in
+    /// the epoch instead). `days_in_month` counts by asking for the 32nd day
+    /// of the month, which Go normalises back into the last day of that month.
     fn of(self, unix_secs: i64) -> f64 {
         let date = civil_from_unix_seconds(unix_secs);
         match self {
@@ -1243,14 +1255,13 @@ impl DateFunc {
     }
 }
 
-/// Go's `int64(f)` conversion, which Prometheus applies via
-/// `time.Unix(int64(el.F), 0)`.
+/// Go's `int64(math.Floor(value))`, which Prometheus applies via
+/// `time.Unix(int64(math.Floor(el.F)), 0)`.
 ///
-/// Go **truncates towards zero**, whereas the earlier `floor()` moved every
-/// negative fractional instant back a second (`-0.5` s became 1969-12-31T23:59
-/// instead of the epoch). That one-second shift changes `day_of_month`,
-/// `hour`, `minute` and `year` for negative fractional inputs, so it is worth
-/// matching exactly.
+/// The floor matters for negative fractional instants: `-0.5` s belongs to
+/// 1969-12-31T23:59:59, not to the epoch. Upstream used a plain `int64(el.F)`
+/// (truncation towards zero) until PR #20056 corrected it, so
+/// `year(vector(-0.5))` used to be 1970.
 ///
 /// A NaN or infinite value has no date at all. Go's `int64` conversion is
 /// unspecified there (amd64 yields `math.MinInt64`, which `dateWrapper` then
@@ -1258,11 +1269,11 @@ impl DateFunc {
 /// the epoch, which is what the roadmap documents. Finite magnitudes beyond
 /// `i64` saturate, so an absurd-but-finite timestamp still lands on a real date
 /// instead of wrapping.
-fn truncate_unix_seconds(value: f64) -> i64 {
+fn floor_unix_seconds(value: f64) -> i64 {
     if !value.is_finite() {
         return 0;
     }
-    value.trunc() as i64
+    value.floor() as i64
 }
 
 /// A UTC calendar instant, with the day count since the Unix epoch kept so
@@ -3816,6 +3827,12 @@ impl<'a> Evaluator<'a> {
                     }
                     for point in instant.vector.0.iter_mut() {
                         point.value = -point.value;
+                        // Unary minus is an arithmetic operation, so it drops
+                        // the metadata labels like every other one
+                        // (`promql/engine.go`, the `*parser.UnaryExpr` branch
+                        // with `DropReserved(schema.IsMetadataLabel)`).
+                        // Unary plus is a no-op and keeps them.
+                        drop_metadata_labels(&mut point.labels);
                     }
                     Ok(instant)
                 } else {
@@ -4351,11 +4368,11 @@ impl<'a> Evaluator<'a> {
                 let mut vector = Vector::default();
                 let Some(expr) = expr else {
                     // No argument: one label-less sample from the evaluation
-                    // instant (Prometheus' `time.Unix(enh.Ts/1000, 0)`). The
-                    // division is integer division, which truncates towards
-                    // zero in Go, so `-1500` ms reads as `-1` s and not `-2`:
-                    // the epoch-inclusive floor happens inside `time.Unix`.
-                    vector.push(BTreeMap::new(), func.of(at_ms / 1_000));
+                    // instant. Prometheus reads it with
+                    // `time.UnixMilli(enh.Ts)`, i.e. the instant floored to the
+                    // millisecond and then to the second, so `-1500` ms is
+                    // 1969-12-31T23:59:59 and `-500` ms is ...23:59:59 too.
+                    vector.push(BTreeMap::new(), func.of(at_ms.div_euclid(1_000)));
                     return Ok(Instant {
                         vector,
                         scalar: None,
@@ -4375,7 +4392,7 @@ impl<'a> Evaluator<'a> {
                 for point in points.0 {
                     let mut labels = point.labels;
                     drop_metadata_labels(&mut labels);
-                    vector.push(labels, func.of(truncate_unix_seconds(point.value)));
+                    vector.push(labels, func.of(floor_unix_seconds(point.value)));
                 }
                 Ok(Instant {
                     vector,
@@ -8132,6 +8149,44 @@ pub async fn instant_query(
     }))
 }
 
+/// Folds one step's output into the range-query result.
+///
+/// A step may not produce two samples with the same labelset. Upstream raises
+/// "vector cannot contain metrics with the same labelset" from `rangeEval`
+/// (`promql/engine.go`), which tracks the last step seen for each output series
+/// in a hash map and refuses a repeat.
+///
+/// Upstream first *merges* series that share a labelset but have disjoint
+/// timestamps (`mergeSeriesWithSameLabelset`, PR #18631), which is why
+/// `max_over_time({__name__=~"metric_.*"}[5m])` over two alternating metrics is
+/// legal: at every step only one of them is inside the window. Evaluating step
+/// by step never sees both at once in that case, so only a genuine collision
+/// within one step has to be rejected here.
+fn record_step(
+    values: &Vector,
+    at: i64,
+    order: &mut Vec<MatchKey>,
+    series: &mut SeriesRows,
+) -> Result<()> {
+    let mut seen: std::collections::HashSet<MatchKey> = std::collections::HashSet::new();
+    for point in &values.0 {
+        let signature: MatchKey = point
+            .labels
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        if !seen.insert(signature.clone()) {
+            return Err(same_labelset_error());
+        }
+        let entry = series.entry(signature.clone()).or_insert_with(|| {
+            order.push(signature);
+            (point.labels.clone(), Vec::new())
+        });
+        entry.1.push((at, point.value));
+    }
+    Ok(())
+}
+
 /// The `data` object of a range query.
 ///
 /// Each step is evaluated independently over the same fetched samples, so the
@@ -8167,8 +8222,8 @@ pub async fn range_query(
 
     // Result series keyed by their exact label set, in first-seen order so the
     // output is stable across identical queries.
-    let mut order: Vec<Vec<(String, String)>> = Vec::new();
-    let mut series: HashMap<MatchKey, (LabelSet, Vec<(i64, f64)>)> = HashMap::new();
+    let mut order: Vec<MatchKey> = Vec::new();
+    let mut series = SeriesRows::new();
 
     let mut at = start_ms;
     loop {
@@ -8180,18 +8235,7 @@ pub async fn range_query(
         } else {
             instant.vector
         };
-        for point in values.0 {
-            let signature: Vec<(String, String)> = point
-                .labels
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            let entry = series.entry(signature.clone()).or_insert_with(|| {
-                order.push(signature);
-                (point.labels.clone(), Vec::new())
-            });
-            entry.1.push((at, point.value));
-        }
+        record_step(&values, at, &mut order, &mut series)?;
         if at >= end_ms {
             break;
         }
@@ -10358,48 +10402,151 @@ mod tests {
         assert!(year.is_finite() && year > 1_000_000.0, "got {year}");
     }
 
-    /// Prometheus reads a sample value with `int64(el.F)` and the evaluation
-    /// instant with `enh.Ts / 1000` — both **truncate towards zero** in Go.
-    /// A `floor()` shifts every negative fractional instant back a second, so
-    /// `-0.5` s became 1969-12-31T23:59 instead of the epoch. Goldens from a Go
-    /// port of `dateWrapper`.
+    /// Prometheus reads a sample value with `int64(math.Floor(el.F))` and the
+    /// evaluation instant with `time.UnixMilli(enh.Ts)` — both **floor**, so a
+    /// negative fractional instant belongs to the preceding second
+    /// (`promql/functions.go`, PR #20056). Goldens from a Go port of
+    /// `dateWrapper`.
     #[test]
-    fn test_date_functions_truncate_towards_zero_like_go() {
+    fn test_date_functions_floor_negative_fractions_like_go() {
         let run_value = |value: f64| {
             let series = synthetic_labeled("m", &[("job", "api")], &[(0, value)]);
             move |query: &str| eval_synthetic(series.clone(), "m", query, 0)[0].1
         };
-        // `int64(-0.5)` is 0 in Go, so both the date and the clock read as the
-        // epoch; `floor()` would have given 1969-12-31T23:59.
+        // `floor(-0.5)` is -1, so the date is the last second of 1969, a
+        // Wednesday; truncation towards zero used to give the epoch instead.
         let at = run_value(-0.5);
-        assert_eq!(at("year(m)"), 1970.0);
-        assert_eq!(at("month(m)"), 1.0);
-        assert_eq!(at("day_of_month(m)"), 1.0);
-        assert_eq!(at("hour(m)"), 0.0);
-        assert_eq!(at("minute(m)"), 0.0);
-        // `int64(-1.5)` is -1: the last second of 1969, a Wednesday.
-        let at = run_value(-1.5);
         assert_eq!(at("year(m)"), 1969.0);
         assert_eq!(at("month(m)"), 12.0);
         assert_eq!(at("day_of_month(m)"), 31.0);
         assert_eq!(at("day_of_week(m)"), 3.0);
         assert_eq!(at("day_of_year(m)"), 365.0);
+        assert_eq!(at("days_in_month(m)"), 31.0);
         assert_eq!(at("hour(m)"), 23.0);
         assert_eq!(at("minute(m)"), 59.0);
-        // A whole negative day truncates to itself, so the clock is midnight.
+        // Even a tiny negative fraction belongs to the previous second.
+        let at = run_value(-0.001);
+        assert_eq!(at("minute(m)"), 59.0);
+        // `floor(-60.5)` is -61, i.e. minute 58 of the same hour.
+        let at = run_value(-60.5);
+        assert_eq!(at("hour(m)"), 23.0);
+        assert_eq!(at("minute(m)"), 58.0);
+        // `floor(-3600.001)` is -3601, so the clock reads 22:59.
+        let at = run_value(-3_600.001);
+        assert_eq!(at("hour(m)"), 22.0);
+        assert_eq!(at("minute(m)"), 59.0);
+        // A whole negative day floors to itself: the day before the epoch.
         let at = run_value(-86_400.0);
         assert_eq!(at("day_of_month(m)"), 31.0);
+        assert_eq!(at("month(m)"), 12.0);
         assert_eq!(at("hour(m)"), 0.0);
         assert_eq!(at("minute(m)"), 0.0);
-        // No-argument form: `enh.Ts / 1000` truncates the same way. -1500 ms is
-        // -1 s, not -2 s, so the date is still the epoch's last second.
+        // Positive fractions stay in the current second.
+        let at = run_value(0.5);
+        assert_eq!(at("year(m)"), 1970.0);
+        assert_eq!(at("hour(m)"), 0.0);
+        // No-argument form goes through `time.UnixMilli`, which floors the
+        // millisecond instant: -1500 ms is second -2, -500 ms is second -1.
         let series = synthetic_labeled("m", &[("job", "api")], &[(0, 0.0)]);
         let at_neg = |ms: i64, query: &str| eval_synthetic(series.clone(), "m", query, ms)[0].1;
-        assert_eq!(at_neg(-500, "year()"), 1970.0);
-        assert_eq!(at_neg(-500, "hour()"), 0.0);
+        assert_eq!(at_neg(-500, "year()"), 1969.0);
+        assert_eq!(at_neg(-500, "hour()"), 23.0);
         assert_eq!(at_neg(-1_500, "year()"), 1969.0);
         assert_eq!(at_neg(-1_500, "minute()"), 59.0);
-        assert_eq!(at_neg(-2_000, "month()"), 12.0);
+        assert_eq!(at_neg(-60_001, "minute()"), 58.0);
+        assert_eq!(at_neg(0, "year()"), 1970.0);
+        assert_eq!(at_neg(0, "hour()"), 0.0);
+    }
+
+    /// `rangeEval` refuses two series with the same labelset at one step
+    /// (`promql/engine.go`), but a *different* step may reuse a labelset: the
+    /// per-series timestamp map is only checked for an immediate repeat.
+    #[test]
+    fn test_record_step_rejects_a_labelset_collision() {
+        let point = |job: &str, value: f64| {
+            let mut labels: LabelSet = BTreeMap::new();
+            labels.insert("job".to_string(), job.to_string());
+            Point {
+                labels,
+                value,
+                sample_ts: None,
+            }
+        };
+        let stepped = |values: Vec<Point>| Vector(values);
+
+        let mut order: Vec<MatchKey> = Vec::new();
+        let mut series: HashMap<MatchKey, (LabelSet, Vec<(i64, f64)>)> = HashMap::new();
+        // Two samples with the same labelset in one step: upstream errors.
+        let collision = stepped(vec![point("api", 1.0), point("api", 2.0)]);
+        let error = record_step(&collision, 0, &mut order, &mut series).unwrap_err();
+        assert_eq!(error.error_type(), "execution");
+        assert_eq!(
+            error.message(),
+            "vector cannot contain metrics with the same labelset"
+        );
+        // The same labelset on a *later* step is fine: that is the ordinary
+        // case a range query builds one series from.
+        let mut order: Vec<MatchKey> = Vec::new();
+        let mut series: HashMap<MatchKey, (LabelSet, Vec<(i64, f64)>)> = HashMap::new();
+        record_step(
+            &stepped(vec![point("api", 1.0)]),
+            0,
+            &mut order,
+            &mut series,
+        )
+        .unwrap();
+        record_step(
+            &stepped(vec![point("api", 2.0)]),
+            1_000,
+            &mut order,
+            &mut series,
+        )
+        .unwrap();
+        assert_eq!(order.len(), 1);
+        let (labels, values) = series.values().next().unwrap();
+        assert_eq!(labels.get("job").map(String::as_str), Some("api"));
+        assert_eq!(values.as_slice(), &[(0, 1.0), (1_000, 2.0)]);
+        // Distinct labelsets stay separate series.
+        let mut order: Vec<MatchKey> = Vec::new();
+        let mut series: HashMap<MatchKey, (LabelSet, Vec<(i64, f64)>)> = HashMap::new();
+        let two = stepped(vec![point("api", 1.0), point("db", 2.0)]);
+        record_step(&two, 0, &mut order, &mut series).unwrap();
+        assert_eq!(order.len(), 2);
+        assert_eq!(series.len(), 2);
+    }
+
+    #[test]
+    fn test_unary_negation_drops_metadata_labels() {
+        let series = [
+            synthetic_labeled("a", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("b", &[("job", "api")], &[(0, 2.0)]),
+        ];
+        let mut fetched = HashMap::new();
+        fetched.insert(selector_key(&selector("a")), vec![series[0].clone()]);
+        fetched.insert(selector_key(&selector("b")), vec![series[1].clone()]);
+        let run = |query: &str| {
+            let expr = parse_ok(query);
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: 0,
+                query_end_ms: 0,
+                step_ms: 0,
+            };
+            rendered(&evaluator.eval(&expr, 0).unwrap().vector)
+        };
+        // Unary minus is an arithmetic operation, so it drops `__name__`.
+        assert_eq!(run("-a"), vec![(r#"{job="api"}"#.to_string(), -1.0)]);
+        // Unary plus is a no-op and keeps it.
+        assert_eq!(
+            run("+a"),
+            vec![(r#"{__name__="a",job="api"}"#.to_string(), 1.0)]
+        );
+        // `-0` keeps its sign bit, as Go's `-x` does.
+        let zero = synthetic_labeled("z", &[("job", "api")], &[(0, 0.0)]);
+        assert_eq!(
+            eval_synthetic(zero, "z", "-z", 0)[0].1.to_bits(),
+            (-0.0f64).to_bits()
+        );
     }
 
     #[test]

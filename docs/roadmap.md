@@ -1099,24 +1099,52 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `covXY / varX`：原先 `varX == 0.0` 时返回斜率 0，而上游不做这个兜底——时间戳
   全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增
   `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的 `linearRegression`。
-- 已完成（2026-11-18）：日期函数的时间戳截断改为 Go 的**向零截断**。上游
-  `dateWrapper` 用 `time.Unix(int64(el.F), 0)` 读样本值、用 `time.Unix(enh.Ts/1000, 0)`
-  读求值时刻；Go 的 `float64 → int64` 与整数除法都向零截断，而此前实现用
-  `floor()`，于是**负的小数时间戳**整整差一秒：`-0.5` 秒被算成
-  1969-12-31T23:59（`floor(-0.5) = -1`），而 Go 得 0 秒、即 epoch 本身。
-  `year` / `month` / `day_of_month` / `hour` / `minute` 全都跟着错一天/一小时，
-  `-1500` ms 的 `year()` 也从 1970 变成 1969。照抄上游：
-  - 样本值走一个新的 `truncate_unix_seconds`（`value.trunc() as i64`），
-    NaN/±Inf 仍按 roadmap 既定语义读作 epoch（Go 在这里是未定义行为，
-    amd64 实际产出 `math.MinInt64`，读成约 2.9e11 年，不复刻这个实现细节）；
-  - 无参数形式直接 `at_ms / 1_000`（Rust 的整数除法同样向零截断），
-    不再先转 `f64` 再 `floor()`；
-  - `CivilDate.year` 因此从 `i32` 放宽到 `i64`：`days_from_civil` 与
-    `days_in_month` 随之接收 `i64`，否则 Go 能表示的 ±2920 亿年会被
-    `i32` 截断；
-  - 测试：`test_date_functions_truncate_towards_zero_like_go` 用 Go 金值覆盖
-    `-0.5` s / `-1.5` s / `-86400` s 三个样本值（年、月、日、星期、年积日、
-    时、分）与 `-500` / `-1500` / `-2000` ms 的无参数形式。
+- 已完成（2026-11-19）：一元负号丢掉元数据标签，range 查询拒绝同一 step 的标签集冲突。
+  两处都来自上游 2026-09 之后的提交：
+  - **一元负号**（`-m`）此前只把值取反、保留 `__name__`。上游把 `*parser.UnaryExpr`
+    当作算术运算处理，在 `e.Op == parser.SUB` 分支里
+    `DropReserved(schema.IsMetadataLabel)`（PR #18680 之前只丢 `__name__`），所以
+    `-m` 的结果没有指标名，而 `+m` 是恒等变换、名字保留。现在照抄：负号分支走
+    `drop_metadata_labels`，正号直接返回。`-0` 仍保留符号位（Go 的 `-x`）。
+    新增 `test_unary_negation_drops_metadata_labels`，验证 `-a` 只剩 `job`、
+    `+a` 保留 `__name__`、`-z`（z=0）的 `to_bits()` 是 `-0`。
+  - **range 查询的标签集冲突**。上游 `rangeEval` 按标签集把每个 step 的输出收进
+    `map[uint64]seriesAndTimestamp`，同一个标签集在同一个 step 出现两次就报
+    `vector cannot contain metrics with the same labelset`（PR #18631 之前更严格，
+    任何 step 重复都报错；现在允许跨 step 复用标签集）。本实现的 `range_query`
+    用 `HashMap<MatchKey, Vec<(i64, f64)>>` 累积，同一 step 的两条同标签集样本会
+    被静默追加成「一个时间戳两个值」，输出非法矩阵。现在拆出 `record_step`，
+    每个 step 用一个 `HashSet` 检查重复，冲突返回
+    `Error::Exec("vector cannot contain metrics with the same labelset")`
+    （`error_type() == "execution"`，与上游的 panic-to-error 路径一致）。
+    跨 step 复用标签集仍然合法，这也正是上游 `mergeSeriesWithSameLabelset`
+    要支持的场景（`max_over_time({__name__=~"metric_.*"}[5m])` 两条交替序列在
+    任一 step 都只有一条落在窗口内）。新增
+    `test_record_step_rejects_a_labelset_collision`：同一 step 冲突报错、
+    跨 step 复用正常累积、不同标签集各自成序列；回退修复后该测试失败（已验证）。
+- 已完成（2026-11-19）：日期函数的时间戳改为 **地板取整**（`math.Floor`）。2026-11-18
+  那一轮按当时的快照把 `dateWrapper` 读成「向零截断」（`int64(el.F)` /
+  `enh.Ts/1000`），但上游随后修正了这一点（`promql/functions.go`，PR #20056，
+  2026-10-26，"fix date functions for negative fractional timestamps"）：
+  - **样本值改回 `int64(math.Floor(el.F))`**。负的小数时间戳属于**前一秒**：
+    `year(vector(-0.5))` 是 `1969`、`minute(vector(-0.5))` 是 `59`、
+    `minute(vector(-60.5))` 是 `58`、`hour(vector(-3600.001))` 是 `22`。
+    向零截断会把这些全算成 epoch。`truncate_unix_seconds` 因此改名为
+    `floor_unix_seconds`，NaN/±Inf 仍按 roadmap 既定语义读作 epoch（Go 在这里是
+    未定义行为，amd64 产出 `math.MinInt64`、读成约 2.9e11 年，不复刻）；
+  - **无参数形式改走 `time.UnixMilli(enh.Ts)`**（同一提交顺手换掉的），即先按
+    **毫秒**保留、再交给 `time.Unix` 去 flooring。所以 `-1500` ms 是第 `-2` 秒
+    （`hour() = 23`、`minute() = 59`），`-500` ms 是第 `-1` 秒，`-60001` ms 的
+    `minute()` 是 `58`。实现在求值时刻上用 `div_euclid(1_000)` 复刻同一效果
+    （对负毫秒向上取整到前一秒）；
+  - 后续提交 `bb09ae7aa1` 只是补了 `-0.001` / `-3600.001` 的 epoch 边界用例，没有
+    再改实现；
+  - 测试：`test_date_functions_truncate_towards_zero_like_go` 改名为
+    `test_date_functions_floor_negative_fractions_like_go`，金值取自 Go 复刻
+    `dateWrapper`。覆盖 `-0.5` / `-0.001` / `-60.5` / `-3600.001` / `-86400`
+    五个样本值的全部日期分量，以及 `-500` / `-1500` / `-60001` / `0` ms 的
+    无参数形式；两条修复分别回退后对应断言会失败（已逐条验证）。
+  - `CivilDate.year` 保持 `i64`（前一轮为避免 `i32` 截断而放宽），与本次无关。
 - 已完成（2026-11-18）：`predict_linear()` 的拟合原点改为**求值时刻**（`enh.Ts`），
   与 Prometheus `funcPredictLinear` 逐字对齐。此前用「首个样本时间戳」做原点、
   预测到「最后样本 + horizon」，只有当最后样本恰好落在求值时刻时才与上游一致；
