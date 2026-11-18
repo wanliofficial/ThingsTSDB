@@ -3832,10 +3832,9 @@ impl<'a> Evaluator<'a> {
             }
             Expr::Sort { dir, expr } => {
                 let mut instant = self.eval(expr, at_ms)?;
-                // VM sorts by the last *non-NaN* value of each series, treating
-                // NaN as larger than any number and skipping trailing NaNs.
-                // Here each output point carries a single value, so the "last
-                // non-NaN" is the value itself unless it is NaN.
+                // Every output point carries a single value, so "the last value
+                // of the series" is the value itself. Prometheus sorts NaN to
+                // the bottom in *both* directions (see `sort_by_value_order`).
                 instant
                     .vector
                     .0
@@ -7690,23 +7689,33 @@ fn must_parse_num(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// The ordering VM's `sort` / `sort_desc` apply to two sample values.
+/// The ordering `sort` / `sort_desc` apply to two sample values.
 ///
-/// Mirrors `newTransformFuncSort`'s comparator: NaN is treated as larger than
-/// any number (a NaN sorts last ascending, first descending), and the two
-/// NaNs compare equal. `SortDir::Asc` puts the smaller value first; `Desc`
-/// reverses it.
+/// Prometheus sorts NaN **to the bottom in both directions**: `funcSort` and
+/// `funcSortDesc` each pick a heap whose `Less` says "NaN is smallest", then
+/// reverse it, so `sort(2, NaN, 1)` and `sort_desc(2, NaN, 1)` both end with
+/// the NaN. Only the numbers swap ends. (VictoriaMetrics' comparator differs —
+/// it puts NaN first in both directions — so the two engines disagree here;
+/// `sort` is PromQL, so Prometheus wins.)
+///
+/// Equal non-NaN values compare `Equal`, letting the stable sort keep the input
+/// order; Prometheus' unstable sort leaves that case arbitrary.
 fn sort_by_value_order(a: f64, b: f64, dir: SortDir) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let order = match (a.is_nan(), b.is_nan()) {
+    match (a.is_nan(), b.is_nan()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-    };
-    match dir {
-        SortDir::Asc => order,
-        SortDir::Desc => order.reverse(),
+        (false, false) => {
+            // NaN is already excluded, so `partial_cmp` is always `Some`, but
+            // an `Equal` fallback keeps the comparator total in the face of
+            // `-0`.
+            let ascending = a.partial_cmp(&b).unwrap_or(Ordering::Equal);
+            match dir {
+                SortDir::Asc => ascending,
+                SortDir::Desc => ascending.reverse(),
+            }
+        }
     }
 }
 
@@ -8881,11 +8890,12 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_orders_by_value_and_handles_nan_like_vm() {
-        // VM's newTransformFuncSort compares the last non-NaN value and treats
-        // NaN as larger than any number, so a NaN series sorts last ascending
-        // (and first descending). Equal values keep their input order, so the
-        // tiebreaks stay deterministic.
+    fn test_sort_orders_by_value_and_puts_nan_last() {
+        // Prometheus' funcSort / funcSortDesc both sort NaN to the bottom
+        // (each picks a heap that ranks NaN lowest, then reverses it), so NaN
+        // trails in *both* directions and only the numbers swap ends.
+        // VictoriaMetrics' comparator instead puts NaN first in both
+        // directions; `sort` is PromQL, so Prometheus wins.
         let series = vec![
             synthetic_labeled("m", &[("instance", "a")], &[(0, 2.0)]),
             synthetic_labeled("m", &[("instance", "b")], &[(0, f64::NAN)]),
@@ -8900,13 +8910,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(order("sort(m)"), vec!["c", "a", "b"]);
-        assert_eq!(order("sort_desc(m)"), vec!["b", "a", "c"]);
+        assert_eq!(order("sort_desc(m)"), vec!["a", "c", "b"]);
     }
 
     #[test]
     fn test_sort_ties_keep_input_order() {
         // Equal values compare Equal, so a stable sort keeps the input order in
-        // both directions — VM's comparator has no label tiebreak either.
+        // both directions — Prometheus' unstable sort leaves that case
+        // arbitrary, and it has no label tiebreak either.
         let series = vec![
             synthetic_labeled("m", &[("instance", "a")], &[(0, 1.0)]),
             synthetic_labeled("m", &[("instance", "b")], &[(0, 1.0)]),
@@ -8921,6 +8932,47 @@ mod tests {
         };
         assert_eq!(order("sort(m)"), vec!["a", "b"]);
         assert_eq!(order("sort_desc(m)"), vec!["a", "b"]);
+    }
+
+    /// NaN handling of `sort` / `sort_desc` over a wider matrix: several NaN
+    /// series, an all-NaN set, and the infinities. Goldens from a Go port of
+    /// Prometheus' `vectorByValueHeap` / `vectorByReverseValueHeap`.
+    #[test]
+    fn test_sort_nan_goes_last_in_both_directions() {
+        let series_of = |values: &[(&str, f64)]| -> Vec<_> {
+            values
+                .iter()
+                .map(|&(instance, value)| {
+                    synthetic_labeled("m", &[("instance", instance)], &[(0, value)])
+                })
+                .collect()
+        };
+        let order = |values: &[(&str, f64)], query: &str| -> Vec<String> {
+            eval_series(series_of(values), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| point.labels["instance"].clone())
+                .collect()
+        };
+        // Infinities are ordinary values and swap ends; the NaN trails both.
+        let mixed = [
+            ("inf", f64::INFINITY),
+            ("nan", f64::NAN),
+            ("ninf", f64::NEG_INFINITY),
+        ];
+        assert_eq!(order(&mixed, "sort(m)"), vec!["ninf", "inf", "nan"]);
+        assert_eq!(order(&mixed, "sort_desc(m)"), vec!["inf", "ninf", "nan"]);
+        // An all-NaN input is already "sorted"; a stable sort keeps input order
+        // in both directions (Prometheus' unstable sort may reorder, which is
+        // not reproducible from Rust and not worth emulating).
+        let all_nan = [("n1", f64::NAN), ("n2", f64::NAN)];
+        assert_eq!(order(&all_nan, "sort(m)"), vec!["n1", "n2"]);
+        assert_eq!(order(&all_nan, "sort_desc(m)"), vec!["n1", "n2"]);
+        // Several NaNs mixed with numbers: every NaN lands after every number.
+        let many = [("a", f64::NAN), ("b", 3.0), ("c", f64::NAN), ("d", 1.0)];
+        assert_eq!(order(&many, "sort(m)"), vec!["d", "b", "a", "c"]);
+        assert_eq!(order(&many, "sort_desc(m)"), vec!["b", "d", "a", "c"]);
     }
 
     #[test]
