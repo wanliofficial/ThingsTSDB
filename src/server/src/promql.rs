@@ -663,7 +663,13 @@ fn matching_signature(labels: &LabelSet, matching: &VectorMatching) -> MatchKey 
                     .iter()
                     .any(|label| label == name.as_str())
             } else {
-                name.as_str() != "__name__"
+                // `ignoring` ignores the metadata labels on top of the listed
+                // ones: upstream's `matchLabels` prepends them to the ignored
+                // set (PR #18680).
+                // `ignoring` ignores the metadata labels on top of the listed
+                // ones: upstream's `matchLabels` prepends them to the ignored
+                // set (PR #18680).
+                !is_metadata_label(name)
                     && !matching
                         .matching_labels
                         .iter()
@@ -3541,10 +3547,10 @@ fn describe(token: Option<Token>) -> String {
 /// its result when the argument matched nothing.
 ///
 /// Only a selector contributes. Prometheus walks the selector's matchers in
-/// order: metadata labels (any name starting with `__`, so `__name__`
-/// included) are skipped, an equality matcher sets its label the first time it
-/// is seen, and anything else — a non-equality matcher, or a second equality
-/// matcher for the same name — deletes that label. That keeps the documented
+/// order: the metadata labels `__name__`, `__type__` and `__unit__` are
+/// skipped, an equality matcher sets its label the first time it is seen, and
+/// anything else — a non-equality matcher, or a second equality matcher for
+/// the same name — deletes that label. That keeps the documented
 /// backwards-compatible behaviour:
 ///
 /// ```text
@@ -3565,7 +3571,9 @@ fn absent_labels(expr: &Expr) -> Vec<(String, String)> {
     // cannot bring it back either.
     let mut seen: HashSet<String> = HashSet::new();
     for (kind, name, value) in matchers {
-        if name.starts_with("__") {
+        // Only the three schema metadata labels are skipped; any other
+        // `__`-prefixed name is an ordinary label to `absent()`.
+        if is_metadata_label(name) {
             continue;
         }
         if *kind == MatcherType::Eq && !seen.contains(name) {
@@ -3984,7 +3992,7 @@ impl<'a> Evaluator<'a> {
                     for point in points.0 {
                         let value = go_max(min, go_min(point.value, max));
                         let mut labels = point.labels;
-                        labels.remove("__name__");
+                        drop_metadata_labels(&mut labels);
                         vector.push(labels, value);
                     }
                 }
@@ -4257,7 +4265,7 @@ impl<'a> Evaluator<'a> {
                     }
                     // An empty metric group is no metric name at all.
                     if rebuilt.is_empty() {
-                        point.labels.remove("__name__");
+                        drop_metadata_labels(&mut point.labels);
                     } else {
                         point.labels.insert("__name__".to_string(), rebuilt);
                     }
@@ -4366,7 +4374,7 @@ impl<'a> Evaluator<'a> {
                 };
                 for point in points.0 {
                     let mut labels = point.labels;
-                    labels.remove("__name__");
+                    drop_metadata_labels(&mut labels);
                     vector.push(labels, func.of(truncate_unix_seconds(point.value)));
                 }
                 Ok(Instant {
@@ -4477,7 +4485,7 @@ impl<'a> Evaluator<'a> {
                         LabelOp::Value(label) => {
                             // VM replaces the value with the label's text and
                             // drops the metric name; every other label stays.
-                            point.labels.remove("__name__");
+                            drop_metadata_labels(&mut point.labels);
                             let parsed = point
                                 .labels
                                 .get(label)
@@ -4738,7 +4746,7 @@ impl<'a> Evaluator<'a> {
             let mut labels = point.labels.clone();
             // Arithmetic results are no longer the raw metric.
             if !op.is_comparison() {
-                labels.remove("__name__");
+                drop_metadata_labels(&mut labels);
             }
             out.push(labels, value);
         }
@@ -4959,7 +4967,7 @@ impl<'a> Evaluator<'a> {
                 // Prometheus keeps the metric name for them; every other range
                 // function describes a new quantity and drops it.
                 if !matches!(func, RangeFunc::FirstOverTime | RangeFunc::LastOverTime) {
-                    labels.remove("__name__");
+                    drop_metadata_labels(&mut labels);
                 }
                 vector.push(labels, value);
             }
@@ -5042,7 +5050,7 @@ impl<'a> Evaluator<'a> {
                         _ => go_min(point.value, bound),
                     };
                     let mut labels = point.labels.clone();
-                    labels.remove("__name__");
+                    drop_metadata_labels(&mut labels);
                     out.push(labels, value);
                 }
                 return Ok(Instant {
@@ -5080,7 +5088,7 @@ impl<'a> Evaluator<'a> {
                 other => apply_math(other, point.value, to_nearest, at_ms),
             };
             let mut labels = point.labels.clone();
-            labels.remove("__name__");
+            drop_metadata_labels(&mut labels);
             vector.push(labels, value);
         }
         Ok(Instant {
@@ -5139,6 +5147,19 @@ fn drop_common_labels(points: Vec<Point>) -> Vector {
     vector
 }
 
+/// Prometheus' `schema.IsMetadataLabel`: the three labels the schema treats as
+/// metadata rather than as ordinary series identity. Whenever Prometheus
+/// "drops the metric name" it drops all three.
+fn is_metadata_label(name: &str) -> bool {
+    matches!(name, "__name__" | "__type__" | "__unit__")
+}
+
+/// Removes `__name__`, `__type__` and `__unit__` — Prometheus'
+/// `DropReserved(schema.IsMetadataLabel)`.
+fn drop_metadata_labels(labels: &mut LabelSet) {
+    labels.retain(|name, _| !is_metadata_label(name));
+}
+
 /// Labels of a fetched series, without `__name__`.
 fn labels_of(series: &SeriesSamples) -> BTreeMap<String, String> {
     series
@@ -5163,11 +5184,14 @@ fn group_key(
             .iter()
             .filter_map(|name| labels.get(name).map(|value| (name.clone(), value.clone())))
             .collect(),
+        // `without` drops the requested labels *and* the metadata labels:
+        // upstream prepends `__name__`, `__type__` and `__unit__` to the
+        // grouping before sorting it (`engine.go`, PR #18680).
         Some(Grouping::Without(names)) => {
             let drop: HashSet<&String> = names.iter().collect();
             labels
                 .iter()
-                .filter(|(name, _)| name.as_str() != "__name__" && !drop.contains(*name))
+                .filter(|(name, _)| !is_metadata_label(name) && !drop.contains(*name))
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect()
         }
@@ -6559,10 +6583,13 @@ fn binary_vectors(
         // Arithmetic results describe a new quantity, and a `bool` comparison
         // no longer reports the left metric; a filtering comparison does.
         if changes_metric_schema(op) || ret_bool {
-            labels.remove("__name__");
+            drop_metadata_labels(&mut labels);
         }
         if matching.card == Cardinality::OneToOne {
             if matching.on {
+                // `on (...)` keeps *only* the listed labels, so any metadata
+                // label not explicitly named (or named and then dropped just
+                // above) disappears here.
                 labels.retain(|name, _| matching.matching_labels.contains(name));
             } else {
                 for name in &matching.matching_labels {
@@ -6908,7 +6935,7 @@ fn bitmap(op: &BitmapOp, mask: f64, vector: &Vector) -> Result<Vector> {
             (op.apply(go_f64_to_u64(point.value), go_f64_to_u64(mask))) as f64
         };
         let mut labels = point.labels.clone();
-        labels.remove("__name__");
+        drop_metadata_labels(&mut labels);
         out.push(labels, value);
     }
     Ok(out)
@@ -6971,7 +6998,7 @@ fn classic_buckets(function: &str, vector: &Vector) -> Result<ClassicHistograms>
         }
         let mut labels = point.labels.clone();
         labels.remove("le");
-        labels.remove("__name__");
+        drop_metadata_labels(&mut labels);
         groups.entry(labels).or_default().push((upper, point.value));
     }
     Ok(groups)
@@ -7945,11 +7972,16 @@ fn go_max(a: f64, b: f64) -> f64 {
 ///
 /// `sorted` must already be ordered the way upstream's `vectorByValueHeap`
 /// orders it — ascending with **NaN first** — which `sort_for_quantile` does.
-/// The formula is evaluated unconditionally: there is no early return for
-/// `weight == 0` or for `lo == hi`, because both change answers upstream.
-/// `quantile(0.3, [3, 3])` really is `2.9999999999999996` (`3*(1-0.3) + 3*0.3`
-/// rounds down), a `+Inf` upper neighbour with `weight == 0` really is `NaN`
-/// (`Inf*0`), and identical neighbours are recomputed rather than returned.
+///
+/// Two early returns matter, and both were added to upstream after a spell
+/// without them (`promql/quantile.go`, PRs #19899 and #20180):
+///
+/// - `weight == 0` returns the lower sample untouched. Interpolating anyway
+///   evaluates `hi * 0`, which is NaN for `hi = ±Inf`, so `quantile(0.5, [1, 2,
+///   +Inf])` would be NaN instead of `2`.
+/// - identical neighbours (same value *and* same bits, so `-0` is distinct from
+///   `+0`) return that value, avoiding the rounding error that made
+///   `quantile(0.3, [3, 3])` land one ULP below `3`.
 fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
     if sorted.is_empty() || quantile.is_nan() {
         return f64::NAN;
@@ -7968,7 +8000,22 @@ fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
     // ceil already lands on lower+1, but the clamp keeps the last bucket exact.
     let upper = (lower_f + 1.0).min((n - 1) as f64) as usize;
     let weight = rank - lower_f;
-    sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+    // An exact rank returns the sample untouched. Interpolating with weight 0
+    // would still evaluate `lo*1 + hi*0`, and `hi*0` is NaN when `hi` is
+    // infinite: `promql/quantile.go` added this guard in PR #19899 so
+    // `quantile(0.5, [-Inf, 2, 3])` stays `2` instead of turning into NaN.
+    if weight == 0.0 {
+        return sorted[lower];
+    }
+    let lower_value = sorted[lower];
+    let upper_value = sorted[upper];
+    // Identical samples need no interpolation. Returning one avoids rounding
+    // error and underflow, and comparing bits keeps `-0` distinct from `+0`
+    // (PR #20180).
+    if lower_value == upper_value && lower_value.to_bits() == upper_value.to_bits() {
+        return lower_value;
+    }
+    lower_value * (1.0 - weight) + upper_value * weight
 }
 
 /// Orders values for `quantile_of` exactly as Prometheus' `vectorByValueHeap`
@@ -8029,12 +8076,13 @@ fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
         MathFunc::Asinh => value.asinh(),
         MathFunc::Acosh => value.acosh(),
         MathFunc::Atanh => value.atanh(),
-        // `v * 180 / math.Pi`, not `v * (180/math.Pi)`: Go evaluates the
-        // multiply first, and for inputs like `deg(0.1)` the two orderings
-        // differ by 1 ULP (5.729577951308232 vs 5.729577951308233).
-        MathFunc::Deg => value * 180.0 / std::f64::consts::PI,
-        // `v * math.Pi / 180`, same reasoning (`rad(-7.89)` differs by 1 ULP).
-        MathFunc::Rad => value * std::f64::consts::PI / 180.0,
+        // `v * (180 / math.Pi)`: the ratio is folded into one constant before
+        // the multiply. `promql/functions.go` did this in PR #19901 so a huge
+        // degree value does not overflow the intermediate `v * 180`
+        // (`deg(1e306)` is a finite `5.729577951308232e+307`).
+        MathFunc::Deg => value * (180.0 / std::f64::consts::PI),
+        // `v * (math.Pi / 180)`, same reasoning (`rad(1e308)` stays finite).
+        MathFunc::Rad => value * (std::f64::consts::PI / 180.0),
         // `timestamp` needs the sample's own timestamp, handled by the caller.
         // `default`, `histogram_quantile` and the clamps are handled before
         // they reach here.
@@ -8744,11 +8792,14 @@ mod tests {
         expect(0.5, "asinh(m)", 0.5f64.asinh());
         expect(2.0, "acosh(m)", 2.0f64.acosh());
         expect(0.5, "atanh(m)", 0.5f64.atanh());
-        expect(0.5, "deg(m)", 0.5 * 180.0 / std::f64::consts::PI);
-        expect(0.5, "rad(m)", 0.5 * std::f64::consts::PI / 180.0);
-        // `0.5` happens to agree with both orderings. These inputs do not: Go
-        // computes `v*180/math.Pi` and `v*math.Pi/180` (multiply first), while
-        // a pre-folded constant differs by 1 ULP. Goldens from Go.
+        expect(0.5, "deg(m)", 0.5 * (180.0 / std::f64::consts::PI));
+        expect(0.5, "rad(m)", 0.5 * (std::f64::consts::PI / 180.0));
+        // The ratio is folded into one constant first, so the multiply cannot
+        // overflow: `deg(1e306)` stays a finite `5.729577951308232e+307` and
+        // `rad(1e308)` a finite `1.7453292519943295e+306`. Goldens from
+        // `trig_functions.test`.
+        expect(1e306, "deg(m)", 5.729_577_951_308_232e307);
+        expect(1e308, "rad(m)", 1.745_329_251_994_329_5e306);
         expect(0.1, "deg(m)", 5.729_577_951_308_232);
         expect(1e-9, "deg(m)", 5.729_577_951_308_233e-8);
         expect(-7.89, "rad(m)", -0.137_706_477_982_352_6);
@@ -10423,15 +10474,27 @@ mod tests {
         );
         // `q = 0.25` lands on a NaN.
         assert!(over("quantile_over_time(0.25, m[60s])")[0].1.is_nan());
-        // Identical neighbours are recomputed, not short-circuited:
-        // `quantile(0.3, [3, 3])` is one ULP below 3 in Go.
+        // Identical neighbours short-circuit to the value itself, so
+        // `quantile(0.3, [3, 3])` is exactly 3 rather than the one-ULP-low
+        // `2.9999999999999996` plain interpolation produces.
         let flat = vec![
             synthetic_labeled("m", &[("instance", "a")], &[(0, 3.0)]),
             synthetic_labeled("m", &[("instance", "b")], &[(0, 3.0)]),
         ];
         assert_eq!(
             rendered(&eval_series(flat, "m", "quantile(0.3, m)", 0).vector),
-            vec![("{}".to_string(), 2.999_999_999_999_999_6)]
+            vec![("{}".to_string(), 3.0)]
+        );
+        // An exact rank next to an infinity keeps the finite sample instead of
+        // computing `Inf * 0 == NaN`.
+        let with_inf = vec![
+            synthetic_labeled("m", &[("instance", "a")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("instance", "b")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("instance", "c")], &[(0, f64::INFINITY)]),
+        ];
+        assert_eq!(
+            rendered(&eval_series(with_inf, "m", "quantile(0.5, m)", 0).vector),
+            vec![("{}".to_string(), 2.0)]
         );
     }
 
@@ -10743,6 +10806,152 @@ mod tests {
                 ("{job=\"api\"}".to_string(), 2.0),
                 ("{job=\"db\"}".to_string(), 10.0)
             ]
+        );
+    }
+
+    /// Prometheus treats `__name__`, `__type__` and `__unit__` as metadata and
+    /// drops all three whenever it "drops the metric name"
+    /// (`schema.IsMetadataLabel`, made consistent across operators and
+    /// functions in PR #18680).
+    #[test]
+    fn test_metadata_labels_are_dropped_like_the_metric_name() {
+        let series = vec![
+            synthetic_labeled(
+                "m",
+                &[
+                    ("job", "api"),
+                    ("instance", "i1"),
+                    ("__type__", "counter"),
+                    ("__unit__", "req"),
+                ],
+                &[(0, 1.0)],
+            ),
+            synthetic_labeled(
+                "m",
+                &[
+                    ("job", "db"),
+                    ("instance", "i1"),
+                    // A different metadata pair: matching must ignore it, so
+                    // these two series still pair up.
+                    ("__type__", "gauge"),
+                    ("__unit__", "ms"),
+                ],
+                &[(0, 10.0)],
+            ),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+
+        // `without` drops the metadata labels on top of the listed ones even
+        // when they are not named (upstream prepends all three to the grouping
+        // before sorting it, PR #18680). Otherwise the two
+        // `__type__`/`__unit__`-carrying series would stay separate.
+        assert_eq!(
+            run("count without (job) (m)"),
+            vec![("{instance=\"i1\"}".to_string(), 2.0)]
+        );
+        assert_eq!(
+            run("sum without (job, instance) (m)"),
+            vec![("{}".to_string(), 11.0)]
+        );
+        // A `sum` with no modifier aggregates everything away.
+        assert_eq!(run("sum(m)"), vec![("{}".to_string(), 11.0)]);
+        // Arithmetic drops all three, so a single-valued output keeps `job`
+        // only.
+        assert_eq!(
+            run("m * 2"),
+            vec![
+                ("{instance=\"i1\",job=\"api\"}".to_string(), 2.0),
+                ("{instance=\"i1\",job=\"db\"}".to_string(), 20.0)
+            ]
+        );
+        // `ignoring` matches without the metadata labels, so these two series
+        // pair up on `job` alone.
+        assert_eq!(
+            run("m + ignoring(__type__, __unit__) m"),
+            vec![
+                ("{instance=\"i1\",job=\"api\"}".to_string(), 2.0),
+                ("{instance=\"i1\",job=\"db\"}".to_string(), 20.0)
+            ]
+        );
+        // Plain matching already ignores the metadata labels, so no modifier is
+        // needed for that.
+        assert_eq!(
+            run("m + m"),
+            vec![
+                ("{instance=\"i1\",job=\"api\"}".to_string(), 2.0),
+                ("{instance=\"i1\",job=\"db\"}".to_string(), 20.0)
+            ]
+        );
+        // A matcher on a metadata label is skipped by `absent`, exactly as
+        // `absent(http_requests_total{__type__="counter", __unit__="request",
+        // job="nonexistent"})` is in `type_and_unit.test`.
+        assert_eq!(
+            eval_series(
+                Vec::new(),
+                "m",
+                r#"absent(m{__type__="counter",__unit__="req",job="nonexistent"})"#,
+                0
+            )
+            .vector
+            .0
+            .len(),
+            1
+        );
+        assert_eq!(
+            rendered(
+                &eval_series(
+                    Vec::new(),
+                    "m",
+                    r#"absent(m{__type__="counter",__unit__="req",job="nonexistent"})"#,
+                    0
+                )
+                .vector
+            ),
+            vec![("{job=\"nonexistent\"}".to_string(), 1.0)]
+        );
+
+        // A cross-selector match makes the difference visible: the two sides
+        // disagree on `__unit__`, and only the metadata labels being ignored
+        // lets them pair up. (`ignoring(job)` alone would not do it — upstream
+        // prepends the metadata labels to the ignored set.)
+        let mut fetched = HashMap::new();
+        fetched.insert(
+            selector_key(&selector("a")),
+            vec![synthetic_labeled(
+                "a",
+                &[("job", "api"), ("__unit__", "req")],
+                &[(0, 1.0)],
+            )],
+        );
+        fetched.insert(
+            selector_key(&selector("b")),
+            vec![synthetic_labeled(
+                "b",
+                &[("job", "api"), ("__unit__", "ms")],
+                &[(0, 10.0)],
+            )],
+        );
+        let evaluate = |query: &str| {
+            let expr = parse_ok(query);
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: 0,
+                query_end_ms: 0,
+                step_ms: 0,
+            };
+            rendered(&evaluator.eval(&expr, 0).unwrap().vector)
+        };
+        // No modifier: metadata labels never take part in matching.
+        assert_eq!(evaluate("a + b"), vec![("{job=\"api\"}".to_string(), 11.0)]);
+        // `ignoring(job)` ignores `job` *and* the metadata labels.
+        assert_eq!(
+            evaluate("a + ignoring(job) b"),
+            vec![("{}".to_string(), 11.0)]
+        );
+        // `on(job)` matches on `job` alone, and the result keeps only it.
+        assert_eq!(
+            evaluate("a + on(job) b"),
+            vec![("{job=\"api\"}".to_string(), 11.0)]
         );
     }
 
@@ -12533,19 +12742,30 @@ mod tests {
             quantile_of(&spread, 0.743_208_562_689_941_6),
             -7.798_779_449_777_607
         );
-        // Identical samples are *not* short-circuited: Prometheus recomputes
-        // `lo*(1-weight) + hi*weight` unconditionally. `quantile(0.3, [3, 3])`
-        // therefore lands one ULP low of 3 (Go golden: 2.9999999999999996),
-        // which the previous early return hid.
-        assert_eq!(quantile_of(&[3.0, 3.0], 0.3), 2.999_999_999_999_999_6);
+        // Identical neighbours are short-circuited (`promql/quantile.go`,
+        // PR #20180): `quantile(0.3, [3, 3])` is exactly 3, not the
+        // `2.9999999999999996` the plain interpolation produces.
+        assert_eq!(quantile_of(&[3.0, 3.0], 0.3), 3.0);
         assert_eq!(quantile_of(&[3.0, 3.0], 0.7), 3.0);
         assert_eq!(quantile_of(&[5.0, 5.0, 5.0], 0.5), 5.0);
         assert_eq!(quantile_of(&[7.0], 0.3), 7.0);
-        // A `+Inf` upper neighbour with `weight == 0` yields `Inf*0 == NaN`
-        // (Go golden), not the finite `lower` value.
-        assert!(quantile_of(&[1.0, 2.0, f64::INFINITY], 0.5).is_nan());
-        // A leading `-Inf` with `weight == 0` keeps the finite `lower`.
+        // "Identical" compares bits, so `-0` is not folded into `+0`: a pair of
+        // negative zeros keeps the negative zero.
+        assert_eq!(
+            quantile_of(&[-0.0, -0.0], 0.5).to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(quantile_of(&[0.0, -0.0], 0.5).to_bits(), 0);
+        // An exact rank (`weight == 0`) returns the sample untouched
+        // (PR #19899). Interpolating would compute `Inf * 0 == NaN`, so these
+        // are the answers a naive implementation gets wrong.
+        assert_eq!(quantile_of(&[1.0, 2.0, f64::INFINITY], 0.5), 2.0);
         assert_eq!(quantile_of(&[f64::NEG_INFINITY, 1.0, 2.0], 0.5), 1.0);
+        assert_eq!(quantile_of(&[1.0, f64::INFINITY], 0.5), f64::INFINITY);
+        assert_eq!(quantile_of(&[f64::NEG_INFINITY], 0.5), f64::NEG_INFINITY);
+        // Two infinities of opposite sign *do* interpolate, and `-Inf + Inf`
+        // is NaN.
+        assert!(quantile_of(&[f64::NEG_INFINITY, f64::INFINITY], 0.5).is_nan());
     }
 
     /// `quantile_of` reads its input ordered as `sort_for_quantile` orders it
@@ -12614,9 +12834,14 @@ mod tests {
             absent(r#"absent(x{job!="a",job="b"})"#),
             vec![("{job=\"b\"}".to_string(), 1.0)]
         );
-        // Metadata labels (`__` prefix) never reach the result.
+        // Only the three schema metadata labels are skipped, not every
+        // `__`-prefixed name: `__aaa` is an ordinary label to `absent()`.
         assert_eq!(
             absent(r#"absent(x{__aaa="1",job="a"})"#),
+            vec![("{__aaa=\"1\",job=\"a\"}".to_string(), 1.0)]
+        );
+        assert_eq!(
+            absent(r#"absent(x{__type__="counter",__unit__="req",job="a"})"#),
             vec![("{job=\"a\"}".to_string(), 1.0)]
         );
         // A bare selector and a non-selector argument both answer `{} 1`.

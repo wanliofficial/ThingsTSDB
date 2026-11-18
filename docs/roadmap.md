@@ -980,18 +980,45 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`changes` 的 NaN→NaN 为 0、单边 NaN 为 1；全 NaN 区间的 min/max 为
     NaN、前导 NaN 被真实值替换、中段 NaN 不参与；`topk(3, ...)` 不含 NaN 而
     `topk(4, ...)` 把 NaN 放在末尾（bottomk 同理）；活服务冒烟逐项复现，日志 0 error。
-- 已完成（2026-11-18）：`quantile` 的插值与排序与上游逐位对齐。三处都是
-  「实现里多做了上游没做的事」：
-  - **去掉 `weight == 0` 提前返回**。Prometheus 的 `quantile()` 永远算
-    `values[lower]*(1-weight) + values[upper]*weight`；当 `weight` 恰好为 0 且上邻
-    是 `+Inf` 时，`Inf*0 = NaN` 会把结果整个变成 NaN（Go 金值：
-    `quantile(0.5, [1, 2, +Inf]) = NaN`、`quantile(1, [1, 2, +Inf]) = NaN`），
-    而提前返回 `lower` 会错误地给出有限值。下邻是 `-Inf` 时仍是有限值
-    （`quantile(0.5, [-Inf, 1, 2]) = 1`），照上游保留；
-  - **去掉「相邻样本相同就返回该值」的短路**。`lo == hi` 时
-    `lo*(1-weight) + hi*weight` 并不总能还原 `lo`：`quantile(0.3, [3, 3])` 在
-    Go 里是 `2.9999999999999996`（`[0.1, 0.1]` 之类的次正规数差得更多）。原先的
-    短路是为「避免重算误差」加的，但那正好偏离上游；
+- 已完成（2026-11-19）：`__type__` / `__unit__` 与 `__name__` 一样被当作**元数据
+  标签**处理。上游把这些归到 `schema.IsMetadataLabel`（`schema/labels.go`），凡是
+  「丢指标名」的地方都调用 `DropReserved(schema.IsMetadataLabel)`，把三个一起丢掉；
+  PR #18680（`0d0ac178e5`，2026-10-10）把这条规则补齐到所有算子和函数上。本实现此前
+  只认 `__name__`，于是：
+  - **`without` 分组**：上游先把 `__name__`/`__type__`/`__unit__` 插进 grouping 再
+    排序，所以 `sum without (job) (m)` 的输出去掉 `__type__`/`__unit__`；本实现只在
+    `group_key` 里滤 `__name__`，两个只差 `__unit__` 的序列会保持分开；
+  - **`ignoring` 匹配**：上游的 `matchLabels` 在 `ignoring` 时把三个元数据标签
+    追加进忽略集合，因此 `a{__unit__="req"} + ignoring(job) b{__unit__="ms"}` 仍能
+    配对（默认匹配本来就不看 `__name__`，现在也不看另两个）；
+  - **算术/函数的标签丢弃**：`m * 2`、`clamp`、`round`、`label_value`、字符串运算、
+    `histogram_quantile` 的分组等原本只 `remove("__name__")`，现在统一走新的
+    `drop_metadata_labels`；
+  - **`absent` 的标签推导**：上游只跳过这三个（`schema.IsMetadataLabel`），**不是**
+    跳过所有 `__` 前缀的名字。`absent(x{__aaa="1",job="a"})` 上游给
+    `{__aaa="1",job="a"} 1`，而本实现此前把 `__aaa` 也滤掉，只给 `{job="a"} 1`。
+  新增 `test_metadata_labels_are_dropped_like_the_metric_name`，覆盖 `without`
+  （未显式列出时也丢）、默认匹配、`ignoring`、`on`、算术与 `absent`，并已逐条验证
+  回退修复后对应断言会失败；`test_absent_carries_selector_equality_matchers` 里
+  「`__` 前缀一律跳过」的旧断言同时改正为「只跳过三个元数据标签」。
+  注：ThingsTSDB 的写入路径不接受保留标签，所以这条差异只在外部导入带 `__type__`
+  的数据、或查询里显式写这些匹配器时才可见，但语义仍按上游对齐。
+- 已完成（2026-11-19）：`quantile` 的两处短路**恢复**。2026-11-18 那一轮照着当时
+  的快照（2026-09）把 `weight == 0` 和「相邻样本相同」两个提前返回删掉了，理由是
+  「上游无条件求值」。但上游后来又把它们加回来了，而且理由相反：
+  - **`weight == 0` 提前返回**（`promql/quantile.go`，PR #19899，2026-10-13）：
+    正好落在整秩上时不该插值。否则 `Inf * 0` 是 NaN，
+    `quantile(0.5, [1, 2, +Inf])` 会变成 NaN，而上游给 `2`；`quantile(0.5,
+    [-Inf, 2, 3])` 同理是 `2`。两个异号无穷相邻时（`[-Inf, +Inf]`）仍是 NaN，
+    因为它们真的插值；
+  - **「相邻样本逐位相同」提前返回**（PR #20180，2026-11-03）：`lo == hi` 时
+    `lo*(1-w) + hi*w` 不一定还原 `lo`，`quantile(0.3, [3, 3])` 会得到
+    `2.9999999999999996`。上游为此显式短路，并要求**逐位**相等才能短路，好让
+    `-0` 与 `+0` 保持区别（`quantile(0.5, [-0, -0])` 是 `-0`，
+    `quantile(0.5, [0, -0])` 是 `+0`）。
+  两者都已照抄，测试改成断言新金值：`quantile(0.3, [3, 3]) == 3`、
+  `quantile(0.5, [1, 2, +Inf]) == 2`、`quantile(0.5, [-0, -0])` 保留符号位。
+- 已完成（2026-11-18）：`quantile` 的排序与上游逐位对齐：
   - **排序改为 NaN 排在最前**。Prometheus 用 `vectorByValueHeap` 排序，
     其 `Less` 在 `vi` 是 NaN 时返回 `true`，所以 NaN 比任何数都小；`f64::total_cmp`
     相反，把 NaN 排在 `+Inf` 之上。差异是可见的：
@@ -1000,16 +1027,19 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     新增 `sort_for_quantile` 复刻该比较器，`quantile()` 聚合与
     `quantile_over_time` 都改用它（VM 侧的 `median`/`mad`/`outliers_*` 本来就先滤
     NaN，排序比较器对它们没有影响）；
-  - 测试：`test_quantile_interpolates` 改为断言 `quantile(0.3, [3, 3])` 的 1 ULP
-    偏差与 `+Inf` 上邻的 NaN；新增 `test_quantile_sorts_nan_first_like_prometheus`
+  - 测试：`test_quantile_interpolates`、`test_quantile_sorts_nan_first_like_prometheus`
     （单位）与 `test_quantile_nan_ordering_end_to_end`（聚合 + `quantile_over_time`
-    + 相同邻值），全部用 Go 复刻 `quantile()` 的金值。
-- 已完成（2026-11-18）：`deg()` / `rad()` 的运算顺序与 Go 一致。Prometheus 写的是
-  `v * 180 / math.Pi`（先乘 180 再除 π）和 `v * math.Pi / 180`，本实现写成了
-  预先折叠常数 `v * (180/Pi)` / `v * (Pi/180)`——两者数学等价但舍入序列不同，
-  在真实输入上差 1 ULP：`deg(0.1)` 是 `5.729577951308232`（折叠常数给
-  `5.729577951308233`）、`rad(-7.89)` 与 `rad(1e-9)` 也各差 1 ULP。
-  现在照上游逐字写（乘除各一次），并用 `deg`/`rad` 的 Go 金值核对。
+    + 相同邻值），全部用 Go 复刻 `quantile()` 的金值；两条短路恢复后，前两个测试
+    改断言 `quantile(0.3, [3, 3]) == 3` 与 `quantile(0.5, [1, 2, +Inf]) == 2`。
+- 已完成（2026-11-19）：`deg()` / `rad()` 改回**折叠常数**。2026-11-18 那一轮按
+  当时的快照把公式从 `v * (180/Pi)` 改成了 `v * 180 / math.Pi`（先乘后除），因为
+  两者在 `deg(0.1)` 上差 1 ULP。但上游随后自己反转了（`promql/functions.go`，
+  PR #19901，2026-10-13，标题就是 "avoid overflow in rad and deg"）：先乘 180 在
+  大角度上会溢出，`deg(1e306)` 的中间积 `1e306 * 180` 是 `+Inf`，结果变成 `+Inf`，
+  而折叠常数给正确的 `5.729577951308232e+307`；`rad(1e308)` 同理应为
+  `1.7453292519943295e+306`。现在照上游写 `v * (180 / math.Pi)` /
+  `v * (math.Pi / 180)`，测试同时断言这两个大数金值（取自
+  `trig_functions.test`）与 `deg(0.1)` / `rad(-7.89)` 的 1 ULP 差别。
 - 已完成（2026-11-18）：`tmin_over_time` / `tmax_over_time` 改为 VM 的并列极值
   语义。这两个是 MetricsQL 独有的 rollup（Prometheus 只有 `ts_of_min_over_time` /
   `ts_of_max_over_time`），实现却借了 `min_by` / `max_by` + `total_cmp`，三处都偏：
