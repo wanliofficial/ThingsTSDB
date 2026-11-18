@@ -1028,6 +1028,20 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     只有 NaN 时该序列没有结果。
   新增 `test_tmin_tmax_over_time_follow_vm_tie_breaks`，金值来自 `rollupTmin` /
   `rollupTmax` 的 Go 转写。
+- 已完成（2026-11-19）：给 `sgn()` 补测试、给 `round()` 补退化边界断言。两者的
+  实现本来就没问题，但 `sgn` 此前**一条测试都没有**，`round` 也只覆盖了常规值：
+  - `sgn`：`funcSgn` 的分支是 `v < 0 → -1`、`v > 0 → 1`、`default → v`，所以
+    `-0` 原样返回 `-0`（`-0 < 0` 为假，却真的是负零）、`NaN` 原样返回 `NaN`、
+    `±Inf` 当普通量级给 `±1`、次正规 `±5e-324` 也给 `±1`。断言时不能只比
+    `==`：`-0.0 == 0.0` 为真，值相等看不出符号，得再用 `is_sign_negative()`
+    区分。新增 `test_sgn_signs`，用 Go 复刻 `funcSgn` 的金值逐项对照
+    （`sgn(-0)` 的符号位、`sgn(NaN)`、`sgn(±Inf)`、次正规），并核对结果只丢
+    `__name__`、保留其余标签、标量参数产出一条无标签样本。
+  - `round`：补上 `toNearest = ±Inf`（`1/±Inf = ±0`，中间积塌成 `±0`，
+    `floor(±0 + 0.5) = 0`，除回去是 `NaN`）、次正规 `5e-324`（倒数溢出成 `±Inf`，
+    `Inf/Inf` 也是 `NaN`）、负 `toNearest`（两次除法把符号抵消，仍然远离零取整）
+    与 `round(±Inf)`（原样保留）的断言，全部与 Go 的
+    `floor(f*(1/n)+0.5)/(1/n)` 逐位一致，因此实现无需改动。
 - 已完成（2026-11-19）：`timestamp(v)` 只在参数是**裸选择器**时报告样本时间戳。
   上游为此有一条专用通路：`engine.go` 的 `Call` 分支看到
   `timestamp` / `start_timestamp` 且第一个参数是 `*parser.VectorSelector` 时，改走

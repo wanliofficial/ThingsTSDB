@@ -10017,9 +10017,63 @@ mod tests {
         // propagation).
         assert!(run("round(m, 0)").is_nan());
         assert!(run("round(5, 0)").is_nan());
+        // `toNearest = ±Inf` gives `1/±Inf == ±0`, so the intermediate product
+        // collapses to `±0` and `floor(±0 + 0.5) = 0`; dividing by zero then
+        // yields NaN, as in Go.
+        assert!(run("round(m, 1/0)").is_nan());
+        assert!(run("round(m, -1/0)").is_nan());
+        // A denormal `toNearest` overflows the inverse to ±Inf, so the product
+        // is ±Inf and `Inf/Inf` is NaN — also Go's answer.
+        assert!(run("round(m, 5e-324)").is_nan());
+        // A negative `toNearest` still rounds away from zero (the sign cancels
+        // between the two divisions).
+        assert_eq!(run("round(1.7, -1)"), 2.0);
+        assert_eq!(run("round(-1.7, -1)"), -2.0);
+        // `round(±Inf)` keeps the infinity, `round(-0)` comes back `+0`.
+        let inf = synthetic_labeled("m", &[("v", "x")], &[(0, f64::INFINITY)]);
+        assert_eq!(eval_synthetic(inf, "m", "round(m)", 0)[0].1, f64::INFINITY);
         // NaN value propagates.
         let nan = synthetic_labeled("m", &[("v", "x")], &[(0, f64::NAN)]);
         assert!(eval_synthetic(nan, "m", "round(m)", 0)[0].1.is_nan());
+    }
+
+    #[test]
+    fn test_sgn_signs() {
+        // `funcSgn` returns the input untouched when it is neither positive nor
+        // negative, so -0 stays -0 and NaN stays NaN; ±Inf are ordinary
+        // magnitudes.
+        //
+        // Value equality cannot see the sign of zero, so each case is checked
+        // with `==` for the value and `is_sign_negative()` for the sign. The
+        // expected values are a Go transcription of `funcSgn`.
+        fn sgn_of(value: f64) -> (f64, bool) {
+            let series = synthetic("m", &[(0, value)]);
+            let result = eval_synthetic(series, "m", "sgn(m)", 0);
+            assert_eq!(result.len(), 1, "sgn({value}) must keep the series");
+            (result[0].1, result[0].1.is_sign_negative())
+        }
+
+        assert_eq!(sgn_of(3.0), (1.0, false));
+        assert_eq!(sgn_of(-3.0), (-1.0, true));
+        assert_eq!(sgn_of(0.0), (0.0, false));
+        // `-0 < 0` is false, so -0 falls through to the identity branch.
+        assert_eq!(sgn_of(-0.0), (0.0, true));
+        assert!(sgn_of(f64::NAN).0.is_nan());
+        assert_eq!(sgn_of(f64::INFINITY), (1.0, false));
+        assert_eq!(sgn_of(f64::NEG_INFINITY), (-1.0, true));
+        assert_eq!(sgn_of(5e-324), (1.0, false));
+        assert_eq!(sgn_of(-5e-324), (-1.0, true));
+        // The result keeps every label except `__name__`.
+        let series = synthetic_labeled("m", &[("job", "j")], &[(0, -2.0)]);
+        assert_eq!(
+            eval_synthetic(series, "m", "sgn(m)", 0),
+            vec![(r#"{job="j"}"#.to_string(), -1.0)]
+        );
+        // The scalar form produces one label-less sample.
+        assert_eq!(
+            eval_synthetic(synthetic("m", &[(0, 5.0)]), "m", "sgn(5)", 0),
+            vec![("{}".to_string(), 1.0)]
+        );
     }
 
     #[test]
