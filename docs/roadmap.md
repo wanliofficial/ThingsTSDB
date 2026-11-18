@@ -298,7 +298,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     操作数顺序）、未匹配序列被丢弃、`and`/`or`/`unless` 按匹配键过滤并保留
     `__name__`、以及 `bool` 比较丢弃 `__name__` 而过滤型比较保留。
   - 端到端测试（走 actix 路由 + 真实引擎）覆盖：`sum by (job)` 出两条序列、
-    `rate(metric[60s])` 对 0,1,2,3（10 s 间隔）算出 0.1/s、`topk`、比较过滤与
+    `rate(metric[60s])` 对 0,1,2,3（10 s 间隔）按 `extrapolatedRate` 外推到窗口
+    两端（计数器起点钳在零穿越处，因此 0→3 得 2/30、10→13 得 0.075）、`topk`、比较过滤与
     算术丢弃 `__name__`、`http_requests / on(job) http_retries` 得到 1.5/3.25、
     `group_left(zone)` 把 `zone` 带到三条 `errors` 序列上、`on(job)` 匹配
     两条同 `job` 序列时返回 400 并报 `found duplicate series`、
@@ -316,8 +317,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     等值匹配器推导（`absent` 同款 `createLabelsForAbsentFunction`：非等值匹配器删除
     对应标签、子查询/非选择器参数退化为无标签 `1`）；
   - `tmin_over_time` / `tmax_over_time`——返回极值样本的**时间戳**（秒）而不是值；
-  - `predict_linear(v[range], t)`——对区间内样本做最小二乘直线拟合，从最后一个样本
-    再外推 `t` 秒（与 Prometheus 的实现一致：拟合斜率而非取端点差）；
+  - `predict_linear(v[range], t)`——对区间内样本做最小二乘直线拟合，**以求值时刻
+    （`enh.Ts`）为原点**再外推 `t` 秒（与 Prometheus 的 `funcPredictLinear` 一致：
+    拟合斜率而非取端点差；原点也必须与上游相同，否则最后采样点不在求值时刻时结果
+    会整体偏移）；
   - `default(v, x)`——结果为空时补一条无标签的 `x`，已有样本中的 `NaN` 也换成 `x`
     （MetricsQL 把 NaN 当缺失值）。
   - `*_over_time` 家族（2026-11-13 补齐）：`range_over_time`（max-min）、
@@ -358,7 +361,7 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     整窗 NaN 的序列丢弃、平方和、几何平均、`-0`/`0` 的 distinct 计数、mode 的
     并列与单样本、increases/decreases 与 1e-12 容差、`tfirst/tlast` 与
     `ts_of_*` 等价），以及走 actix 路由的端到端用例（`aggr_over_time(avg, ...)`=1.5、
-    `predict_linear(..., 3600)`=363、`default(不存在的指标, 7)` 单条无标签 7、
+    `predict_linear(..., 3600)`=364、`default(不存在的指标, 7)` 单条无标签 7、
     `absent_over_time(不存在的指标[60s])`=1）。
 - 已完成（2026-11-13）：MetricsQL 标签函数 `label_set` / `label_del` /
   `label_keep` / `label_copy` / `label_move` / `label_value` / `alias`
@@ -963,6 +966,21 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`changes` 的 NaN→NaN 为 0、单边 NaN 为 1；全 NaN 区间的 min/max 为
     NaN、前导 NaN 被真实值替换、中段 NaN 不参与；`topk(3, ...)` 不含 NaN 而
     `topk(4, ...)` 把 NaN 放在末尾（bottomk 同理）；活服务冒烟逐项复现，日志 0 error。
+- 已完成（2026-11-18）：`predict_linear()` 的拟合原点改为**求值时刻**（`enh.Ts`），
+  与 Prometheus `funcPredictLinear` 逐字对齐。此前用「首个样本时间戳」做原点、
+  预测到「最后样本 + horizon」，只有当最后样本恰好落在求值时刻时才与上游一致；
+  一旦最后一次采样早于查询时刻（常见于稀疏序列），整条预测就按斜率 × 时间差偏移。
+  照抄上游：`slope, intercept = linearRegression(samples, enh.Ts)`、返回
+  `slope*horizon + intercept`，原点即窗口起点计算时用的 `resolve_at(at, now)`
+  （**未减 offset**，与上游 `enh.Ts` 一致）。`Extrapolation` 因此带上 `eval_ts`
+  字段，`apply_range_func`（无窗口的单元测试助手）退回末样本时间戳以保持旧断言。
+  - 连带修正一处从窗口外推改动起就漏更新的端到端断言：`rate(http_requests[60s])`
+    的 0→3 计数器因零穿越钳位得 `2/30`、10→13 得 `0.075`（此前仍写着外推前的
+    `0.1`），`predict_linear(..., 3600)` 由 `363` 改为 `364`。Go 复刻
+    `linearRegression` + `extrapolatedRate` 确认逐位相符。
+  - 测试：`test_predict_linear_anchors_at_evaluation_timestamp` 用 Go 金值
+    覆盖「末样本 == 求值时刻」（`4/3`）与「求值时刻晚 1 s」（`5/6`）两个原点，
+    以及 1 小时 horizon 放大差异（`-1798.1666…` / `-1798.6666…`）。
 - 已完成（2026-11-18）：`rate()` / `increase()` / `delta()` 补上 Prometheus 的
   **窗口外推**（`extrapolatedRate`）。此前只按「首尾样本差 ÷ 首尾时间差」算斜率，
   于是查询步长大于采样间隔时结果系统性偏低：窗口里只有中间几个样本时，Prometheus

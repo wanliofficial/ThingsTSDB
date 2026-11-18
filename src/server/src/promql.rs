@@ -4840,11 +4840,13 @@ impl<'a> Evaluator<'a> {
                 at: pinned,
                 ..
             } => {
-                let end = self.resolve_at(*pinned, at_ms) - offset_ms;
+                let eval_ts = self.resolve_at(*pinned, at_ms);
+                let end = eval_ts - offset_ms;
                 Some(Extrapolation {
                     range_start: end - range_ms,
                     range_end: end,
                     range_ms: *range_ms,
+                    eval_ts,
                 })
             }
             _ => None,
@@ -5763,6 +5765,10 @@ struct Extrapolation {
     range_start: i64,
     range_end: i64,
     range_ms: i64,
+    /// The evaluation timestamp (`enh.Ts`) the window is queried at, before
+    /// `offset` is subtracted. `predict_linear` anchors its regression here
+    /// rather than at a sample, matching Prometheus.
+    eval_ts: i64,
 }
 
 /// Prometheus' `extrapolatedRate`, for a bare range selector.
@@ -6048,15 +6054,22 @@ fn apply_range_func_in(
             Some(quantile_of(&deviations, 0.5))
         }
         // Linear extrapolation over the range, evaluated `horizon` seconds past
-        // the last sample (least squares, as Prometheus does).
+        // the evaluation timestamp (least squares, as Prometheus does).
         RangeFunc::PredictLinear => {
             let horizon = param?;
-            let origin = samples[0].timestamp;
+            // Prometheus anchors the least-squares line at the evaluation
+            // timestamp (`enh.Ts`) and returns the fit `horizon` seconds past
+            // it — not at the first or last sample. The two coincide only when
+            // the last sample sits exactly at the eval time; a series whose
+            // final scrape trails the query (the usual case) would otherwise be
+            // extrapolated from the wrong point. Fall back to the last sample
+            // when no window was threaded in (the direct unit-test helper).
+            let origin = match extrapolation {
+                Some(window) => window.eval_ts,
+                None => samples.last()?.timestamp,
+            };
             let (slope, intercept) = linear_regression(samples, origin);
-            // `intercept` is the fit's value at `origin`, so the last sample is
-            // `(last - origin)` seconds along the line.
-            let last = (samples.last()?.timestamp - origin) as f64 / 1_000.0;
-            Some(intercept + slope * (last + horizon))
+            Some(slope * horizon + intercept)
         }
         // `deriv` is the slope alone; ≤1 sample has no slope at all.
         RangeFunc::Deriv => {
@@ -8475,6 +8488,45 @@ mod tests {
                 .expect("predict_linear returns a value");
         assert!((predicted - 4.0 / 3.0).abs() < 1e-9, "got {predicted}");
         assert!(values.len() == 3);
+    }
+
+    /// Prometheus' `funcPredictLinear` fits the line at the *evaluation*
+    /// timestamp (`enh.Ts`) and returns it `duration` seconds past that, not
+    /// past the last sample. A series whose final scrape trails the query step
+    /// therefore yields a different (correct) answer. Goldens from a Go port of
+    /// `linearRegression` + `funcPredictLinear`.
+    #[test]
+    fn test_predict_linear_anchors_at_evaluation_timestamp() {
+        let samples: Vec<SamplePoint> = [(0, 2.0), (1_000, 4.0), (2_000, 1.0)]
+            .iter()
+            .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+            .collect();
+        let run = |eval_ts: i64, horizon: f64| {
+            apply_range_func_in(
+                RangeFunc::PredictLinear,
+                &samples,
+                3_000,
+                Some(horizon),
+                None,
+                Some(Extrapolation {
+                    range_start: eval_ts - 3_000,
+                    range_end: eval_ts,
+                    range_ms: 3_000,
+                    eval_ts,
+                }),
+            )
+            .expect("predict_linear returns a value")
+        };
+        // When the last sample coincides with the eval time both anchors agree:
+        // the fit is 17/6 - t/2, so t = 2 + 1 gives 4/3 (the Go port prints
+        // `1.3333333333333335`, one ULP above `4.0 / 3.0` — compared exactly so
+        // any drift in the accumulation would show up).
+        assert_eq!(run(2_000, 1.0), 1.333_333_333_333_333_5);
+        // One second later the same fit predicts 5/6, not 4/3.
+        assert_eq!(run(3_000, 1.0), 0.833_333_333_333_333_5);
+        // A one-hour horizon amplifies the difference between the anchors.
+        assert_eq!(run(2_000, 3_600.0), -1_798.166_666_666_666_7);
+        assert_eq!(run(3_000, 3_600.0), -1_798.666_666_666_666_7);
     }
 
     /// MetricsQL's `aggr_over_time(<agg>, v[range])` must give exactly the
@@ -10931,6 +10983,7 @@ mod tests {
             range_start: 0,
             range_end: 60_000,
             range_ms: 60_000,
+            eval_ts: 60_000,
         };
         // Samples filling the window exactly: no stretching, factor 1.
         let full: Vec<(i64, f64)> = (0..=4).map(|i| (i * 15_000, i as f64 * 15.0)).collect();

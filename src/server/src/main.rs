@@ -1390,9 +1390,25 @@ mod tests {
         let result = body["data"]["result"].as_array().unwrap();
         assert_eq!(result.len(), 2);
         for series in result {
-            // Values are 0,1,2,3 over 10 s steps, so the rate is 0.1/s.
+            // Values rise by 3 over 30 s, but `rate` extrapolates towards the
+            // window edges (`extrapolatedRate`). The last sample sits 10 s
+            // before the window end, inside the 1.1-average-interval threshold,
+            // so that gap counts in full; the first sits 20 s after the window
+            // start, beyond it, so only half an interval (5 s) counts. For `db`
+            // (10→13) that is 3 * (30+5+10)/30 / 60 s = 0.075. `api` starts at
+            // 0, so the counter is additionally clamped where it would have
+            // crossed zero — no start extrapolation at all — giving
+            // 3 * (30+0+10)/30 / 60 s = 2/30. Goldens from a Go port.
+            let expected = match series["metric"]["job"].as_str().unwrap() {
+                "api" => 2.0 / 30.0,
+                "db" => 0.075,
+                other => panic!("unexpected job {other}"),
+            };
             let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
-            assert!((value - 0.1).abs() < 1e-9, "got {value}");
+            assert!(
+                (value - expected).abs() < 1e-12,
+                "got {value}, want {expected}"
+            );
         }
 
         // `rate` needs a range vector; a bare selector is rejected.
@@ -1436,10 +1452,12 @@ mod tests {
             assert!((value - expected).abs() < 1e-9, "got {value}");
         }
 
-        // `predict_linear` extrapolates the same straight lines by one hour.
-        // With four samples 10 s apart the fit is exact: the mean sits 15 s
-        // before the last sample, so the prediction is `mean + 0.1 * (3600 +
-        // 15)` — 363 for `api` and 373 for `db`.
+        // `predict_linear` extrapolates the same straight lines by one hour,
+        // anchored at the evaluation time (`enh.Ts`), as Prometheus does. The
+        // samples sit 10 s apart with the last one at eval − 10 s, so the fit
+        // value at the eval time is mean + 0.1 * 25 (4 for `api`, 14 for `db`);
+        // the prediction adds another 0.1 * 3600 — 364 for `api` and 374 for
+        // `db`.
         let body: Value = actix_web::test::call_and_read_body_json(
             &app,
             actix_web::test::TestRequest::get()
@@ -1457,8 +1475,8 @@ mod tests {
         assert_eq!(result.len(), 2);
         for series in result {
             let expected = match series["metric"]["job"].as_str().unwrap() {
-                "api" => 363.0,
-                "db" => 373.0,
+                "api" => 364.0,
+                "db" => 374.0,
                 other => panic!("unexpected job {other}"),
             };
             let value: f64 = series["value"][1].as_str().unwrap().parse().unwrap();
