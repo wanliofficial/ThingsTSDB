@@ -743,6 +743,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     精确的 0（避免浮点噪声），全为 Infinity 时按 Prometheus 返回 NaN。四个和
     （`sumX/sumY/sumXY/sumX2`）用 Prometheus 同款 Kahan（Neumaier）累加，长区间
     不再丢失朴素 `+=` 会损失的精度（500 样本 1e8 基线时斜率差 ~4e-11）；
+    拟合原点与 `funcDeriv` 一致取**求值时刻** `enh.Ts`（斜率在精确算术下与原点
+    无关，浮点下不是：两样本窗口上换原点会让结果差 ~1e-14 相对量）；
   - 日期函数 `day_of_month` / `day_of_week` / `day_of_year` / `days_in_month` /
     `hour` / `minute` / `month` / `year`：参数可选。有参数时把每个样本的
     **值**当作 Unix 秒（UTC，**向零截断**后计算——Go 的 `int64(el.F)`，样本自身的
@@ -1026,6 +1028,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     只有 NaN 时该序列没有结果。
   新增 `test_tmin_tmax_over_time_follow_vm_tie_breaks`，金值来自 `rollupTmin` /
   `rollupTmax` 的 Go 转写。
+- 已完成（2026-11-19）：`deriv` 的拟合原点改为求值时刻，`linear_regression` 去掉
+  `varX == 0` 的兜底。斜率在精确算术里与原点无关，所以 `deriv` 一直沿用第一个样本
+  的时间戳；但浮点里 `sumX/sumXY/sumX2` 都随原点变化，`funcDeriv` 传的是
+  `enh.Ts`。用 2000 条伪随机序列（2–13 个样本）对比，两种原点有 1811 条的斜率
+  **不逐位相等**，差 1–3 ULP（两样本窗口最明显：`deriv` 于 265 ms / 15835 ms 两点、
+  求值时刻 19835 ms 时 `-0.11199032644906443` vs `-0.1119903264490607`）。现在与
+  `predict_linear` 一样取窗口的 `eval_ts`（直接调用 `apply_range_func` 的单元测试
+  助手上退回第一个样本的时间戳）。另外 `linearRegression` 直接写
+  `covXY / varX`：原先 `varX == 0.0` 时返回斜率 0，而上游不做这个兜底——时间戳
+  全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增 `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的
+  `linearRegression`。
 - 已完成（2026-11-18）：日期函数的时间戳截断改为 Go 的**向零截断**。上游
   `dateWrapper` 用 `time.Unix(int64(el.F), 0)` 读样本值、用 `time.Unix(enh.Ts/1000, 0)`
   读求值时刻；Go 的 `float64 → int64` 与整数除法都向零截断，而此前实现用

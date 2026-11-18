@@ -6095,12 +6095,20 @@ fn apply_range_func_in(
             let (slope, intercept) = linear_regression(samples, origin);
             Some(slope * horizon + intercept)
         }
-        // `deriv` is the slope alone; ≤1 sample has no slope at all.
+        // `deriv` is the slope alone; ≤1 sample has no slope at all. Like
+        // `predict_linear` it anchors the fit at the evaluation timestamp
+        // (`enh.Ts`): the slope is origin-independent in exact arithmetic, but
+        // not in floating point — for a two-sample window the two origins
+        // differ by ~1e-14 relative, so the origin has to match upstream.
         RangeFunc::Deriv => {
             if samples.len() < 2 {
                 return None;
             }
-            let (slope, _) = linear_regression(samples, samples[0].timestamp);
+            let origin = match extrapolation {
+                Some(window) => window.eval_ts,
+                None => samples[0].timestamp,
+            };
+            let (slope, _) = linear_regression(samples, origin);
             Some(slope)
         }
         // Holt's linear ("double exponential") smoothing, transcribed from
@@ -6443,7 +6451,10 @@ fn linear_regression(samples: &[SamplePoint], origin_ms: i64) -> (f64, f64) {
     sum_x2 += c_x2;
     let cov_xy = sum_xy - sum_x * sum_y / n;
     let var_x = sum_x2 - sum_x * sum_x / n;
-    let slope = if var_x == 0.0 { 0.0 } else { cov_xy / var_x };
+    // No `var_x == 0` guard: upstream divides straight away, so a window whose
+    // timestamps are all equal gives NaN (0/0) or ±Inf rather than a slope of
+    // 0.
+    let slope = cov_xy / var_x;
     (slope, sum_y / n - slope * sum_x / n)
 }
 
@@ -10088,6 +10099,25 @@ mod tests {
         // Two seconds ahead of the last sample on the same line: 32.
         let predicted = eval_synthetic(series, "m", "predict_linear(m[60s], 2)", 20_000);
         assert!((predicted[0].1 - 32.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_deriv_anchors_at_the_eval_timestamp() {
+        // `funcDeriv` fits with `linearRegression(floats, enh.Ts)`, and the
+        // slope is only origin-independent in exact arithmetic. For this
+        // two-sample window the last scrape is 4 s before the query, and using
+        // the first sample's timestamp as the origin gives
+        // -0.1119903264490607 instead of the Go golden below.
+        let series = synthetic(
+            "m",
+            &[
+                (265, 113.434_845_912_179_41),
+                (15_835, 111.691_156_529_367_52),
+            ],
+        );
+        let got = eval_synthetic(series, "m", "deriv(m[60s])", 19_835);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, -0.111_990_326_449_064_43, "got {}", got[0].1);
     }
 
     #[test]
