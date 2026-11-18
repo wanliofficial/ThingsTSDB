@@ -1091,6 +1091,8 @@ impl RangeFunc {
                 | RangeFunc::DecreasesOverTime
                 | RangeFunc::TFirstOverTime
                 | RangeFunc::TLastOverTime
+                | RangeFunc::TMinOverTime
+                | RangeFunc::TMaxOverTime
                 | RangeFunc::FilterOverTime(..)
                 | RangeFunc::DurationOverTime
         )
@@ -6031,15 +6033,15 @@ fn apply_range_func_in(
             apply_range_func(equivalent, samples, range_ms, param, param2)
         }
         // The timestamp of the extreme sample, in seconds (Prometheus reports
-        // `timestamp()`-shaped numbers, not samples).
-        RangeFunc::TMinOverTime => samples
-            .iter()
-            .min_by(|a, b| a.value.total_cmp(&b.value))
-            .map(|s| s.timestamp as f64 / 1_000.0),
-        RangeFunc::TMaxOverTime => samples
-            .iter()
-            .max_by(|a, b| a.value.total_cmp(&b.value))
-            .map(|s| s.timestamp as f64 / 1_000.0),
+        // `timestamp()`-shaped numbers, not samples). These are MetricsQL's
+        // `tmin_over_time` / `tmax_over_time`, and VM's `rollupTmin` /
+        // `rollupTmax` compare with `<=` / `>=` — so when several samples share
+        // the extreme value the *last* one wins ("Get the last timestamp for
+        // the minimum value as most users expect"), and `-0`/`+0` compare
+        // equal. A `total_cmp` min/max would do both differently: it keeps the
+        // first tie and orders `-0` below `+0`.
+        RangeFunc::TMinOverTime => timestamp_of_extreme(samples, |current, best| current <= best),
+        RangeFunc::TMaxOverTime => timestamp_of_extreme(samples, |current, best| current >= best),
         // Prometheus' newest additions, all read off the same ordered sample
         // slice. `first_over_time` is the oldest value; the `ts_of_*` forms
         // report seconds, like `timestamp()`.
@@ -9719,6 +9721,62 @@ mod tests {
         .0[0]
             .labels
             .contains_key("__name__"));
+    }
+
+    #[test]
+    fn test_tmin_tmax_over_time_follow_vm_tie_breaks() {
+        // MetricsQL's `tmin_over_time` / `tmax_over_time` are VM's
+        // `rollupTmin` / `rollupTmax`, which compare with `<=` / `>=`: the
+        // *last* sample holding the extreme value wins. Goldens from a Go
+        // transcription of those two functions.
+        let run = |samples: &[(i64, f64)], query: &str, at: i64| {
+            eval_synthetic(synthetic("m", samples), "m", query, at)
+        };
+        let tied = [(0, 5.0), (10_000, 3.0), (20_000, 3.0)];
+        assert_eq!(
+            run(&tied, "tmin_over_time(m[60s])", 20_000),
+            vec![("{}".to_string(), 20.0)]
+        );
+        assert_eq!(
+            run(&tied, "tmax_over_time(m[60s])", 20_000),
+            vec![("{}".to_string(), 0.0)]
+        );
+        // A value that repeats after a larger one: `tmin` reports the newest
+        // occurrence (30 s), `tmax` the newest maximum (20 s).
+        let bumpy = [(0, 1.0), (10_000, 2.0), (20_000, 2.0), (30_000, 1.0)];
+        assert_eq!(
+            run(&bumpy, "tmin_over_time(m[60s])", 30_000),
+            vec![("{}".to_string(), 30.0)]
+        );
+        assert_eq!(
+            run(&bumpy, "tmax_over_time(m[60s])", 30_000),
+            vec![("{}".to_string(), 20.0)]
+        );
+        // `-0` and `+0` compare equal in Go, and `0 <= -0` / `0 >= -0` both
+        // hold, so both forms pick the newer sample. `total_cmp` would keep
+        // `-0` as the minimum and the *older* `+0` as the maximum.
+        let zeros = [(0, -0.0), (10_000, 0.0)];
+        assert_eq!(
+            run(&zeros, "tmin_over_time(m[60s])", 10_000),
+            vec![("{}".to_string(), 10.0)]
+        );
+        assert_eq!(
+            run(&zeros, "tmax_over_time(m[60s])", 10_000),
+            vec![("{}".to_string(), 10.0)]
+        );
+        // VM runs `removeNanValues` before every rollup, so a gap is invisible:
+        // `tmax` reports the 2 at 20 s, not the NaN at 10 s.
+        let gappy = [(0, 1.0), (10_000, f64::NAN), (20_000, 2.0)];
+        assert_eq!(
+            run(&gappy, "tmin_over_time(m[60s])", 20_000),
+            vec![("{}".to_string(), 0.0)]
+        );
+        assert_eq!(
+            run(&gappy, "tmax_over_time(m[60s])", 20_000),
+            vec![("{}".to_string(), 20.0)]
+        );
+        // A window that holds nothing but NaN has no extreme to report.
+        assert!(run(&[(0, f64::NAN)], "tmin_over_time(m[60s])", 0).is_empty());
     }
 
     #[test]

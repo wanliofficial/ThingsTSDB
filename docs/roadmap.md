@@ -317,6 +317,9 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     等值匹配器推导（`absent` 同款 `createLabelsForAbsentFunction`：非等值匹配器删除
     对应标签、子查询/非选择器参数退化为无标签 `1`）；
   - `tmin_over_time` / `tmax_over_time`——返回极值样本的**时间戳**（秒）而不是值；
+    这是 VM 的 `rollupTmin` / `rollupTmax`，比较用 `<=` / `>=`，所以并列极值时
+    **最后一个**样本胜出（`[5,3,3]` 的 `tmin` 是第 3 个样本的时间戳），`-0`/`+0`
+    也算相等；输入同样先过 `removeNanValues`，窗口里只有 NaN 时没有结果；
   - `predict_linear(v[range], t)`——对区间内样本做最小二乘直线拟合，**以求值时刻
     （`enh.Ts`）为原点**再外推 `t` 秒（与 Prometheus 的 `funcPredictLinear` 一致：
     拟合斜率而非取端点差；原点也必须与上游相同，否则最后采样点不在求值时刻时结果
@@ -1005,6 +1008,24 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   在真实输入上差 1 ULP：`deg(0.1)` 是 `5.729577951308232`（折叠常数给
   `5.729577951308233`）、`rad(-7.89)` 与 `rad(1e-9)` 也各差 1 ULP。
   现在照上游逐字写（乘除各一次），并用 `deg`/`rad` 的 Go 金值核对。
+- 已完成（2026-11-18）：`tmin_over_time` / `tmax_over_time` 改为 VM 的并列极值
+  语义。这两个是 MetricsQL 独有的 rollup（Prometheus 只有 `ts_of_min_over_time` /
+  `ts_of_max_over_time`），实现却借了 `min_by` / `max_by` + `total_cmp`，三处都偏：
+  - **并列极值取最后一个**。VM 的 `rollupTmin` / `rollupTmax` 用 `<=` / `>=`，注释
+    写明「Get the last timestamp for the minimum value as most users expect」，
+    所以 `[5, 3, 3]`（0/10/20 s）的 `tmin` 是 `20`；Rust 的 `min_by` 返回**第一个**
+    最小元素，给出 `10`。（`max_by` 恰好返回最后一个最大元素，两个函数此前因此还互不
+    对称。）现在两者都走 `timestamp_of_extreme` 的显式比较；
+  - **`-0` 与 `+0` 视为相等**。`total_cmp` 把 `-0` 排在 `+0` 之下，于是
+    `tmin_over_time([-0 @0s, +0 @10s])` 会停在 `0 s`，而 Go 的 `0 <= -0` 为真，
+    取 `10 s`；`tmax` 在 `[+0, -0]` 上同样反着来；
+  - **先滤 NaN**。VM 在调用任何 rollup 之前都会跑 `removeNanValues`
+    （`eval.go` 的 `doParallel` 回调），这两个函数原先漏在
+    `is_metricsql_rollup` 之外，于是 `tmax_over_time([1, NaN, 2])` 会挑中 NaN 的
+    时间戳（`total_cmp` 认为 NaN 最大）；现在与其它 VM rollup 一样先滤 NaN，窗口里
+    只有 NaN 时该序列没有结果。
+  新增 `test_tmin_tmax_over_time_follow_vm_tie_breaks`，金值来自 `rollupTmin` /
+  `rollupTmax` 的 Go 转写。
 - 已完成（2026-11-18）：日期函数的时间戳截断改为 Go 的**向零截断**。上游
   `dateWrapper` 用 `time.Unix(int64(el.F), 0)` 读样本值、用 `time.Unix(enh.Ts/1000, 0)`
   读求值时刻；Go 的 `float64 → int64` 与整数除法都向零截断，而此前实现用
