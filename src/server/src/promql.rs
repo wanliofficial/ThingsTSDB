@@ -3601,8 +3601,12 @@ pub struct Point {
     /// and dropped as soon as an operation derives a new value.
     pub labels: LabelSet,
     pub value: f64,
-    /// The sample's own timestamp, when it came from a stored point. Derived
-    /// values inherit it from their input so `timestamp()` can report it.
+    /// The sample's own timestamp, when it came from a stored point.
+    ///
+    /// Only `timestamp()` on a bare selector reports it: Prometheus evaluates
+    /// that shape through `rangeEvalTimestampFunctionOverVectorSelector`, while
+    /// any other argument goes through `rangeEval`, whose `gatherVector` stamps
+    /// every input sample with the evaluation timestamp.
     pub sample_ts: Option<i64>,
 }
 
@@ -3830,7 +3834,15 @@ impl<'a> Evaluator<'a> {
                 param2,
             } => self.range_func(*func, expr, param.as_deref(), param2.as_deref(), at_ms),
             Expr::MathFunc { func, param, expr } => {
-                self.math_func(*func, expr, param.as_deref(), at_ms)
+                // `timestamp()` reports the *sample's* timestamp only when its
+                // argument is a bare vector selector: Prometheus routes that
+                // shape through `rangeEvalTimestampFunctionOverVectorSelector`,
+                // while every other argument is evaluated by `rangeEval`, whose
+                // `gatherVector` stamps each input sample with the evaluation
+                // timestamp. So `timestamp(m)` is the scrape time but
+                // `timestamp(m + 0)` / `timestamp(sort(m))` are the step time.
+                let bare_selector = matches!(expr.as_ref(), Expr::Selector { .. });
+                self.math_func(*func, expr, param.as_deref(), bare_selector, at_ms)
             }
             Expr::Sort { dir, expr } => {
                 let mut instant = self.eval(expr, at_ms)?;
@@ -4963,6 +4975,7 @@ impl<'a> Evaluator<'a> {
         func: MathFunc,
         expr: &Expr,
         param: Option<&Expr>,
+        bare_selector: bool,
         at_ms: i64,
     ) -> Result<Instant> {
         let instant = self.eval(expr, at_ms)?;
@@ -5055,7 +5068,15 @@ impl<'a> Evaluator<'a> {
         }
         for point in &instant.vector.0 {
             let value = match func {
-                MathFunc::Timestamp => point.sample_ts.unwrap_or(at_ms) as f64 / 1_000.0,
+                // Only a bare selector keeps the scrape timestamp; anything
+                // else was gathered by `rangeEval` and carries the step time.
+                MathFunc::Timestamp => {
+                    let ts = match point.sample_ts {
+                        Some(sample_ts) if bare_selector => sample_ts,
+                        _ => at_ms,
+                    };
+                    ts as f64 / 1_000.0
+                }
                 other => apply_math(other, point.value, to_nearest, at_ms),
             };
             let mut labels = point.labels.clone();
@@ -10099,6 +10120,47 @@ mod tests {
         // Two seconds ahead of the last sample on the same line: 32.
         let predicted = eval_synthetic(series, "m", "predict_linear(m[60s], 2)", 20_000);
         assert!((predicted[0].1 - 32.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_timestamp_reports_the_sample_time_only_for_a_bare_selector() {
+        // `load 10s` samples at 0/10/20 s, query at 15 s: the selector picks
+        // the sample at 10 s, so `timestamp()` reports 10.
+        let series = synthetic("m", &[(0, 1.0), (10_000, 2.0), (20_000, 3.0)]);
+        let run = |query: &str| eval_synthetic(series.clone(), "m", query, 15_000);
+        assert_eq!(
+            run("timestamp(m)"),
+            vec![("{}".to_string(), 10.0)],
+            "a bare selector keeps the scrape time"
+        );
+        // Parentheses are stripped from function arguments before evaluation,
+        // so this is still the selector shape (`prom_functions.test` asserts
+        // `timestamp(((metric)))` equals `timestamp(metric)`).
+        assert_eq!(run("timestamp(((m)))"), vec![("{}".to_string(), 10.0)]);
+        // Any other argument is gathered with the evaluation timestamp, so the
+        // step time (15 s) wins over the scrape time — both for arithmetic and
+        // for the sample-passthrough operators like `sort`.
+        for query in [
+            "timestamp(m + 0)",
+            "timestamp(abs(m))",
+            "timestamp(sort(m))",
+            "timestamp(abs(m) and m)",
+            "timestamp(sum(m))",
+        ] {
+            assert_eq!(
+                run(query),
+                vec![("{}".to_string(), 15.0)],
+                "{query} must report the evaluation time"
+            );
+        }
+        // An `offset` shifts which sample is read, and the answer follows the
+        // sample, not the shifted evaluation time.
+        assert_eq!(
+            run("timestamp(m offset 5s)"),
+            vec![("{}".to_string(), 10.0)]
+        );
+        // `@` pins the lookup time the same way.
+        assert_eq!(run("timestamp(m @ 5)"), vec![("{}".to_string(), 0.0)]);
     }
 
     #[test]

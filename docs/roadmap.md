@@ -1028,6 +1028,22 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     只有 NaN 时该序列没有结果。
   新增 `test_tmin_tmax_over_time_follow_vm_tie_breaks`，金值来自 `rollupTmin` /
   `rollupTmax` 的 Go 转写。
+- 已完成（2026-11-19）：`timestamp(v)` 只在参数是**裸选择器**时报告样本时间戳。
+  上游为此有一条专用通路：`engine.go` 的 `Call` 分支看到
+  `timestamp` / `start_timestamp` 且第一个参数是 `*parser.VectorSelector` 时，改走
+  `rangeEvalTimestampFunctionOverVectorSelector`，那里的样本带 `T: t`（底层样本
+  时间）；其它任何参数都走普通 `rangeEval`，而它的 `gatherVector` 会把输入样本
+  一律重写成 `T: ts`（**求值时刻**）。所以上游 `timestamp(m)` 是采样时刻，而
+  `timestamp(m + 0)` / `timestamp(abs(m))` / `timestamp(sort(m))` /
+  `timestamp(sum(m))` 都是 step 时刻。本实现原先对所有带 `sample_ts` 的结果都
+  返回样本时间戳，于是上述派生形态全错（`timestamp(sort(m))` 在 15 s 求值时
+  应得 15，却返回 10）。现在 `math_func` 多收一个「参数是否裸选择器」的标记，
+  只有它为真且样本确实带了 `sample_ts` 时才用样本时间，否则用 `at_ms`。括号在
+  解析期已经消掉，所以 `timestamp(((m)))` 仍算裸选择器（与
+  `prom_functions.test` 的 `timestamp(((metric)))` 断言一致），`offset`/`@`
+  也照旧跟着选中的样本走。新增
+  `test_timestamp_reports_the_sample_time_only_for_a_bare_selector`，并已验证把
+  修复回退后该测试会失败。
 - 已完成（2026-11-19）：`deriv` 的拟合原点改为求值时刻，`linear_regression` 去掉
   `varX == 0` 的兜底。斜率在精确算术里与原点无关，所以 `deriv` 一直沿用第一个样本
   的时间戳；但浮点里 `sumX/sumXY/sumX2` 都随原点变化，`funcDeriv` 传的是
@@ -1037,8 +1053,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `predict_linear` 一样取窗口的 `eval_ts`（直接调用 `apply_range_func` 的单元测试
   助手上退回第一个样本的时间戳）。另外 `linearRegression` 直接写
   `covXY / varX`：原先 `varX == 0.0` 时返回斜率 0，而上游不做这个兜底——时间戳
-  全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增 `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的
-  `linearRegression`。
+  全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增
+  `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的 `linearRegression`。
 - 已完成（2026-11-18）：日期函数的时间戳截断改为 Go 的**向零截断**。上游
   `dateWrapper` 用 `time.Unix(int64(el.F), 0)` 读样本值、用 `time.Unix(enh.Ts/1000, 0)`
   读求值时刻；Go 的 `float64 → int64` 与整数除法都向零截断，而此前实现用
