@@ -1213,12 +1213,15 @@ impl DateFunc {
         })
     }
 
-    /// The component of `unix_secs`, in UTC, exactly as `dateWrapper` reads it.
-    /// `days_in_month` counts by asking for the 32nd day of the month, which
-    /// Go normalises back into the last day of that month.
-    fn of(self, unix_secs: f64) -> f64 {
-        let seconds = unix_secs.floor();
-        let date = civil_from_unix_seconds(seconds);
+    /// The component of the instant `unix_secs`, in UTC, exactly as
+    /// `dateWrapper` reads it.
+    ///
+    /// Prometheus converts each sample's value with `int64(el.F)`, which in Go
+    /// **truncates towards zero** — so `-0.5` s is the epoch, not the second
+    /// before it. `days_in_month` counts by asking for the 32nd day of the
+    /// month, which Go normalises back into the last day of that month.
+    fn of(self, unix_secs: i64) -> f64 {
+        let date = civil_from_unix_seconds(unix_secs);
         match self {
             DateFunc::DayOfMonth => f64::from(date.day),
             DateFunc::DayOfWeek => weekday_from_days(date.days) as f64,
@@ -1227,15 +1230,39 @@ impl DateFunc {
             DateFunc::Hour => f64::from(date.hour),
             DateFunc::Minute => f64::from(date.minute),
             DateFunc::Month => f64::from(date.month),
-            DateFunc::Year => f64::from(date.year),
+            DateFunc::Year => date.year as f64,
         }
     }
+}
+
+/// Go's `int64(f)` conversion, which Prometheus applies via
+/// `time.Unix(int64(el.F), 0)`.
+///
+/// Go **truncates towards zero**, whereas the earlier `floor()` moved every
+/// negative fractional instant back a second (`-0.5` s became 1969-12-31T23:59
+/// instead of the epoch). That one-second shift changes `day_of_month`,
+/// `hour`, `minute` and `year` for negative fractional inputs, so it is worth
+/// matching exactly.
+///
+/// A NaN or infinite value has no date at all. Go's `int64` conversion is
+/// unspecified there (amd64 yields `math.MinInt64`, which `dateWrapper` then
+/// reads as year ~2.9e11); rather than reproduce that artifact we read it as
+/// the epoch, which is what the roadmap documents. Finite magnitudes beyond
+/// `i64` saturate, so an absurd-but-finite timestamp still lands on a real date
+/// instead of wrapping.
+fn truncate_unix_seconds(value: f64) -> i64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.trunc() as i64
 }
 
 /// A UTC calendar instant, with the day count since the Unix epoch kept so
 /// `day_of_year` and `day_of_week` do not need a second conversion.
 struct CivilDate {
-    year: i32,
+    /// `i64`, not `i32`: Go's `time.Time` spans ±292 billion years, and a
+    /// saturated `int64` second count really does land around year 2.9e11.
+    year: i64,
     month: u32,
     day: u32,
     hour: u32,
@@ -1249,21 +1276,11 @@ struct CivilDate {
 /// Howard Hinnant's `civil_from_days`: shift the epoch to 0000-03-01 so leap
 /// days land at the end of the 400-year cycle, then undo the shift. Integer
 /// arithmetic only, so no dependency and no floating-point rounding.
-fn civil_from_unix_seconds(unix_secs: f64) -> CivilDate {
-    // A NaN or infinite sample has no date; Go's `int64` conversion is
-    // unspecified there, so treat it as the epoch. Finite values are clamped
-    // into a range whose day count is far from overflowing the integer
-    // arithmetic below (about ±31 million years).
-    const MAX_UNIX_SECS: f64 = 1.0e15;
-    let total_seconds = if unix_secs.is_finite() {
-        unix_secs.clamp(-MAX_UNIX_SECS, MAX_UNIX_SECS)
-    } else {
-        0.0
-    };
-    let days = (total_seconds / 86_400.0).floor() as i64;
-    // `rem_euclid` keeps the time of day in [0, 86400) even for the negative
-    // extremes, where `total - days * 86400` would not.
-    let secs_of_day = total_seconds.rem_euclid(86_400.0) as i64;
+fn civil_from_unix_seconds(unix_secs: i64) -> CivilDate {
+    // `div_euclid` matches Go's `time.Unix`, which floors the division of the
+    // (already truncated) second count.
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
 
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -1274,7 +1291,7 @@ fn civil_from_unix_seconds(unix_secs: f64) -> CivilDate {
     let mp = (5 * doy + 2) / 153;
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = (year + i64::from(month <= 2)) as i32;
+    let year = year + i64::from(month <= 2);
 
     CivilDate {
         year,
@@ -1287,8 +1304,8 @@ fn civil_from_unix_seconds(unix_secs: f64) -> CivilDate {
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date.
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = i64::from(year) - i64::from(month <= 2);
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = year - era * 400;
     let mp = i64::from(if month > 2 { month - 3 } else { month + 9 });
@@ -1302,7 +1319,7 @@ fn weekday_from_days(days: i64) -> i64 {
     (days + 4).rem_euclid(7)
 }
 
-fn days_in_month(year: i32, month: u32) -> u32 {
+fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -4313,8 +4330,11 @@ impl<'a> Evaluator<'a> {
                 let mut vector = Vector::default();
                 let Some(expr) = expr else {
                     // No argument: one label-less sample from the evaluation
-                    // instant (Prometheus' `time.UnixMilli(enh.Ts)`).
-                    vector.push(BTreeMap::new(), func.of(at_ms as f64 / 1_000.0));
+                    // instant (Prometheus' `time.Unix(enh.Ts/1000, 0)`). The
+                    // division is integer division, which truncates towards
+                    // zero in Go, so `-1500` ms reads as `-1` s and not `-2`:
+                    // the epoch-inclusive floor happens inside `time.Unix`.
+                    vector.push(BTreeMap::new(), func.of(at_ms / 1_000));
                     return Ok(Instant {
                         vector,
                         scalar: None,
@@ -4334,7 +4354,7 @@ impl<'a> Evaluator<'a> {
                 for point in points.0 {
                     let mut labels = point.labels;
                     labels.remove("__name__");
-                    vector.push(labels, func.of(point.value));
+                    vector.push(labels, func.of(truncate_unix_seconds(point.value)));
                 }
                 Ok(Instant {
                     vector,
@@ -10001,6 +10021,50 @@ mod tests {
         let huge = synthetic_labeled("m", &[("job", "api")], &[(0, 1e30)]);
         let year = eval_synthetic(huge, "m", "year(m)", 0)[0].1;
         assert!(year.is_finite() && year > 1_000_000.0, "got {year}");
+    }
+
+    /// Prometheus reads a sample value with `int64(el.F)` and the evaluation
+    /// instant with `enh.Ts / 1000` — both **truncate towards zero** in Go.
+    /// A `floor()` shifts every negative fractional instant back a second, so
+    /// `-0.5` s became 1969-12-31T23:59 instead of the epoch. Goldens from a Go
+    /// port of `dateWrapper`.
+    #[test]
+    fn test_date_functions_truncate_towards_zero_like_go() {
+        let run_value = |value: f64| {
+            let series = synthetic_labeled("m", &[("job", "api")], &[(0, value)]);
+            move |query: &str| eval_synthetic(series.clone(), "m", query, 0)[0].1
+        };
+        // `int64(-0.5)` is 0 in Go, so both the date and the clock read as the
+        // epoch; `floor()` would have given 1969-12-31T23:59.
+        let at = run_value(-0.5);
+        assert_eq!(at("year(m)"), 1970.0);
+        assert_eq!(at("month(m)"), 1.0);
+        assert_eq!(at("day_of_month(m)"), 1.0);
+        assert_eq!(at("hour(m)"), 0.0);
+        assert_eq!(at("minute(m)"), 0.0);
+        // `int64(-1.5)` is -1: the last second of 1969, a Wednesday.
+        let at = run_value(-1.5);
+        assert_eq!(at("year(m)"), 1969.0);
+        assert_eq!(at("month(m)"), 12.0);
+        assert_eq!(at("day_of_month(m)"), 31.0);
+        assert_eq!(at("day_of_week(m)"), 3.0);
+        assert_eq!(at("day_of_year(m)"), 365.0);
+        assert_eq!(at("hour(m)"), 23.0);
+        assert_eq!(at("minute(m)"), 59.0);
+        // A whole negative day truncates to itself, so the clock is midnight.
+        let at = run_value(-86_400.0);
+        assert_eq!(at("day_of_month(m)"), 31.0);
+        assert_eq!(at("hour(m)"), 0.0);
+        assert_eq!(at("minute(m)"), 0.0);
+        // No-argument form: `enh.Ts / 1000` truncates the same way. -1500 ms is
+        // -1 s, not -2 s, so the date is still the epoch's last second.
+        let series = synthetic_labeled("m", &[("job", "api")], &[(0, 0.0)]);
+        let at_neg = |ms: i64, query: &str| eval_synthetic(series.clone(), "m", query, ms)[0].1;
+        assert_eq!(at_neg(-500, "year()"), 1970.0);
+        assert_eq!(at_neg(-500, "hour()"), 0.0);
+        assert_eq!(at_neg(-1_500, "year()"), 1969.0);
+        assert_eq!(at_neg(-1_500, "minute()"), 59.0);
+        assert_eq!(at_neg(-2_000, "month()"), 12.0);
     }
 
     #[test]

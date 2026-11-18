@@ -737,11 +737,11 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     不再丢失朴素 `+=` 会损失的精度（500 样本 1e8 基线时斜率差 ~4e-11）；
   - 日期函数 `day_of_month` / `day_of_week` / `day_of_year` / `days_in_month` /
     `hour` / `minute` / `month` / `year`：参数可选。有参数时把每个样本的
-    **值**当作 Unix 秒（UTC，向下取整后计算，样本自身的时间戳不参与）；无参数
-    （`year()`）时用求值时刻。两者都丢弃 `__name__`，无参数形式返回单条无标签
-    样本。日历换算用 Howard Hinnant 的 `civil_from_days` 纯整数算法，不引入时区
-    或时间库；`day_of_week` 与 Go 一致（周日为 0）；非有限值（NaN/Inf）没有
-    日期，按 0 秒处理；
+    **值**当作 Unix 秒（UTC，**向零截断**后计算——Go 的 `int64(el.F)`，样本自身的
+    时间戳不参与）；无参数（`year()`）时用求值时刻（Go 的 `enh.Ts / 1000`，同样
+    向零截断）。两者都丢弃 `__name__`，无参数形式返回单条无标签样本。日历换算用
+    Howard Hinnant 的 `civil_from_days` 纯整数算法，不引入时区或时间库；
+    `day_of_week` 与 Go 一致（周日为 0）；非有限值（NaN/Inf）没有日期，按 0 秒处理；
   - `quantile(q, v)` 聚合：按 `by`/`without` 分组后排序插值，复用
     `quantile_over_time` 的 `quantile_of`；`q` 为 NaN 时结果是 NaN，`q<0`/`q>1`
     分别是 `-Inf`/`+Inf`。`q` 是必填参数且写在向量前（`quantile by (job)
@@ -966,6 +966,24 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`changes` 的 NaN→NaN 为 0、单边 NaN 为 1；全 NaN 区间的 min/max 为
     NaN、前导 NaN 被真实值替换、中段 NaN 不参与；`topk(3, ...)` 不含 NaN 而
     `topk(4, ...)` 把 NaN 放在末尾（bottomk 同理）；活服务冒烟逐项复现，日志 0 error。
+- 已完成（2026-11-18）：日期函数的时间戳截断改为 Go 的**向零截断**。上游
+  `dateWrapper` 用 `time.Unix(int64(el.F), 0)` 读样本值、用 `time.Unix(enh.Ts/1000, 0)`
+  读求值时刻；Go 的 `float64 → int64` 与整数除法都向零截断，而此前实现用
+  `floor()`，于是**负的小数时间戳**整整差一秒：`-0.5` 秒被算成
+  1969-12-31T23:59（`floor(-0.5) = -1`），而 Go 得 0 秒、即 epoch 本身。
+  `year` / `month` / `day_of_month` / `hour` / `minute` 全都跟着错一天/一小时，
+  `-1500` ms 的 `year()` 也从 1970 变成 1969。照抄上游：
+  - 样本值走一个新的 `truncate_unix_seconds`（`value.trunc() as i64`），
+    NaN/±Inf 仍按 roadmap 既定语义读作 epoch（Go 在这里是未定义行为，
+    amd64 实际产出 `math.MinInt64`，读成约 2.9e11 年，不复刻这个实现细节）；
+  - 无参数形式直接 `at_ms / 1_000`（Rust 的整数除法同样向零截断），
+    不再先转 `f64` 再 `floor()`；
+  - `CivilDate.year` 因此从 `i32` 放宽到 `i64`：`days_from_civil` 与
+    `days_in_month` 随之接收 `i64`，否则 Go 能表示的 ±2920 亿年会被
+    `i32` 截断；
+  - 测试：`test_date_functions_truncate_towards_zero_like_go` 用 Go 金值覆盖
+    `-0.5` s / `-1.5` s / `-86400` s 三个样本值（年、月、日、星期、年积日、
+    时、分）与 `-500` / `-1500` / `-2000` ms 的无参数形式。
 - 已完成（2026-11-18）：`predict_linear()` 的拟合原点改为**求值时刻**（`enh.Ts`），
   与 Prometheus `funcPredictLinear` 逐字对齐。此前用「首个样本时间戳」做原点、
   预测到「最后样本 + horizon」，只有当最后样本恰好落在求值时刻时才与上游一致；
