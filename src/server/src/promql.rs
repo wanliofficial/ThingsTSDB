@@ -5329,7 +5329,7 @@ fn quantile_agg(values: &Vector, quantile: f64, grouping: Option<&Grouping>) -> 
     }
     let mut out = Vector::default();
     for (key, mut group) in groups {
-        group.sort_by(|a, b| a.total_cmp(b));
+        sort_for_quantile(&mut group);
         out.push(key.into_iter().collect(), quantile_of(&group, quantile));
     }
     out
@@ -6002,7 +6002,10 @@ fn apply_range_func_in(
         RangeFunc::QuantileOverTime => {
             let quantile = param?;
             let mut values: Vec<f64> = samples.iter().map(|s| s.value).collect();
-            values.sort_by(|a, b| a.total_cmp(b));
+            // Prometheus' `funcQuantileOverTime` sorts into a
+            // `vectorByValueHeap`, i.e. NaN first — not the `total_cmp` order
+            // that would park a NaN above `+Inf`.
+            sort_for_quantile(&mut values);
             Some(quantile_of(&values, quantile))
         }
         // `absent_over_time` is answered by `range_func` from the matrix being
@@ -7903,7 +7906,16 @@ fn go_max(a: f64, b: f64) -> f64 {
     }
 }
 
-/// Prometheus' interpolation between the two neighbouring order statistics.
+/// Prometheus' `quantile()`: the ordinate between the two neighbouring order
+/// statistics, `lo*(1-weight) + hi*weight`.
+///
+/// `sorted` must already be ordered the way upstream's `vectorByValueHeap`
+/// orders it — ascending with **NaN first** — which `sort_for_quantile` does.
+/// The formula is evaluated unconditionally: there is no early return for
+/// `weight == 0` or for `lo == hi`, because both change answers upstream.
+/// `quantile(0.3, [3, 3])` really is `2.9999999999999996` (`3*(1-0.3) + 3*0.3`
+/// rounds down), a `+Inf` upper neighbour with `weight == 0` really is `NaN`
+/// (`Inf*0`), and identical neighbours are recomputed rather than returned.
 fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
     if sorted.is_empty() || quantile.is_nan() {
         return f64::NAN;
@@ -7922,20 +7934,25 @@ fn quantile_of(sorted: &[f64], quantile: f64) -> f64 {
     // ceil already lands on lower+1, but the clamp keeps the last bucket exact.
     let upper = (lower_f + 1.0).min((n - 1) as f64) as usize;
     let weight = rank - lower_f;
-    if weight == 0.0 {
-        return sorted[lower];
-    }
-    let lo = sorted[lower];
-    let hi = sorted[upper];
-    // Identical samples need no interpolation; returning one avoids rounding
-    // error and underflow. Comparing bits distinguishes -0 from +0, so a
-    // -0/+0 pair still interpolates instead of collapsing.
-    if lo == hi && lo.to_bits() == hi.to_bits() {
-        return lo;
-    }
-    // Prometheus interpolates as `lo*(1-weight) + hi*weight`, not the algebraic
-    // `lo + (hi-lo)*weight`; the two orderings differ in the last ULP.
-    lo * (1.0 - weight) + hi * weight
+    sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+}
+
+/// Orders values for `quantile_of` exactly as Prometheus' `vectorByValueHeap`
+/// does: ascending, but every NaN is **smaller** than every number, so a NaN
+/// never sorts above `+Inf`.
+///
+/// This matters: with `quantile(0.5, [3, NaN, 1])` the sorted order is
+/// `[NaN, 1, 3]` and the answer is `1`, whereas `f64::total_cmp` would put the
+/// NaN last (`[1, 3, NaN]`) and answer `3`. Only the `*_over_time` and
+/// `quantile()` paths see NaNs at all — the aggregation paths that VM defines
+/// (`median`, `mad`, `outliers_*`) filter them out first, as VM does.
+fn sort_for_quantile(values: &mut [f64]) {
+    values.sort_by(|a, b| match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+    });
 }
 
 fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
@@ -7978,8 +7995,12 @@ fn apply_math(func: MathFunc, value: f64, to_nearest: f64, _at_ms: i64) -> f64 {
         MathFunc::Asinh => value.asinh(),
         MathFunc::Acosh => value.acosh(),
         MathFunc::Atanh => value.atanh(),
-        MathFunc::Deg => value * (180.0 / std::f64::consts::PI),
-        MathFunc::Rad => value * (std::f64::consts::PI / 180.0),
+        // `v * 180 / math.Pi`, not `v * (180/math.Pi)`: Go evaluates the
+        // multiply first, and for inputs like `deg(0.1)` the two orderings
+        // differ by 1 ULP (5.729577951308232 vs 5.729577951308233).
+        MathFunc::Deg => value * 180.0 / std::f64::consts::PI,
+        // `v * math.Pi / 180`, same reasoning (`rad(-7.89)` differs by 1 ULP).
+        MathFunc::Rad => value * std::f64::consts::PI / 180.0,
         // `timestamp` needs the sample's own timestamp, handled by the caller.
         // `default`, `histogram_quantile` and the clamps are handled before
         // they reach here.
@@ -8691,6 +8712,13 @@ mod tests {
         expect(0.5, "atanh(m)", 0.5f64.atanh());
         expect(0.5, "deg(m)", 0.5 * 180.0 / std::f64::consts::PI);
         expect(0.5, "rad(m)", 0.5 * std::f64::consts::PI / 180.0);
+        // `0.5` happens to agree with both orderings. These inputs do not: Go
+        // computes `v*180/math.Pi` and `v*math.Pi/180` (multiply first), while
+        // a pre-folded constant differs by 1 ULP. Goldens from Go.
+        expect(0.1, "deg(m)", 5.729_577_951_308_232);
+        expect(1e-9, "deg(m)", 5.729_577_951_308_233e-8);
+        expect(-7.89, "rad(m)", -0.137_706_477_982_352_6);
+        expect(1e-9, "rad(m)", 1.745_329_251_994_329_5e-11);
     }
 
     #[test]
@@ -10156,6 +10184,51 @@ mod tests {
         assert!(run("quantile by (job) (0.0/0.0, m)")[0].1.is_nan());
         // The quantile is a required parameter, and it comes before the vector.
         assert!(parse_err("quantile(m)").contains("expected Comma but found"));
+    }
+
+    /// End-to-end check of the NaN ordering: `quantile()` and
+    /// `quantile_over_time()` must sort NaN to the *front*, as Prometheus'
+    /// `vectorByValueHeap` does, so a median can land on a real value even when
+    /// the group holds a gap. All goldens from a Go port of `quantile()`.
+    #[test]
+    fn test_quantile_nan_ordering_end_to_end() {
+        // Aggregation across series: [3, NaN, 1] -> sorted [NaN, 1, 3], median
+        // 1.
+        let series = vec![
+            synthetic_labeled("m", &[("instance", "a")], &[(0, 3.0)]),
+            synthetic_labeled("m", &[("instance", "b")], &[(0, f64::NAN)]),
+            synthetic_labeled("m", &[("instance", "c")], &[(0, 1.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        assert_eq!(run("quantile(0.5, m)"), vec![("{}".to_string(), 1.0)]);
+        // `q = 1` picks the largest value after NaN-first sorting: 3, not NaN.
+        assert_eq!(run("quantile(1, m)"), vec![("{}".to_string(), 3.0)]);
+        // `q = 0` lands on the leading NaN.
+        assert!(run("quantile(0, m)")[0].1.is_nan());
+
+        // `quantile_over_time` walks one series over the range instead.
+        let window = vec![synthetic(
+            "m",
+            &[(0, 1.0), (10_000, f64::NAN), (20_000, 4.0), (30_000, 2.0)],
+        )];
+        let over = |query: &str| rendered(&eval_series(window.clone(), "m", query, 30_000).vector);
+        // Sorted [NaN, 1, 2, 4]; the median interpolates between 1 and 2.
+        assert_eq!(
+            over("quantile_over_time(0.5, m[60s])"),
+            vec![("{}".to_string(), 1.5)]
+        );
+        // `q = 0.25` lands on a NaN.
+        assert!(over("quantile_over_time(0.25, m[60s])")[0].1.is_nan());
+        // Identical neighbours are recomputed, not short-circuited:
+        // `quantile(0.3, [3, 3])` is one ULP below 3 in Go.
+        let flat = vec![
+            synthetic_labeled("m", &[("instance", "a")], &[(0, 3.0)]),
+            synthetic_labeled("m", &[("instance", "b")], &[(0, 3.0)]),
+        ];
+        assert_eq!(
+            rendered(&eval_series(flat, "m", "quantile(0.3, m)", 0).vector),
+            vec![("{}".to_string(), 2.999_999_999_999_999_6)]
+        );
     }
 
     #[test]
@@ -12256,10 +12329,47 @@ mod tests {
             quantile_of(&spread, 0.743_208_562_689_941_6),
             -7.798_779_449_777_607
         );
-        // Identical samples short-circuit to the value, not a recomputed
-        // interpolation (avoids rounding error / underflow).
+        // Identical samples are *not* short-circuited: Prometheus recomputes
+        // `lo*(1-weight) + hi*weight` unconditionally. `quantile(0.3, [3, 3])`
+        // therefore lands one ULP low of 3 (Go golden: 2.9999999999999996),
+        // which the previous early return hid.
+        assert_eq!(quantile_of(&[3.0, 3.0], 0.3), 2.999_999_999_999_999_6);
+        assert_eq!(quantile_of(&[3.0, 3.0], 0.7), 3.0);
         assert_eq!(quantile_of(&[5.0, 5.0, 5.0], 0.5), 5.0);
         assert_eq!(quantile_of(&[7.0], 0.3), 7.0);
+        // A `+Inf` upper neighbour with `weight == 0` yields `Inf*0 == NaN`
+        // (Go golden), not the finite `lower` value.
+        assert!(quantile_of(&[1.0, 2.0, f64::INFINITY], 0.5).is_nan());
+        // A leading `-Inf` with `weight == 0` keeps the finite `lower`.
+        assert_eq!(quantile_of(&[f64::NEG_INFINITY, 1.0, 2.0], 0.5), 1.0);
+    }
+
+    /// `quantile_of` reads its input ordered as `sort_for_quantile` orders it
+    /// (ascending, NaN first), not as `f64::total_cmp` would (NaN last, above
+    /// `+Inf`). Goldens from a Go port of Prometheus' `quantile()`.
+    #[test]
+    fn test_quantile_sorts_nan_first_like_prometheus() {
+        let mut nan_last = [3.0, 1.0, f64::NAN];
+        sort_for_quantile(&mut nan_last);
+        // NaN sorts to the *front* of the array, not above +Inf.
+        assert!(nan_last[0].is_nan());
+        assert_eq!(nan_last[1..], [1.0, 3.0]);
+        // `quantile(0.5, [3, NaN, 1])`: order is [NaN, 1, 3], so the median is
+        // 1.
+        assert_eq!(quantile_of(&nan_last, 0.5), 1.0);
+        // `quantile(0, [3, NaN, 1])` is NaN (it lands on the leading NaN).
+        assert!(quantile_of(&nan_last, 0.0).is_nan());
+        // `quantile(1, [3, NaN, 1])` is the largest finite value.
+        assert_eq!(quantile_of(&nan_last, 1.0), 3.0);
+        // NaN mixed deeper in the window: [NaN, 1, 2, 4].
+        let mut mixed = [1.0, f64::NAN, 4.0, 2.0];
+        sort_for_quantile(&mut mixed);
+        // `assert_eq!` compares element-wise and NaN != NaN, so check the
+        // shape.
+        assert!(mixed[0].is_nan());
+        assert_eq!(&mixed[1..], [1.0, 2.0, 4.0]);
+        assert_eq!(quantile_of(&mixed, 0.5), 1.5);
+        assert!(quantile_of(&mixed, 0.25).is_nan());
     }
 
     #[test]

@@ -753,8 +753,12 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     (0.5, m)` 也支持），缺参数在解析期报错；`aggr_over_time` 仍拒绝它并提示改用
     `quantile_over_time`。插值与 Prometheus `quantile` **逐位一致**：
     `lo*(1-weight) + hi*weight`（`weight = rank - floor(rank)`），不是代数等价的
-    `lo + (hi-lo)*weight`——后者在约 1/3 的输入上差 1 ULP；相邻样本位相同（含
-    `-0`/`+0`）时直接返回该值，避免重算误差与负零符号丢失。
+    `lo + (hi-lo)*weight`——后者在约 1/3 的输入上差 1 ULP。两种序都**无条件求值**：
+    没有 `weight == 0` 提前返回（那样 `+Inf` 上邻会漏掉 `Inf*0 = NaN`），也没有
+    「相邻样本相同就直接返回」的短路（`quantile(0.3, [3, 3])` 在 Go 里就是
+    `2.9999999999999996`）。排序也照 `vectorByValueHeap`：升序但 **NaN 排最前**，
+    不是 `total_cmp` 的「NaN 在 `+Inf` 之上」——`quantile(0.5, [3, NaN, 1])` 因此是
+    `1` 而非 `3`，`quantile_over_time` 同理。
   - 测试：`clamp` 的上下界/`max<min` 空结果/NaN 传播；`scalar` 的 1 个、0 个、
     多个样本与标量参数，以及 MetricsQL 的字符串字面量形式
     （`"1.5"`/`"1e3"`/`"1e400"`/`"abc"`/`"3"`）；`deriv` 的斜率、常量序列、
@@ -971,6 +975,36 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 测试：`changes` 的 NaN→NaN 为 0、单边 NaN 为 1；全 NaN 区间的 min/max 为
     NaN、前导 NaN 被真实值替换、中段 NaN 不参与；`topk(3, ...)` 不含 NaN 而
     `topk(4, ...)` 把 NaN 放在末尾（bottomk 同理）；活服务冒烟逐项复现，日志 0 error。
+- 已完成（2026-11-18）：`quantile` 的插值与排序与上游逐位对齐。三处都是
+  「实现里多做了上游没做的事」：
+  - **去掉 `weight == 0` 提前返回**。Prometheus 的 `quantile()` 永远算
+    `values[lower]*(1-weight) + values[upper]*weight`；当 `weight` 恰好为 0 且上邻
+    是 `+Inf` 时，`Inf*0 = NaN` 会把结果整个变成 NaN（Go 金值：
+    `quantile(0.5, [1, 2, +Inf]) = NaN`、`quantile(1, [1, 2, +Inf]) = NaN`），
+    而提前返回 `lower` 会错误地给出有限值。下邻是 `-Inf` 时仍是有限值
+    （`quantile(0.5, [-Inf, 1, 2]) = 1`），照上游保留；
+  - **去掉「相邻样本相同就返回该值」的短路**。`lo == hi` 时
+    `lo*(1-weight) + hi*weight` 并不总能还原 `lo`：`quantile(0.3, [3, 3])` 在
+    Go 里是 `2.9999999999999996`（`[0.1, 0.1]` 之类的次正规数差得更多）。原先的
+    短路是为「避免重算误差」加的，但那正好偏离上游；
+  - **排序改为 NaN 排在最前**。Prometheus 用 `vectorByValueHeap` 排序，
+    其 `Less` 在 `vi` 是 NaN 时返回 `true`，所以 NaN 比任何数都小；`f64::total_cmp`
+    相反，把 NaN 排在 `+Inf` 之上。差异是可见的：
+    `quantile(0.5, [3, NaN, 1])` 上游排成 `[NaN, 1, 3]` 得 `1`，`total_cmp` 排成
+    `[1, 3, NaN]` 得 `3`；`quantile(0, …)` 则因为落到 NaN 上而返回 NaN。
+    新增 `sort_for_quantile` 复刻该比较器，`quantile()` 聚合与
+    `quantile_over_time` 都改用它（VM 侧的 `median`/`mad`/`outliers_*` 本来就先滤
+    NaN，排序比较器对它们没有影响）；
+  - 测试：`test_quantile_interpolates` 改为断言 `quantile(0.3, [3, 3])` 的 1 ULP
+    偏差与 `+Inf` 上邻的 NaN；新增 `test_quantile_sorts_nan_first_like_prometheus`
+    （单位）与 `test_quantile_nan_ordering_end_to_end`（聚合 + `quantile_over_time`
+    + 相同邻值），全部用 Go 复刻 `quantile()` 的金值。
+- 已完成（2026-11-18）：`deg()` / `rad()` 的运算顺序与 Go 一致。Prometheus 写的是
+  `v * 180 / math.Pi`（先乘 180 再除 π）和 `v * math.Pi / 180`，本实现写成了
+  预先折叠常数 `v * (180/Pi)` / `v * (Pi/180)`——两者数学等价但舍入序列不同，
+  在真实输入上差 1 ULP：`deg(0.1)` 是 `5.729577951308232`（折叠常数给
+  `5.729577951308233`）、`rad(-7.89)` 与 `rad(1e-9)` 也各差 1 ULP。
+  现在照上游逐字写（乘除各一次），并用 `deg`/`rad` 的 Go 金值核对。
 - 已完成（2026-11-18）：日期函数的时间戳截断改为 Go 的**向零截断**。上游
   `dateWrapper` 用 `time.Unix(int64(el.F), 0)` 读样本值、用 `time.Unix(enh.Ts/1000, 0)`
   读求值时刻；Go 的 `float64 → int64` 与整数除法都向零截断，而此前实现用
