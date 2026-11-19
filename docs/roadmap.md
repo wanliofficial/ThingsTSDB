@@ -1117,6 +1117,14 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `group_left(a:b)` 都已可解析。新增 `test_vector_matching_modifiers_parse`
   的三条断言（`on(a:b)`、`group_left(a:b)`、`sum by (a:b)`）；回退 lexer 的
   冒号续接后该测试失败（已验证）。
+- 已完成（2026-11-19）：`stdvar_over_time` / `stddev_over_time` 对 NaN/Inf
+  首样本语义的确认与补测。与聚合不同，上游 `varianceOverTime` 是一个从 0
+  开始的顺序 Kahan-Welford 遍历（无 group-init 播种），首样本 NaN/±Inf 通过
+  `delta * (f - mean)` 自然传播为 NaN（`Inf * (f - Inf) = NaN`）。本实现
+  逐字一致，补 `test_over_time_kahan_and_welford_match_prometheus` 的首样本
+  NaN/+Inf/-Inf、混合序列与中间 NaN 断言（Go 金值 `stdvar_ot.go` 验证）。回退
+  实现到聚合那种「从 0 播种累加器」不会改变 over_time 结果，但补测钉住了与
+  上游一致的传播行为。
 - 已完成（2026-11-19）：`stdvar`/`stddev` 聚合对 NaN/Inf 首样本的语义。上游
   Prometheus 在 `STDVAR`/`STDDEV` 分组的初始化分支里，当首样本是 NaN 或 ±Inf
   时将方差累加器 `floatValue` 初始化为 NaN，否则初始化为 0。这确保首样本是

@@ -9396,6 +9396,37 @@ mod tests {
         // `avg_over_time` also survives an overflowing running sum.
         let overflow = [1e308, 1e308, -1e308, -1e308];
         assert_eq!(run(RangeFunc::AvgOverTime, &overflow), Some(0.0));
+
+        // Unlike the `stdvar`/`stddev` aggregations (which seed the variance
+        // accumulator in a group-init branch), `stdvar_over_time` is a plain
+        // sequential Kahan-Welford pass from zero, so a NaN/±Inf first sample
+        // propagates to NaN on its own: `delta * (f - mean)` becomes
+        // `Inf * (f - Inf) = NaN`. Goldens match a Go port of
+        // `varianceOverTime`.
+        assert!(run(RangeFunc::StdvarOverTime, &[f64::NAN])
+            .unwrap()
+            .is_nan());
+        assert!(run(RangeFunc::StdvarOverTime, &[f64::INFINITY])
+            .unwrap()
+            .is_nan());
+        assert!(run(RangeFunc::StdvarOverTime, &[f64::NEG_INFINITY])
+            .unwrap()
+            .is_nan());
+        assert!(run(RangeFunc::StddevOverTime, &[f64::NAN])
+            .unwrap()
+            .is_nan());
+        assert!(run(RangeFunc::StdvarOverTime, &[f64::INFINITY, 1.0])
+            .unwrap()
+            .is_nan());
+        assert!(run(RangeFunc::StdvarOverTime, &[1.0, f64::INFINITY])
+            .unwrap()
+            .is_nan());
+        assert!(run(RangeFunc::StdvarOverTime, &[f64::NAN, 1.0])
+            .unwrap()
+            .is_nan());
+        assert!(run(RangeFunc::StdvarOverTime, &[1.0, 2.0, f64::NAN])
+            .unwrap()
+            .is_nan());
     }
 
     #[test]
