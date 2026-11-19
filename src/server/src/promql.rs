@@ -5277,9 +5277,18 @@ fn aggregate_values(op: AggOp, values: &[f64]) -> f64 {
         // and then folds each later one in). A naive two-pass sum would agree
         // on well-conditioned input but drifts once the mean is large relative
         // to the spread.
+        //
+        // The `value` accumulator starts at NaN when the first sample is a NaN
+        // or an infinity, zero otherwise: upstream sets `floatValue` that way
+        // in the group-init branch, so a group whose *only* sample is NaN/±Inf
+        // answers NaN instead of 0.
         AggOp::Stdvar => {
             let mut mean = values[0];
-            let mut value = 0.0;
+            let mut value = if mean.is_nan() || mean.is_infinite() {
+                f64::NAN
+            } else {
+                0.0
+            };
             let mut count = 1.0;
             for &sample in &values[1..] {
                 count += 1.0;
@@ -11365,6 +11374,35 @@ mod tests {
             aggregate_values(AggOp::Sum, &[1.0, f64::INFINITY, 2.0]),
             f64::INFINITY
         );
+    }
+
+    /// Prometheus seeds the `stdvar`/`stddev` variance accumulator with NaN
+    /// when the group's first sample is a NaN or an infinity, and zero
+    /// otherwise (the `floatValue` choice in the `STDVAR`/`STDDEV` group-init
+    /// branch). A group whose only sample is NaN/±Inf therefore answers NaN,
+    /// not 0.
+    #[test]
+    fn test_stdvar_seeds_nan_for_nan_or_infinite_first_sample() {
+        // A lone NaN or ±Inf sample has no defined spread.
+        assert!(aggregate_values(AggOp::Stdvar, &[f64::NAN]).is_nan());
+        assert!(aggregate_values(AggOp::Stdvar, &[f64::INFINITY]).is_nan());
+        assert!(aggregate_values(AggOp::Stdvar, &[f64::NEG_INFINITY]).is_nan());
+        assert!(aggregate_values(AggOp::Stddev, &[f64::NAN]).is_nan());
+        assert!(aggregate_values(AggOp::Stddev, &[f64::INFINITY]).is_nan());
+        assert!(aggregate_values(AggOp::Stddev, &[f64::NEG_INFINITY]).is_nan());
+
+        // A leading NaN/±Inf is followed by a finite sample; the accumulator is
+        // already NaN and stays NaN.
+        assert!(aggregate_values(AggOp::Stdvar, &[f64::INFINITY, 1.0]).is_nan());
+        assert!(aggregate_values(AggOp::Stdvar, &[1.0, f64::INFINITY]).is_nan());
+        assert!(aggregate_values(AggOp::Stdvar, &[f64::NAN, 1.0]).is_nan());
+
+        // Ordinary input still gives the population variance and its sqrt.
+        let values = [1.0, 2.0, 3.0, 4.0];
+        assert!((aggregate_values(AggOp::Stdvar, &values) - 1.25).abs() < 1e-12);
+        assert!((aggregate_values(AggOp::Stddev, &values) - 1.25f64.sqrt()).abs() < 1e-12);
+        // A NaN further in is still propagated.
+        assert!(aggregate_values(AggOp::Stdvar, &[1.0, 2.0, f64::NAN]).is_nan());
     }
 
     /// `min`/`max` seed with the group's first sample and restart on NaN, which

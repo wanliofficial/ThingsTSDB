@@ -1117,6 +1117,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `group_left(a:b)` 都已可解析。新增 `test_vector_matching_modifiers_parse`
   的三条断言（`on(a:b)`、`group_left(a:b)`、`sum by (a:b)`）；回退 lexer 的
   冒号续接后该测试失败（已验证）。
+- 已完成（2026-11-19）：`stdvar`/`stddev` 聚合对 NaN/Inf 首样本的语义。上游
+  Prometheus 在 `STDVAR`/`STDDEV` 分组的初始化分支里，当首样本是 NaN 或 ±Inf
+  时将方差累加器 `floatValue` 初始化为 NaN，否则初始化为 0。这确保首样本是
+  NaN/±Inf 的单元素组返回 NaN 而非 0（PR #20056 后续，当前 main 的
+  `prom_engine.go:4349-4367`）。本实现的 `aggregate_values` 已按此修正；新增
+  `test_stdvar_seeds_nan_for_nan_or_infinite_first_sample` 覆盖单样本 NaN/+Inf/-Inf、
+  混合序列以及普通输入的边界。回退该初始化分支后测试失败（已验证）。
 - 已完成（2026-11-19）：`integral()` 的梯形平均加溢出保护（补测试）。上游
   `funcIntegral`（提交 `e71425d03a`，PR #19729 后续）在梯形积分里先
   `(currVal+prevVal)` 再 `/2`，于是两个**有限**的大数（如 `1e308`）相加会先溢出成
