@@ -12080,7 +12080,17 @@ mod tests {
         assert!(bucket_fraction(0.0, 1.0, &mut no_inf).is_nan());
         let mut no_observations = vec![(0.5, 0.0), (f64::INFINITY, 0.0)];
         assert!(bucket_fraction(0.0, 1.0, &mut no_observations).is_nan());
+        // Empty input answers NaN whatever the bounds, and the guard sits
+        // before the lower >= upper short circuit (upstream commit 0639411d7c).
         assert!(bucket_fraction(0.0, 1.0, &mut []).is_nan());
+        assert!(bucket_fraction(1.0, 0.0, &mut []).is_nan());
+        assert!(bucket_fraction(f64::NEG_INFINITY, f64::INFINITY, &mut []).is_nan());
+        assert!(bucket_fraction(f64::NAN, 1.0, &mut []).is_nan());
+        assert!(bucket_fraction(0.0, f64::NAN, &mut []).is_nan());
+        // A non-empty list keeps its behaviour, including NaN for a +Inf bucket
+        // with a zero count.
+        let mut zero_inf = vec![(f64::INFINITY, 0.0)];
+        assert!(bucket_fraction(0.0, 1.0, &mut zero_inf).is_nan());
     }
 
     #[test]
@@ -12732,6 +12742,15 @@ mod tests {
             f64::NEG_INFINITY
         );
         assert_eq!(bucket_quantile(2.0, &mut buckets.clone()), f64::INFINITY);
+        // Empty input answers NaN for every ordinary quantile, but the
+        // out-of-range short circuits run first and still answer ∓Inf
+        // (`BucketQuantile`, upstream commit d5b1febeb1).
+        assert!(bucket_quantile(0.0, &mut []).is_nan());
+        assert!(bucket_quantile(0.5, &mut []).is_nan());
+        assert!(bucket_quantile(1.0, &mut []).is_nan());
+        assert!(bucket_quantile(f64::NAN, &mut []).is_nan());
+        assert_eq!(bucket_quantile(-1.0, &mut []), f64::NEG_INFINITY);
+        assert_eq!(bucket_quantile(2.0, &mut []), f64::INFINITY);
         // Inputs that cannot describe a distribution answer NaN, as in
         // Prometheus, rather than an invented value.
         let mut no_inf = vec![(0.1, 1.0), (1.0, 2.0)];
@@ -13292,6 +13311,27 @@ mod tests {
         // An empty grouping list is legal in Prometheus.
         assert!(matching("a + on() b").on);
         assert!(matching("a + on() b").matching_labels.is_empty());
+
+        // Unquoted colons stay legal in grouping and matching labels — they
+        // predate the unquoted UTF-8 name feature and Prometheus 3 can store
+        // such labels (upstream commit 2911912782).
+        assert_eq!(
+            matching("a + on(a:b) b").matching_labels,
+            vec!["a:b".to_string()]
+        );
+        assert_eq!(
+            matching("a * on(x) group_left(a:b) b").include,
+            vec!["a:b".to_string()]
+        );
+        match parse_ok("sum by (a:b) (a)") {
+            Expr::Aggregation { grouping, .. } => {
+                let Some(Grouping::By(labels)) = grouping else {
+                    panic!("expected `by`");
+                };
+                assert_eq!(labels, vec!["a:b".to_string()]);
+            }
+            other => panic!("sum by (a:b) parsed as {other:?}"),
+        }
 
         // Errors name the problem.
         assert!(parse_err("a + on(instance) group_left(instance) b")

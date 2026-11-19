@@ -1099,6 +1099,24 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `covXY / varX`：原先 `varX == 0.0` 时返回斜率 0，而上游不做这个兜底——时间戳
   全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增
   `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的 `linearRegression`。
+- 已完成（2026-11-19）：补 `bucket_quantile` / `bucket_fraction` 空输入的边界断言。
+  两处空输入都已在正确位置返回 NaN，但缺测试钉住顺序（上游提交 `d5b1febeb1` /
+  `0639411d7c`）：
+  - `BucketQuantile` 的 `len(buckets) == 0 → NaN` 在 q 的三处越界短路**之后**，所以
+    空输入 + q<0 仍得 `-Inf`、q>1 得 `+Inf`、q=0/0.5/1/NaN 得 NaN；
+  - `BucketFraction` 的 `len(buckets) == 0 → NaN` 在 `lower >= upper → 0` **之前**，
+    所以空输入 + 反向边界也得 NaN。新增 `test_bucket_fraction_interpolates_classic_buckets`
+    的空输入全边界表格；`test_histogram_quantile_interpolates_classic_buckets` 补上
+    空输入 + q=-1/q=2 的越界组合。回退任一顺序后对应断言失败（已验证）。
+- 已完成（2026-11-19）：grouping / matching label 接受未加引号的冒号。上游
+  PR #20169（未加引号 UTF-8 名称默认启用）一度让 `sum by (a:b)`、`a + on (a:b) b`
+  这类「需要加引号」的 label 名被拒（因为它们含 `:`），随后提交 `2911912782`
+  恢复：`on`/`ignoring`/`group_left`/`group_right` 与 `by`/`without` 的 label
+  名不再做「需加引号」检查（只有 selector 里的 label name 仍不接受未加引号冒号）。
+  本实现的 lexer 在名字续接处一律允许 `:`，因此 `by (a:b)`、`on (a:b)`、
+  `group_left(a:b)` 都已可解析。新增 `test_vector_matching_modifiers_parse`
+  的三条断言（`on(a:b)`、`group_left(a:b)`、`sum by (a:b)`）；回退 lexer 的
+  冒号续接后该测试失败（已验证）。
 - 已完成（2026-11-19）：`integral()` 的梯形平均加溢出保护（补测试）。上游
   `funcIntegral`（提交 `e71425d03a`，PR #19729 后续）在梯形积分里先
   `(currVal+prevVal)` 再 `/2`，于是两个**有限**的大数（如 `1e308`）相加会先溢出成
