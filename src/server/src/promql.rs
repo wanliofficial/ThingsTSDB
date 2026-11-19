@@ -4989,6 +4989,19 @@ impl<'a> Evaluator<'a> {
                 vector.push(labels, value);
             }
         }
+        // A range vector function drops `__name__`, so two input series with
+        // different names but the same remaining labelset collapse onto one
+        // output labelset. Upstream runs the result through
+        // `mergeSeriesWithSameLabelset` (`promql/engine.go`, PR #18631): with
+        // non-overlapping timestamps the two series are merged, but in an
+        // instant query every point shares the evaluation timestamp, so a
+        // repeated labelset is always a collision and is reported.
+        let mut seen: std::collections::HashSet<&LabelSet> = std::collections::HashSet::new();
+        for point in &vector.0 {
+            if !seen.insert(&point.labels) {
+                return Err(same_labelset_error());
+            }
+        }
         Ok(Instant {
             vector,
             scalar: None,
@@ -10461,6 +10474,88 @@ mod tests {
     /// `rangeEval` refuses two series with the same labelset at one step
     /// (`promql/engine.go`), but a *different* step may reuse a labelset: the
     /// per-series timestamp map is only checked for an immediate repeat.
+    /// A range vector function drops `__name__`, so two input series with
+    /// different names but the same remaining labelset collapse onto one output
+    /// labelset. Upstream reports the collision via
+    /// `mergeSeriesWithSameLabelset` (PR #18631); in an instant query every
+    /// point shares the timestamp, so a repeated labelset is always a clash.
+    /// Goldens from Prometheus' engine_test.go #14695 case.
+    #[test]
+    fn test_range_func_rejects_a_same_labelset_collision() {
+        // Two series with different names but the same remaining labelset,
+        // both inside a 30m window evaluated at 12m.
+        let metric_1 = synthetic_labeled(
+            "metric_1",
+            &[("common", "label")],
+            &[(0, 0.0), (360_000, 1.0), (720_000, 2.0)],
+        );
+        let metric_2 = synthetic_labeled(
+            "metric_2",
+            &[("common", "label")],
+            &[(0, 3.0), (360_000, 4.0), (720_000, 5.0)],
+        );
+        let eval = |query: &str| {
+            let mut fetched = HashMap::new();
+            fetched.insert(
+                selector_key(&selector("m{common=\"label\"}")),
+                vec![metric_1.clone(), metric_2.clone()],
+            );
+            let expr = parse_ok(query);
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: 720_000,
+                query_end_ms: 720_000,
+                step_ms: 0,
+            };
+            evaluator.eval(&expr, 720_000)
+        };
+        // Both series fall in the window: a collision.
+        let error = eval("max_over_time(m{common=\"label\"}[30m])").unwrap_err();
+        assert_eq!(error.error_type(), "execution");
+        assert_eq!(
+            error.message(),
+            "vector cannot contain metrics with the same labelset"
+        );
+        // A 5m window at 6m still holds samples from both series, so it too
+        // collides — the check is on labelsets, not on the window width.
+        let eval_at = |at: i64| {
+            let mut fetched = HashMap::new();
+            fetched.insert(
+                selector_key(&selector("m{common=\"label\"}")),
+                vec![metric_1.clone(), metric_2.clone()],
+            );
+            let expr = parse_ok("max_over_time(m{common=\"label\"}[5m])");
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: at,
+                query_end_ms: at,
+                step_ms: 0,
+            };
+            evaluator
+                .eval(&expr, at)
+                .map(|instant| rendered(&instant.vector))
+        };
+        assert!(eval_at(360_000).is_err());
+        // With a selector matching only one of the two names there is no
+        // collision and the single answer is returned.
+        let single = {
+            let mut fetched = HashMap::new();
+            fetched.insert(
+                selector_key(&selector("metric_1{common=\"label\"}")),
+                vec![metric_1.clone()],
+            );
+            let expr = parse_ok("max_over_time(metric_1{common=\"label\"}[30m])");
+            let evaluator = Evaluator {
+                fetched: &fetched,
+                query_start_ms: 720_000,
+                query_end_ms: 720_000,
+                step_ms: 0,
+            };
+            rendered(&evaluator.eval(&expr, 720_000).unwrap().vector)
+        };
+        assert_eq!(single, vec![(r#"{common="label"}"#.to_string(), 2.0)]);
+    }
+
     #[test]
     fn test_record_step_rejects_a_labelset_collision() {
         let point = |job: &str, value: f64| {

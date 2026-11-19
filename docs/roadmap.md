@@ -1099,6 +1099,20 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `covXY / varX`：原先 `varX == 0.0` 时返回斜率 0，而上游不做这个兜底——时间戳
   全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增
   `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的 `linearRegression`。
+- 已完成（2026-11-19）：instant 查询中 range vector 函数也拒绝同一标签集冲突。
+  上游 PR #18631 之后 range vector 函数（`max_over_time` / `rate` 等）的输出
+  走 `mergeSeriesWithSameLabelset`（`promql/engine.go`）：同名标签集但时间戳
+  不重叠的两条序列会被合并，真正重叠时报
+  `vector cannot contain metrics with the same labelset`。此前实现的
+  `range_query` 只在「每个 step 累积」时查重（见上一条），instant 查询路径
+  `range_func` 没有检查——两条不同名、去掉 `__name__` 后剩余标签集相同的序列
+  （`metric_1{common="x"}` 与 `metric_2{common="x"}`）在窗口内都有样本时，
+  会静默输出两个 `{common="x"}` 点。现在 `range_func` 返回前用一个 `HashSet`
+  检查重复标签集，冲突报同一 `same_labelset_error()`（`error_type() ==
+  "execution"`）。instant 查询里所有点共享求值时刻，因此任何重复标签集都必然
+  是冲突，无需区分合并。新增 `test_range_func_rejects_a_same_labelset_collision`，
+  验证 `[30m]` 与 `[5m]` 两种窗口都报错、单序列正常返回；回退修复后该测试
+  失败（已验证）。
 - 已完成（2026-11-19）：一元负号丢掉元数据标签，range 查询拒绝同一 step 的标签集冲突。
   两处都来自上游 2026-09 之后的提交：
   - **一元负号**（`-m`）此前只把值取反、保留 `__name__`。上游把 `*parser.UnaryExpr`
