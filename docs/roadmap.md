@@ -1099,6 +1099,14 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `covXY / varX`：原先 `varX == 0.0` 时返回斜率 0，而上游不做这个兜底——时间戳
   全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增
   `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的 `linearRegression`。
+- 已完成（2026-11-19）：`integral()` 的梯形平均加溢出保护（补测试）。上游
+  `funcIntegral`（提交 `e71425d03a`，PR #19729 后续）在梯形积分里先
+  `(currVal+prevVal)` 再 `/2`，于是两个**有限**的大数（如 `1e308`）相加会先溢出成
+  `±Inf`、平均变成 `Inf`。修法是：若 Kahan 和已为 `±Inf` 而两个输入都有限，就改成
+  `currVal/2 + prevVal/2`。本实现的这一段早已照抄（`kahan_inc(current/2, before/2)`），
+  只是注释还写着「sum 之后减半」，已更正。现在补上金值测试：常数 `1e308` 的
+  `integral` 得 `1e308`（不是 `Inf`）、`-1e308` 得 `-1e308`、真正含 `+Inf` 样本的
+  序列仍得 `+Inf`；回退溢出保护后第一条断言失败（已验证）。
 - 已完成（2026-11-19）：解析器接受未加引号的 UTF-8 指标名。上游 PR #20169
   （"enable unquoted UTF-8 names by default"，2026-10-23）把 lexer 的
   `isNameStart` 扩为「ASCII 字母、`_`、或任意 Unicode 字母」，`isNameContinue`

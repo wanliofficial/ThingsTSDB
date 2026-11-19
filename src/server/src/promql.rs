@@ -6250,8 +6250,11 @@ fn apply_range_func_in(
                     0 => (before, 0.0),
                     // Right-point rectangle: the newer one's.
                     1 => (current, 0.0),
-                    // Trapezoid: the mean of the two, with a halving *after*
-                    // the sum so finite samples cannot overflow the average.
+                    // Trapezoid: the mean of the two. Prometheus adds the two
+                    // samples first and halves after, but when both are finite
+                    // and the sum overflows to ±Inf it halves *before* adding
+                    // instead, so `1e308` and `1e308` average to `1e308` rather
+                    // than `+Inf` (PR #19729 follow-up, `funcIntegral`).
                     _ => {
                         if before == 0.0 && current == 0.0 {
                             (0.0, 0.0)
@@ -9760,6 +9763,25 @@ mod tests {
         assert_eq!(
             apply_range_func(RangeFunc::Integral, &samples(&[(0, 5.0)]), 0, None, None),
             Some(0.0)
+        );
+        // Averaging two finite samples that overflow when added must not yield
+        // ±Inf: Prometheus halves before adding instead, so a constant 1e308
+        // integrates to 1e308 (engine test `integral_large`, PR #19729).
+        let huge = samples(&[(0, 1e308), (1_000, 1e308)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &huge, 1_000, None, None),
+            Some(1e308)
+        );
+        let huge_negative = samples(&[(0, -1e308), (1_000, -1e308)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &huge_negative, 1_000, None, None),
+            Some(-1e308)
+        );
+        // A genuine +Inf sample is still propagated, not averaged away.
+        let infinite = samples(&[(0, f64::INFINITY), (1_000, f64::INFINITY)]);
+        assert_eq!(
+            apply_range_func(RangeFunc::Integral, &infinite, 1_000, None, None),
+            Some(f64::INFINITY)
         );
         // An unusable strategy falls back to the trapezoidal default rather
         // than failing — Prometheus only warns.
