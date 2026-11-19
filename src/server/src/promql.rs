@@ -277,6 +277,20 @@ fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Whether `c` can start a metric or label name. Prometheus' lexer
+/// (`isNameStart` in `promql/parser/lex.go`) accepts ASCII letters, `_`, and
+/// any Unicode letter: unquoted UTF-8 names are on by default since PR #20169.
+fn is_name_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && c.is_alphabetic())
+}
+
+/// Whether `c` can continue a metric or label name. `isNameContinue` adds ASCII
+/// digits and `.` to `isNameStart`, so `foo.bar` and `指标.总数` are single
+/// names.
+fn is_name_continue(c: char) -> bool {
+    is_name_start(c) || c.is_ascii_digit() || c == '.'
+}
+
 /// A query error: `Bad` is the caller's fault (`bad_data`), `Exec` is ours
 /// (`execution`).
 #[derive(Debug, Clone, PartialEq)]
@@ -430,11 +444,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             tokens.push(Token::Number(number));
             continue;
         }
-        if c.is_ascii_alphabetic() || c == '_' {
+        if is_name_start(c) {
             let start = i;
-            while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == ':')
-            {
+            while i < chars.len() && (is_name_continue(chars[i]) || chars[i] == ':') {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
@@ -10751,6 +10763,32 @@ mod tests {
         assert!(parse_err("a and on(x) group_left b").contains("no grouping allowed"));
         // Prometheus' `fill` family is named rather than misparsed.
         assert!(parse_err("a + fill(0) b").contains("`fill` vector matching"));
+    }
+
+    #[test]
+    fn test_utf8_metric_names_parse_and_evaluate() {
+        // Unquoted UTF-8 names are on by default since Prometheus' PR #20169:
+        // the lexer's `isNameStart` accepts any Unicode letter and
+        // `isNameContinue` also allows `.`, so `指标.总数` is one name.
+        parse_ok("指标.总数");
+        parse_ok("指标{job=\"api\"}");
+        parse_ok("sum(指标.总数)");
+        parse_ok("指标_a.b");
+        // A number still lexes as a number: `.` after digits is a decimal
+        // point, not part of a name, and `Inf`/`NaN` stay float literals.
+        assert!(matches!(parse_ok("1.5"), Expr::Number(v) if (v - 1.5).abs() < f64::EPSILON));
+        // End-to-end: a Unicode-named series evaluates like an ASCII one.
+        let series = synthetic_labeled("指标.总数", &[("job", "api")], &[(0, 1.0), (60_000, 3.0)]);
+        let value = eval_synthetic(
+            series,
+            "指标.总数{job=\"api\"}",
+            "指标.总数{job=\"api\"}",
+            60_000,
+        );
+        assert_eq!(
+            value,
+            vec![(r#"{__name__="指标.总数",job="api"}"#.to_string(), 3.0)]
+        );
     }
 
     #[test]

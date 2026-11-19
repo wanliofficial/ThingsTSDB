@@ -1099,6 +1099,20 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `covXY / varX`：原先 `varX == 0.0` 时返回斜率 0，而上游不做这个兜底——时间戳
   全同时它算的是 `0/0`（NaN），浮点残差不为零时则是一个由残差决定的比值。新增
   `test_deriv_anchors_at_the_eval_timestamp`，金值取自 Go 的 `linearRegression`。
+- 已完成（2026-11-19）：解析器接受未加引号的 UTF-8 指标名。上游 PR #20169
+  （"enable unquoted UTF-8 names by default"，2026-10-23）把 lexer 的
+  `isNameStart` 扩为「ASCII 字母、`_`、或任意 Unicode 字母」，`isNameContinue`
+  再额外允许 ASCII 数字和 `.`（`promql/parser/lex.go`）。此前实现的 lexer 只从
+  ASCII 字母或 `_` 起头、续接仅 ASCII 字母数字 + `_` + `:`，于是 `指标.总数`
+  报 `unexpected character '指'`。现在换成两个判定函数 `is_name_start` /
+  `is_name_continue`，与上游一致：`指标.总数`、`指标_a.b`、`sum(指标.总数)`
+  都能解析并求值；数字字面量不受影响（`1.5` 仍是一个数，`.` 只在名字的续接
+  位置属于名字）。`is_name_byte`（`label_replace` 的 `$name` 展开）保持原样，
+  那是替换模板的语法、与上游 `expandReplacement` 的 `isValidLabelName` 无关。
+  新增 `test_utf8_metric_names_parse_and_evaluate`：四项 `parse_ok`、`1.5`
+  仍是数字、以及一条中文名序列的端到端求值；回退 `is_name_start` 或
+  `is_name_continue` 的 `.` 任一后该测试失败（已逐条验证）。
+  注：不追求上游的表达式打印器（`Expr.String()`），本服务没有 AST 打印路径。
 - 已完成（2026-11-19）：instant 查询中 range vector 函数也拒绝同一标签集冲突。
   上游 PR #18631 之后 range vector 函数（`max_over_time` / `rate` 等）的输出
   走 `mergeSeriesWithSameLabelset`（`promql/engine.go`）：同名标签集但时间戳
