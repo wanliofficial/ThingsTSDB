@@ -1214,6 +1214,22 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     五个样本值的全部日期分量，以及 `-500` / `-1500` / `-60001` / `0` ms 的
     无参数形式；两条修复分别回退后对应断言会失败（已逐条验证）。
   - `CivilDate.year` 保持 `i64`（前一轮为避免 `i32` 截断而放宽），与本次无关。
+- 已完成（2026-11-19）：`topk` / `bottomk` 的 `k` 参数边界对齐 Prometheus。核对聚合时
+  发现一个保真度缺口：上游 `aggregationK` 先 `k = min(int64(fParam),
+  len(inputMatrix))`，再 `if k < 1 { return nil }`，所以 `topk(0, m)` /
+  `topk(-1, m)` 一律返回空结果；而这里此前直接 `param as usize`，负的 `f64`
+  参数会被 wrap 成一个巨大的 `usize`（例如 `-1.0` → `18446744073709551615`），
+  `take(k)` 于是把整组序列全吐出来，与上游相反。同族的 `limitk` / `outliersk`
+  早就走 `float_to_int_bounded(k).max(0) as usize`（NaN→0、负→0、分数向零截断），
+  `topk` / `bottomk` 漏了这层钳位。现在统一改走同一钳位：
+  - NaN→0、负→0（都返回空）、分数向零截断（`topk(2.9, m)` 保留 2），与 Go 复刻
+    `k = min(int64(fParam), len); if k < 1 { empty }` 的金值一致；
+  - `±Inf` 仍按普通极值排（`topk(3)` 给 `+Inf` 在前、`bottomk(3)` 给 `+Inf`
+    在后），NaN 在两向都落末尾（`topk(5)` 把唯一的 NaN 排在末位）；
+  - 分组下每组的排名独立保持（`topk(2, m)` 按 `g` 分组各取前 2）。
+  - 测试：在 `test_topk_and_bottomk_rank_nan_last` 里补 `±Inf` 极值排序、分组
+    `topk(2)`、负/零 `k` 返回空、分数 `k` 截断四组断言，金值取自 Go 复刻
+    Prometheus 的堆填充 + 最终 `sort.Reverse`。
 - 已完成（2026-11-18）：`predict_linear()` 的拟合原点改为**求值时刻**（`enh.Ts`），
   与 Prometheus `funcPredictLinear` 逐字对齐。此前用「首个样本时间戳」做原点、
   预测到「最后样本 + horizon」，只有当最后样本恰好落在求值时刻时才与上游一致；

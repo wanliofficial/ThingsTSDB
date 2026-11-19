@@ -4838,8 +4838,17 @@ impl<'a> Evaluator<'a> {
                     scalar: None,
                 });
             }
+            // `topk`/`bottomk` build a heap of up to `k` slots and return an
+            // empty result when `k < 1` — the same `k < 1` short-circuit as
+            // `limitk`/`outliersk`. A raw `param as usize` would wrap a
+            // negative param into a huge count and return every series instead.
+            let k = if param.is_nan() {
+                0
+            } else {
+                float_to_int_bounded(param).max(0) as usize
+            };
             return Ok(Instant {
-                vector: topk(op, &values, param as usize, grouping),
+                vector: topk(op, &values, k, grouping),
                 scalar: None,
             });
         }
@@ -12079,6 +12088,39 @@ mod tests {
         assert_eq!(bottom.len(), 4);
         assert_eq!(bottom[..3], [1.0, 2.0, 3.0]);
         assert!(bottom[3].is_nan(), "bottomk put NaN first: {bottom:?}");
+        // Infinities rank as ordinary extremes. A Go port of the heap fill +
+        // final `sort.Reverse` gives `topk(3) = [+Inf, 3, 2]`, `bottomk(3) =
+        // [1, 2, 3]`, and `topk(5)` trailing the lone NaN. Grouping keeps the
+        // ranking per group.
+        let inf_series = vec![
+            synthetic_labeled("m", &[("g", "a"), ("i", "nan")], &[(0, f64::NAN)]),
+            synthetic_labeled("m", &[("g", "a"), ("i", "one")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("g", "a"), ("i", "two")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("g", "a"), ("i", "inf")], &[(0, f64::INFINITY)]),
+            synthetic_labeled("m", &[("g", "b"), ("i", "ten")], &[(0, 10.0)]),
+        ];
+        let grouped = |query: &str| -> Vec<(String, f64)> {
+            eval_series(inf_series.clone(), "m", query, 0)
+                .vector
+                .0
+                .iter()
+                .map(|point| (point.labels["g"].clone(), point.value))
+                .collect()
+        };
+        assert_eq!(
+            grouped("topk(2, m)"),
+            vec![("a".to_string(), f64::INFINITY), ("b".to_string(), 10.0)]
+        );
+        // A negative or zero k yields an empty result — the same `k < 1`
+        // short-circuit as `limitk`/`outliersk` and Prometheus' `aggregationK`
+        // (`k = min(int64(fParam), len(inputMatrix)); if k < 1 { return nil
+        // }`).
+        assert!(eval("topk(-1, m)").is_empty());
+        assert!(eval("bottomk(-1, m)").is_empty());
+        assert!(eval("topk(0, m)").is_empty());
+        assert!(eval("bottomk(0, m)").is_empty());
+        // A fractional k truncates toward zero, so `topk(2.9, m)` keeps 2.
+        assert_eq!(eval("topk(2.9, m)"), vec![3.0, 2.0]);
     }
 
     #[test]
