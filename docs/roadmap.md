@@ -397,7 +397,12 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - `label_uppercase` / `label_lowercase` 只改点名的标签，其他标签不动；VM 至少
     要求一个标签名（`not enough args`），这里同样拒绝零参数；
   - `label_transform(v, "label", "regex", "replacement")` 用**未锚定**的 Go 正则
-    做 `ReplaceAll`：替换标签值里每一处匹配，替换串支持 `$1`/`${name}`；
+    做 `ReplaceAll`：替换标签值里每一处匹配，替换串按 Go `regexp.ExpandString`
+    的语法展开（`$1`、`${name}`、`$$` 为字面 `$`）；展开结果为空串时删除该标签
+    （VM 的 `RemoveTag`）；源标签缺失时按空串读入，因此能匹配 `""` 的正则会**新建**
+    该标签（VM 的 `getDstValue` 会追加一个 tag）；`expand_replacement` 与
+    `label_replace` 共用，故 `$1x` 的「最长名字」规则、行尾 `$`、未闭合的 `${`
+    与空的 `${}` 都按字面复制；
   - `label_match` / `label_mismatch` 用**锚定**正则（`^(?:re)$`）过滤序列——
     匹配的留下 / 不匹配的留下，缺标签按空串处理，因此 `.*` 命中而 `.+` 不命中；
   - 正则都在解析期编译，失败时报 `bad_data` 并点名函数（`label_transform` 与
@@ -405,7 +410,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `CompileRegexpAnchored`）。
   - 测试：`label_map` 的命中/未命中/映射为空/同名键后写覆盖/`""→x` 新建标签、
     大小写只动点名标签、`label_transform`
-    的逐处替换与捕获组展开、`label_match`/`label_mismatch` 的锚定语义与互补关系、
+    的逐处替换与捕获组展开（含空展开删标签、缺失标签被 `""` 匹配时新建、`${}`
+    字面复制）、`label_match`/`label_mismatch` 的锚定语义与互补关系、
     缺标签按空串匹配、向量过滤后只剩一条；以及奇数参数、零标签名、非法正则、
     缺逗号、标量输入的报错。
 - 已完成（2026-11-13）：MetricsQL 经典桶的汇总函数 `histogram_avg` /
@@ -461,9 +467,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     时丢弃，再把相邻两桶中 `hits` 之和最小的一对合并到上界成员里，直到只剩
     `limit` 个；首尾桶始终保留，合并后的桶沿用上界桶的 `le`、计数把下界桶的
     累计值并入；
-  - `limit` 先按 Go 的 `float→int`（`floatToIntBounded`）取整，`<= 0` 报错，
-    `< 3` 抬到 3（VM 保留首尾桶的考量）、`> 3` 原样保留（不封顶）；缺 `le` 或
-    `le` 不可解析的序列被跳过；`limit` 必须是数值样本值，字符串字面量在解析期被
+  - `limit` 先按 Go 的 `float→int`（`floatToIntBounded`）取整，`<= 0` 报错
+    `limit must be greater than 0; got <整数>`（照抄 VM 的 `got %d`，用的是取整后的
+    整数而非原始浮点样本值），`< 3` 抬到 3（VM 保留首尾桶的考量）、`> 3` 原样保留
+    （不封顶）；缺 `le` / `le` 不可解析 / `le` 为 NaN 的序列被跳过（VM 跳过前两者，
+    但会保留 `le="NaN"`——其 `sort.Slice` 顺序不确定，这里统一跳过以保持确定性）；
+    `le` 解析不 trim（Go 的 `strconv.ParseFloat` 拒绝前后空格）；
+    `limit` 必须是数值样本值，字符串字面量在解析期被
     拒绝（VM 只在 `scalar()` 里特判字符串）；
   - 测试：桶数不超限时全保留（`limit=10` 对 8 个桶）；超限时按最小 hits 合并到
     `limit` 个且首末桶保留（8 桶 → `le` 1/64/+Inf，计数 1/7/8）；两端空桶被裁掉
@@ -712,7 +722,10 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - `label_replace(v, dst, replacement, src, regex)`：pattern 按 Prometheus 的方式
     锚定（`^(?s:...)$`），源标签值**整串**匹配才替换；`replacement` 用 Go
     `ExpandString` 的语法展开（`$1`、`${name}`、`$$` 为字面 `$`、越界或未参与的
-    捕获组展开为空），展开为空则**删除**目标标签；不匹配的序列原样透传；
+    捕获组展开为空），展开为空则**删除**目标标签；不匹配的序列原样透传。
+    `expand_replacement` 逐行对照 Go 的 `expand`/`extract`：`$name` 取**最长**的
+    名字字节串（所以 `$1x` 是组名 `"1x"`、展开为空而不是 `$1` 加字面 `x`）、
+    不构成名字的 `$`（行尾 `$`、`${` 未闭合、空 `${}`）按字面复制；
   - `label_join(v, dst, separator, src...)`：把源标签按顺序用分隔符连接，缺失的源
     标签按空串参与（分隔符仍出现），结果为空同样删除目标标签；
   - 目标标签名（以及 `label_join` 的源标签名）在解析期按
@@ -721,7 +734,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     「expects an instant vector」；
   - 写 `__name__` 即重命名指标，其余情况保留 `__name__`；两个序列改写后标签相同时
     按 Prometheus 的逐 step 语义各留在结果里（不静默丢弃）。
-  - 测试：`$1`/`${1}`/`$$` 展开、锚定导致的不匹配原样透传、空展开删除标签、
+  - 测试：`$1`/`${1}`/`$$` 展开、`$1x` 的「最长名字」规则、行尾 `$`/`${}`/`${1`
+    的按字面复制、锚定导致的不匹配原样透传、空展开删除标签、
     未参与捕获组展开为空、`__name__` 重命名、`label_join` 的缺失源标签与空结果、
     解析期错误（非法正则/标签名/非字符串参数/缺源标签）、标量参数求值错误；端到端
     （actix 路由 + 真实引擎）覆盖 `label_replace` 派生 `instance` 且值不变、
@@ -1285,7 +1299,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `label_value`（丢 `__name__`、解析失败为 NaN、NaN 样本保持且全 NaN 系列不删）、
   `alias`（= `label_set(q, "__name__", name)`）、`label_map`（Go map 后者胜、
   缺失标签按空串查表可创建、映射到空串删除）、`label_transform`（非锚定
-  `replace_all`）、`label_match` / `label_mismatch`（`^(?:re)$` 锚定）、
+  `replace_all` + Go 展开规则 + 空展开删除 + 缺失标签新建）、
+  `label_match` / `label_mismatch`（`^(?:re)$` 锚定）、
   `label_join`（无条件插分隔符、空结果删标签）、`drop_common_labels`。
 - 已完成（2026-11-19）：`topk` / `bottomk` 的 `k` 参数边界对齐 Prometheus。核对聚合时
   发现一个保真度缺口：上游 `aggregationK` 先 `k = min(int64(fParam),

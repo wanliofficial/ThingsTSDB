@@ -108,10 +108,13 @@
 //! `label_map` / `label_uppercase` / `label_lowercase` / `label_transform` /
 //! `label_match` / `label_mismatch` follow the same file: `label_map` replaces
 //! a listed value and leaves an unlisted one alone (a mapping to `""` deletes
-//! the label), the case functions only touch the labels they name, and
-//! `label_transform` replaces every (unanchored) regex match inside the value
-//! while `label_match` / `label_mismatch` anchor their regex and drop the
-//! series that (does not) match.
+//! the label, a mapping for `""` creates it since a missing label is the empty
+//! string in VM's `GetTagValue`), the case functions only touch the labels they
+//! name, and `label_transform` replaces every (unanchored) regex match inside
+//! the value while `label_match` / `label_mismatch` anchor their regex and drop
+//! the series that (does not) match. The replacement string is expanded by Go
+//! `regexp.ExpandString` rules (`$1`, `${name}`, `$$`), so a malformed `${}`
+//! is copied through literally and an empty expansion deletes the tag.
 //!
 //! `histogram_avg` / `histogram_stddev` / `histogram_stdvar` are
 //! VictoriaMetrics' classic-`le` versions, not Prometheus' native-histogram
@@ -231,11 +234,12 @@ fn expand_replacement(template: &str, captures: &regex::Captures<'_>) -> String 
             continue;
         }
         let (name, next) = if bytes.get(after) == Some(&b'{') {
-            // `${name}` — the brace must close. An empty `${}` names no group
-            // and therefore expands to nothing, as in Go.
+            // `${name}` — the brace must close. Go's `extract` rejects an empty
+            // name (or one with a non-name byte), and `expand` then copies the
+            // `$` through as literal text, so `${}` survives verbatim.
             let body = &template[after + 1..];
             match body.find('}') {
-                Some(end) if body[..end].bytes().all(is_name_byte) => {
+                Some(end) if end > 0 && body[..end].bytes().all(is_name_byte) => {
                     (body[..end].to_string(), after + 1 + end + 1)
                 }
                 _ => {
@@ -4264,13 +4268,24 @@ impl<'a> Evaluator<'a> {
                             pattern,
                             replacement,
                         } => {
-                            if let Some(value) = point.labels.get(label) {
-                                // Go's `ReplaceAll` expands `$1` / `${name}`
-                                // in the replacement and replaces every match;
-                                // `regex::Regex` does the same with
-                                // `replace_all`.
-                                let replaced = pattern.0.replace_all(value, replacement.as_str());
-                                point.labels.insert(label.clone(), replaced.into_owned());
+                            // VM's `labelReplace`: a missing source label reads
+                            // as the empty string, so a pattern that matches
+                            // `""` still creates the destination tag. The
+                            // replacement is expanded by Go's `expand` rules,
+                            // and an empty result removes the tag.
+                            let current = point.labels.get(label).map(String::as_str).unwrap_or("");
+                            if pattern.0.is_match(current) {
+                                let replaced = pattern.0.replace_all(
+                                    current,
+                                    |captures: &regex::Captures<'_>| {
+                                        expand_replacement(replacement, captures)
+                                    },
+                                );
+                                if replaced.is_empty() {
+                                    point.labels.remove(label);
+                                } else {
+                                    point.labels.insert(label.clone(), replaced.into_owned());
+                                }
                             }
                             true
                         }
@@ -14402,6 +14417,32 @@ mod tests {
                 1.0
             )]
         );
+        // Go's `expand` takes the longest run of name bytes after `$`, so
+        // `$1x` names the group "1x" (which the regex does not declare) and
+        // expands to nothing.
+        assert_eq!(
+            run(r#"label_replace(http_requests, "job", "a$1x", "job", "(a)pi")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"a\"}".to_string(),
+                1.0
+            )]
+        );
+        // A `$` that starts no name is copied through, including at the end of
+        // the template and in the malformed `${}` form.
+        for (replacement, want) in [("a$", "a$"), ("x${}y", "x${}y"), ("${1", "${1")] {
+            let query =
+                format!(r#"label_replace(http_requests, "job", "{replacement}", "job", "api")"#);
+            assert_eq!(
+                run(&query),
+                vec![(
+                    format!(
+                        "{{__name__=\"http_requests\",instance=\"10.0.0.1:9090\",job=\"{want}\"}}"
+                    ),
+                    1.0
+                )],
+                "{query}"
+            );
+        }
         // Writing `__name__` renames the metric instead of adding a label.
         assert_eq!(
             run(
@@ -14779,6 +14820,41 @@ mod tests {
             run(r#"label_transform(http_requests, "instance", "([0-9]+)\.([0-9]+)", "$1-$2")"#),
             vec![(
                 "{__name__=\"http_requests\",instance=\"10-0.0-1\",job=\"api\"}".to_string(),
+                1.0
+            )]
+        );
+        // A replacement that expands to nothing removes the tag (VM's
+        // `RemoveTag`).
+        assert_eq!(
+            run(r#"label_transform(http_requests, "job", ".*", "")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\"}".to_string(),
+                1.0
+            )]
+        );
+        // A missing source label reads as `""`, so a pattern that matches it
+        // creates the tag; VM's `getDstValue` appends one.
+        assert_eq!(
+            run(r#"label_transform(http_requests, "zone", ".*", "eu")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"api\",zone=\"eu\"}"
+                    .to_string(),
+                1.0
+            )]
+        );
+        // The replacement uses Go's `expand` rules: `$1x` is the (missing)
+        // group "1x", and a malformed `${}` is copied through literally.
+        assert_eq!(
+            run(r#"label_transform(http_requests, "job", "(a)pi", "a$1x")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"a\"}".to_string(),
+                1.0
+            )]
+        );
+        assert_eq!(
+            run(r#"label_transform(http_requests, "job", "api", "x${}y")"#),
+            vec![(
+                "{__name__=\"http_requests\",instance=\"10.0.0.1\",job=\"x${}y\"}".to_string(),
                 1.0
             )]
         );
