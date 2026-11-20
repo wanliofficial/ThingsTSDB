@@ -7160,13 +7160,13 @@ type ClassicHistograms = BTreeMap<BTreeMap<String, String>, Vec<(f64, f64)>>;
 
 /// `histogram_quantile(q, v)` for classic `le` buckets.
 ///
-/// Every series must carry a `le` bucket bound; `_sum`/`_count` series (or a
-/// missing `by (le)` aggregation) are refused by name rather than dropped, so
-/// a panel that passes the wrong metric hears about it instead of drawing an
-/// empty graph.
+/// Series without a parsable `le` bound are skipped, exactly as Prometheus'
+/// `resetHistograms` (which also records a `bad_bucket_label` warning) and
+/// VictoriaMetrics' `groupLeTimeseries` do, so a panel that passes `_sum` or
+/// `_count` by mistake draws nothing rather than failing the whole query.
 fn histogram_quantile(quantile: f64, vector: &Vector) -> Result<Vector> {
     let mut out = Vector::default();
-    for (labels, mut buckets) in classic_buckets("histogram_quantile", vector)? {
+    for (labels, mut buckets) in classic_buckets(vector) {
         out.push(labels, bucket_quantile(quantile, &mut buckets));
     }
     Ok(out)
@@ -7180,7 +7180,7 @@ fn histogram_quantile(quantile: f64, vector: &Vector) -> Result<Vector> {
 /// outside `[0, 1]` still produces a series (Prometheus only warns), whose
 /// value is `-Inf`, `+Inf` or `NaN`.
 fn histogram_quantiles(quantiles: &[f64], label: &str, vector: &Vector) -> Result<Vector> {
-    let groups = classic_buckets("histogram_quantiles", vector)?;
+    let groups = classic_buckets(vector);
     let mut out = Vector::default();
     for quantile in quantiles {
         let name = format_g_percent(*quantile);
@@ -7224,7 +7224,9 @@ type BucketGroups<'a> = BTreeMap<Vec<(String, String)>, Vec<(f64, &'a Point)>>;
 fn buckets_limit(limit_raw: f64, vector: &Vector) -> Result<Vector> {
     let limit = float_to_int_bounded(limit_raw);
     if limit <= 0 {
-        return bad(format!("limit must be greater than 0; got {limit_raw}"));
+        // VM formats the *integer* it got back from `getIntNumber`, not the
+        // original sample value (`limit must be greater than 0; got %d`).
+        return bad(format!("limit must be greater than 0; got {limit}"));
     }
     // A limit below three is raised to three (VM preserves the first and last
     // buckets for min/max accuracy); a larger limit is kept as is.
@@ -7238,7 +7240,13 @@ fn buckets_limit(limit_raw: f64, vector: &Vector) -> Result<Vector> {
         let Some(raw) = point.labels.get("le") else {
             continue;
         };
-        let Ok(upper) = raw.trim().parse::<f64>() else {
+        // VM parses `le` with Go's `strconv.ParseFloat`, which rejects
+        // surrounding whitespace but accepts `NaN`/`±Inf`. A NaN bound is
+        // *kept* by VM (it is simply ordered arbitrarily by `sort.Slice`), but
+        // here it is dropped: NaN's position is unspecified upstream, so
+        // reproducing it would mean depending on unstable sort behaviour. This
+        // is recorded as an intentional divergence.
+        let Ok(upper) = raw.parse::<f64>() else {
             continue;
         };
         if upper.is_nan() {
@@ -7361,38 +7369,42 @@ fn go_f64_to_u64(value: f64) -> u64 {
 
 /// Groups a vector of classic `le` buckets into one histogram per label set.
 ///
-/// Every series must carry a `le` bucket bound; `_sum`/`_count` series (or a
-/// missing `by (le)` aggregation) are refused by name rather than dropped, so
-/// a panel that passes the wrong metric hears about it instead of drawing an
-/// empty graph. Prometheus emits a warning and skips such a series; this
-/// evaluator has no annotation channel, so the error is the honest signal.
-fn classic_buckets(function: &str, vector: &Vector) -> Result<ClassicHistograms> {
+/// Series that do not carry a usable `le` bound are **skipped**, matching both
+/// upstreams:
+///
+/// - Prometheus' `resetHistograms` parses the bound with `strconv.ParseFloat`
+///   and, on failure or a NaN bound, records a `bad_bucket_label` warning and
+///   continues;
+/// - VictoriaMetrics' `groupLeTimeseries` skips the series when the tag is
+///   absent or `ParseFloat` fails.
+///
+/// This evaluator has no annotation channel, so the warning half of the
+/// Prometheus behaviour is dropped and only the skip remains.
+///
+/// One deliberate divergence: VM keeps a `le="NaN"` series (`ParseFloat`
+/// succeeds) and orders it arbitrarily, since `sort.Slice` with `NaN` violates
+/// the ordering contract. Reproducing that would mean depending on unstable
+/// sort behaviour, so a NaN bound is skipped here for every caller.
+fn classic_buckets(vector: &Vector) -> ClassicHistograms {
     let mut groups: ClassicHistograms = BTreeMap::new();
     for point in &vector.0 {
         let Some(raw) = point.labels.get("le") else {
-            return bad(format!(
-                "{function} needs a `le` label on every series; {} has none",
-                label_string(&point.labels)
-            ));
+            continue;
         };
-        let Ok(upper) = raw.trim().parse::<f64>() else {
-            return bad(format!(
-                "{function} cannot read `le={raw}` as a bucket bound"
-            ));
+        // Go's `strconv.ParseFloat` rejects surrounding whitespace, so no
+        // trimming here either.
+        let Ok(upper) = raw.parse::<f64>() else {
+            continue;
         };
         if upper.is_nan() {
-            // Prometheus refuses a NaN bound for the same reason as an
-            // unparseable one: every comparison against it is false.
-            return bad(format!(
-                "{function} cannot read `le={raw}` as a bucket bound"
-            ));
+            continue;
         }
         let mut labels = point.labels.clone();
         labels.remove("le");
         drop_metadata_labels(&mut labels);
         groups.entry(labels).or_default().push((upper, point.value));
     }
-    Ok(groups)
+    groups
 }
 
 /// MetricsQL's `histogram(v)` — a native histogram built from the group's
@@ -7650,7 +7662,7 @@ fn go_format_e3(value: f64) -> String {
 /// `histogram_fraction(lower, upper, v)` for classic `le` buckets.
 fn histogram_fraction(lower: f64, upper: f64, vector: &Vector) -> Result<Vector> {
     let mut out = Vector::default();
-    for (labels, mut buckets) in classic_buckets("histogram_fraction", vector)? {
+    for (labels, mut buckets) in classic_buckets(vector) {
         out.push(labels, bucket_fraction(lower, upper, &mut buckets));
     }
     Ok(out)
@@ -7671,7 +7683,7 @@ fn histogram_fraction(lower: f64, upper: f64, vector: &Vector) -> Result<Vector>
 /// interpolants.
 fn histogram_share(le: f64, bounds: Option<&str>, vector: &Vector) -> Result<Vector> {
     let mut out = Vector::default();
-    for (labels, buckets) in classic_buckets("histogram_share", vector)? {
+    for (labels, buckets) in classic_buckets(vector) {
         let (share, lower, upper) = bucket_share(le, buckets);
         if let Some(bounds) = bounds {
             let mut lower_labels = labels.clone();
@@ -7771,8 +7783,8 @@ fn fix_broken_buckets(mut buckets: Vec<(f64, f64)>) -> (Vec<f64>, Vec<f64>) {
 /// (`lePrev` and `vPrev` start at 0).
 fn histogram_stat(op: HistogramStatOp, vector: &Vector) -> Result<Vector> {
     let mut out = Vector::default();
-    for (labels, mut buckets) in classic_buckets(op.name(), vector)? {
-        // VM sorts by `le`; `classic_buckets` already rejected NaN bounds, so
+    for (labels, mut buckets) in classic_buckets(vector) {
+        // VM sorts by `le`; `classic_buckets` already dropped NaN bounds, so
         // `total_cmp` only has to order the remaining values.
         buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
         out.push(labels, bucket_stat(op, &buckets));
@@ -12709,17 +12721,32 @@ mod tests {
             assert!(!point.labels.contains_key("__name__"));
             assert!(!point.labels.contains_key("le"));
         }
-        // A series without `le` is refused by name, as for
-        // `histogram_quantile`.
+        // A series without `le` is skipped, not refused: Prometheus'
+        // `resetHistograms` and VM's `groupLeTimeseries` both `continue` past
+        // it (Prometheus additionally records a `bad_bucket_label` warning,
+        // which this evaluator has no channel for). The two real histograms
+        // still answer.
         let mut mixed = vector.clone();
         mixed.0.push(Point {
             labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
             value: 0.0,
             sample_ts: None,
         });
-        let error = histogram_fraction(0.0, 0.5, &mixed).unwrap_err();
-        assert!(error.message().contains("`le` label"));
-        assert!(error.message().contains("job=\"api\""));
+        let skipped = histogram_fraction(0.0, 0.5, &mixed).expect("bad `le` is skipped");
+        assert_eq!(skipped.0.len(), 2);
+        assert_eq!(rendered(&skipped), rendered(&out));
+        // An entirely `le`-less input yields no histograms at all, so the
+        // answer is empty rather than an error.
+        let mut nothing = Vector::default();
+        nothing.0.push(Point {
+            labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
+            value: 0.0,
+            sample_ts: None,
+        });
+        assert!(histogram_fraction(0.0, 0.5, &nothing)
+            .expect("no buckets is not an error")
+            .0
+            .is_empty());
         // End to end through the evaluator: one `le` series per bucket, 2/4/6/8
         // observations up to 0.1/0.5/1/+Inf.
         let series = vec![
@@ -12842,15 +12869,17 @@ mod tests {
             assert!(!point.labels.contains_key("__name__"));
         }
 
-        // A histogram with no `le` at all is refused by name.
+        // A histogram with no `le` at all is skipped, leaving no output.
         let mut missing = Vector::default();
         missing.0.push(Point {
             labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
             value: 0.0,
             sample_ts: None,
         });
-        let error = histogram_share(1.0, None, &missing).unwrap_err();
-        assert!(error.message().contains("`le` label"));
+        assert!(histogram_share(1.0, None, &missing)
+            .expect("no buckets is not an error")
+            .0
+            .is_empty());
 
         // End to end: the parser takes two or three arguments, and the answer
         // drops `__name__` and `le`.
@@ -13239,7 +13268,7 @@ mod tests {
             0.05
         ));
         // Two histograms are grouped apart by their non-`le` labels, and a
-        // missing `le` is refused by name.
+        // missing `le` is skipped rather than refused.
         let labeled = |job: &str, le: &str, value: f64| Point {
             labels: BTreeMap::from([
                 ("job".to_string(), job.to_string()),
@@ -13270,9 +13299,9 @@ mod tests {
             value: 0.0,
             sample_ts: None,
         });
-        let error = histogram_stat(HistogramStatOp::Stddev, &mixed).unwrap_err();
-        assert!(error.message().contains("`le` label"));
-        assert!(error.message().contains("job=\"api\""));
+        // The `le`-less series is skipped, so both histograms still answer.
+        let skipped = histogram_stat(HistogramStatOp::Stddev, &mixed).expect("bad `le` is skipped");
+        assert_eq!(skipped.0.len(), 2);
 
         // End to end through the evaluator.
         let series = vec![
@@ -13507,8 +13536,8 @@ mod tests {
                 ("{quantile=\"1\"}".to_string(), 1.0),
             ]
         );
-        // Bad arguments: no quantile, too many quantiles, an invalid label
-        // name, and a scalar input.
+        // Bad arguments: no quantile, too many quantiles, and an invalid label
+        // name.
         assert!(parse_err("histogram_quantiles(\"q\", latency_bucket)")
             .contains("at least one quantile"));
         let too_many = format!(
@@ -13520,13 +13549,17 @@ mod tests {
             parse_err("histogram_quantiles(\"q x\", 0.5, latency_bucket)")
                 .contains("invalid label name")
         );
-        let error = eval_err(
-            synthetic("latency_bucket", &[(0, 1.0)]),
+        // An input with no usable `le` bound is skipped rather than refused, so
+        // the answer is simply empty (VM's `groupLeTimeseries`).
+        let empty = eval_series(
+            vec![synthetic("latency_bucket", &[(0, 1.0)])],
             "latency_bucket",
             "histogram_quantiles(\"q\", 0.5, latency_bucket)",
             0,
         );
-        assert!(error.contains("needs a `le` label"));
+        assert!(empty.vector.0.is_empty());
+        // A scalar input stays an error: VM's `args[len(args)-1]` must be a
+        // vector.
         let error = eval_err(
             synthetic("m", &[(0, 1.0)]),
             "m",
@@ -13612,18 +13645,47 @@ mod tests {
             assert!(!point.labels.contains_key("__name__"));
             assert!(!point.labels.contains_key("le"));
         }
-        // A series without `le` is an error naming the series, not silently
-        // dropped: a panel that passed `_sum`/`_count` would otherwise show
-        // an empty graph.
+        // A series without `le` is skipped, not an error: a panel that passed
+        // `_sum`/`_count` by mistake gets no series for that name (Prometheus
+        // also warns; this evaluator has no annotation channel).
         let mut mixed = vector.clone();
         mixed.0.push(Point {
             labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
             value: 0.0,
             sample_ts: None,
         });
-        let error = histogram_quantile(0.75, &mixed).unwrap_err();
-        assert!(error.message().contains("`le` label"));
-        assert!(error.message().contains("job=\"api\""));
+        let skipped = histogram_quantile(0.75, &mixed).expect("bad `le` is skipped");
+        assert_eq!(rendered(&skipped), rendered(&out));
+        // A `le` value that is not a number is skipped as well, and a NaN
+        // bound too (VM would keep the NaN one, but its sort position is
+        // unspecified upstream).
+        for bad_le in ["abc", " 1.5", "NaN", "le"] {
+            let mut broken = vector.clone();
+            broken.0.push(Point {
+                labels: BTreeMap::from([
+                    ("job".to_string(), "api".to_string()),
+                    ("le".to_string(), bad_le.to_string()),
+                ]),
+                value: 100.0,
+                sample_ts: None,
+            });
+            assert_eq!(
+                rendered(&histogram_quantile(0.75, &broken).expect("bad `le` is skipped")),
+                rendered(&out),
+                "`le={bad_le}` should be skipped"
+            );
+        }
+        // Nothing with a usable `le` means no output at all, not an error.
+        let mut nothing = Vector::default();
+        nothing.0.push(Point {
+            labels: BTreeMap::from([("job".to_string(), "api".to_string())]),
+            value: 0.0,
+            sample_ts: None,
+        });
+        assert!(histogram_quantile(0.75, &nothing)
+            .expect("no buckets is not an error")
+            .0
+            .is_empty());
     }
 
     #[test]

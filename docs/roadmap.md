@@ -419,13 +419,13 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `continue`）；
   - 权重总和为 0（只有 `+Inf` 桶，或各桶累计计数都是 0）时返回 NaN；方差用
     `E[x²] - E[x]²`，负数按 VM 的做法钳到 0，`histogram_stddev` 再开方；
-  - 分组与 `histogram_quantile` 一致（除 `le`/`__name__` 外的全部标签），缺 `le`
-    的序列按名字报错而不是静默丢弃；结果丢弃 `__name__` 与 `le`；
+  - 分组与 `histogram_quantile` 一致（除 `le`/`__name__` 外的全部标签），缺 `le` /
+    `le` 不可解析 / NaN 的序列被跳过而不是报错；结果丢弃 `__name__` 与 `le`；
   - VM 的 `convertBucketsToVMRange` 那套 `vmrange` 标签转换不在这里实现——本服务
     只产出经典 `le` 桶（这也是既有 `histogram_quantile` 的约定）；
   - 测试：2/4/6/8 累计计数下 avg=2.2/6、方差 `E[x²]-E[x]²` 与 stddev=√var、
     `+Inf` 单桶与全 0 计数都返回 NaN、计数不变的非零直方图只计第一个区间的权重
-    （5/5 → 0.05）、两组直方图分组互不影响、缺 `le` 报错并点名，
+    （5/5 → 0.05）、两组直方图分组互不影响、缺 `le` 的序列被跳过（不再报错），
     以及经求值器端到端丢掉 `__name__`/`le`、标量输入报错。
 - 已完成（2026-11-14）：MetricsQL 的 `histogram_share(le, v[, boundsLabel])`
   （`transform.go` 的 `transformHistogramShare` / `share` / `fixBrokenBuckets` /
@@ -442,14 +442,15 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - 第三个参数是 VM 的 `boundsLabel`：给了它，每个直方图产出**三条**序列——占比本身
     （保留原有的同名标签值）、`boundsLabel="lower"` 与 `boundsLabel="upper"` 两个
     插值边界。VM 不校验这个标签名（标签是任意字节串），这里同样不校验；
-  - 结果丢弃 `__name__` 与 `le`；缺 `le` 的序列按名字报错，与 `histogram_quantile` /
-    `histogram_fraction` 一致（VM 的 `groupLeTimeseries` 是静默跳过，这里沿用本仓库
-    的报错约定，宁可报错也不静默少一条）；
+  - 结果丢弃 `__name__` 与 `le`；缺 `le` / `le` 无法解析 / `le` 为 NaN 的序列
+    被**跳过**（Prometheus 的 `resetHistograms` 是 warning + `continue`，VM 的
+    `groupLeTimeseries` 直接 `continue`；本求值器没有 annotation 通道，只保留
+    「跳过」）；
   - 测试：1/2/3/4 累计计数下 2→0.5、3→0.625、6→0.75、0.5→0.125、10→0.75 与
     `+Inf`/负数/NaN 的硬编码分支、无 `+Inf` 桶时超出末桶才为 1；计数递减与 NaN 计数
     被钳平后为 1；同边界合并后 1 与 1.5 都是 1；`boundsLabel` 产出三条序列且
-    `lower`/`upper` 分别为 0.5/0.75、占比保留原标签值；缺 `le` 报错；经求值器
-    端到端丢名、两参数与三参数两种写法、标量输入报错。
+    `lower`/`upper` 分别为 0.5/0.75、占比保留原标签值；缺 `le` 的序列被跳过；
+    经求值器端到端丢名、两参数与三参数两种写法、标量输入报错。
 - 已完成（2026-11-14）：MetricsQL 的 `buckets_limit(limit, v)`
   （`transform.go` 的 `transformBucketsLimit`），把一条直方图的经典 `le` 桶
   thinning 到每幅最多 `limit` 个：
@@ -672,14 +673,15 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     相对差 < 1e-12 的浮点噪声**吸收**成相等（`relatively_equal`，即 `prometheus/common`
     的 `RelativelyEqual`），被修正的桶**不推进**参考计数，后续真实增长仍以上一个干净
     值为基准；超过容差的下降才强制钳平；
-  - 结果只保留分组标签（去掉 `le` 与 `__name__`）；每条序列都必须带可解析的 `le`，
-    否则按该序列的标签报 `bad_data`：面板漏写 `sum by (le)` 或误传 `_sum`/`_count`
-    时会看到原因，而不是一张空图。
+  - 结果只保留分组标签（去掉 `le` 与 `__name__`）；缺 `le` / `le` 不可解析 /
+    `le` 为 NaN 的序列被跳过（Prometheus 的 `resetHistograms` 是 warning +
+    `continue`，VM 的 `groupLeTimeseries` 直接 `continue`）。
   - 测试：`bucket_quantile` 的插值/`+Inf`/NaN 分支、重复边界、递减计数的钳平、
     相对噪声 <1e-12 的吸收（`relatively_equal` 及「不推进参考计数」行为）、
-    按标签分组与标签裁剪、缺 `le` 的报错；端到端（actix 路由 + 真实引擎）写入
+    按标签分组与标签裁剪、缺 `le` 的跳过（含 `abc` / `" 1.5"` / `NaN`）；
+    端到端（actix 路由 + 真实引擎）写入
     1/2/3/4 四个桶后断言 `histogram_quantile(0.5, http_latency_bucket)` 是单条
-    无标签的 `0.5`，缺 `le` 的 `histogram_quantile(0.5, http_requests)` 返回 400。
+    无标签的 `0.5`，而 `histogram_quantile(0.5, http_requests)` 成功返回空结果。
 - 已完成（2026-11-12）：PromQL 子查询 `expr[range:step]`（此前解析期直接拒绝）。
   语义照抄 Prometheus 的 `subqueryEvaluationTimes` / `runSubquery`：
   - step 栅格锚定在**绝对**的 step 整数倍上，起点是严格晚于 `at - offset - range`
@@ -805,14 +807,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   有意的差异：
   - 排序后**不做**单调性钳平（Prometheus 的 `BucketFraction` 没有
     `fixBadHistogramBuckets` 那步），递减计数按普通累计读；
-  - 缺/无法解析/NaN 的 `le` 直接 `bad_data` 报错，而非 Prometheus 的
-    `BadBucketLabel` warning 后跳过——本求值器没有 annotation 通道，报错才是
-    诚实的信号；
+  - 缺/无法解析/NaN 的 `le` **跳过该 series**（Prometheus 的 `resetHistograms`
+    在 `ParseFloat` 失败或 NaN 时记 `BadBucketLabel` warning 后 `continue`，
+    VM 的 `groupLeTimeseries` 直接 `continue`）；本求值器没有 annotation 通道，
+    所以只保留「跳过」这一半行为，不报错。唯一有意偏差是 VM 对 `le="NaN"`
+    会保留（`ParseFloat("NaN")` 成功），但 `NaN` 在 `sort.Slice` 里位置不确定，
+    这里统一跳过；
   - 特殊值：无桶/无 `+Inf` 桶/观测数为 0 返回 NaN，NaN 界返回 NaN，`lower >= upper`
     返回 0（相等与倒置都为 0）。
   - 测试：`bucket_fraction` 的插值/`+Inf`/NaN/`-Inf` 隐式下界/重复边界/递减/无桶，
-    按直方图分组与标签裁剪、缺 `le` 的报错，以及经求值器写出四个桶后断言
-    `histogram_fraction(0.5, 1, ...)`=0.25、`(-Inf, +Inf)`=1。
+    按直方图分组与标签裁剪、缺 `le` 的跳过（只有坏 `le` 时结果为空），以及经求值器
+    写出四个桶后断言 `histogram_fraction(0.5, 1, ...)`=0.25、`(-Inf, +Inf)`=1。
   - 顺带补上 PromQL 的 `Inf`/`NaN` 浮点字面量：此前 `-Inf` 会被词法分析当成
     名为 `Inf` 的指标（再与 `-` 组成一元负号），`histogram_fraction(-Inf, +Inf, ...)`
     因此悄悄算出 NaN。现在 `Inf`/`NaN`（大小写不敏感，`Infinity` 之类仍是标识符）
@@ -1390,8 +1395,8 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     且值为 1.0；越界与 NaN 分位数照样各出一条
     `-Inf`/`+Inf`/`NaN`，标签是**请求的分位数**（`"-0.5"`/`"1.5"`/`"NaN"`）而不是
     结果值；同名标签被覆盖；经求值器
-    端到端丢弃 `__name__`；缺 `le`、标量输入、零个分位数、11 个分位数、非法标签名
-    各自报错。
+    端到端丢弃 `__name__`；缺 `le` 的输入返回空结果，标量输入、零个分位数、
+    11 个分位数、非法标签名各自报错。
 
 
 - 剩余未实现的 Prometheus 函数（**明确不做**，理由记在这里）：

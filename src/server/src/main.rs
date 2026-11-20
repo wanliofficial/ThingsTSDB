@@ -1539,9 +1539,11 @@ mod tests {
         let value: f64 = result[0]["value"][1].as_str().unwrap().parse().unwrap();
         assert!((value - 0.5).abs() < 1e-9, "got {value}");
 
-        // A series without `le` is refused by name: that is what a panel that
-        // forgot `sum by (le)` (or passed `_sum`) would send.
-        let response = actix_web::test::call_service(
+        // A series without `le` is skipped, not refused: Prometheus and VM both
+        // `continue` past a non-bucket series, so a panel that forgot
+        // `sum by (le)` (or passed `_sum`) draws nothing rather than failing
+        // the whole query.
+        let body: Value = actix_web::test::call_and_read_body_json(
             &app,
             actix_web::test::TestRequest::get()
                 .uri(&format!(
@@ -1554,7 +1556,8 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], "success");
+        assert!(body["data"]["result"].as_array().unwrap().is_empty());
 
         // Label rewriting runs per step and only changes labels: the value and
         // `__name__` stay, and a fresh `instance` is derived from `job`.
