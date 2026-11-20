@@ -4159,17 +4159,31 @@ impl<'a> Evaluator<'a> {
                             true
                         }
                         LabelFilterOp::Case { upper, labels } => {
-                            // Go's `strings.ToUpper` / `ToLower` are Unicode
-                            // aware; Rust's `to_uppercase` / `to_lowercase`
-                            // agree on the mappings Golang applies.
+                            // VM applies Go's `strings.ToUpper` / `ToLower`,
+                            // which use the **simple** per-rune case mapping.
+                            // Rust's `to_uppercase` / `to_lowercase` are the
+                            // full mapping, so a few runes expand (`ß` -> `SS`)
+                            // where Go keeps one rune; `go_to_upper` /
+                            // `go_to_lower` reproduce Go's behaviour.
+                            //
+                            // VM's `transformLabelValueFunc` reads through
+                            // `getDstValue`, which treats a missing label as
+                            // the empty string, and then drops the tag when the
+                            // result is still empty. So a label that is present
+                            // but empty (`job=""`) is *removed*, and a missing
+                            // one stays missing.
                             for name in labels {
-                                if let Some(value) = point.labels.get_mut(name) {
-                                    let mapped = if *upper {
-                                        value.to_uppercase()
-                                    } else {
-                                        value.to_lowercase()
-                                    };
-                                    *value = mapped;
+                                let current =
+                                    point.labels.get(name).map(String::as_str).unwrap_or("");
+                                let mapped = if *upper {
+                                    go_to_upper(current)
+                                } else {
+                                    go_to_lower(current)
+                                };
+                                if mapped.is_empty() {
+                                    point.labels.remove(name);
+                                } else {
+                                    point.labels.insert(name.clone(), mapped);
                                 }
                             }
                             true
@@ -5165,6 +5179,172 @@ fn label_copy(labels: &mut LabelSet, pairs: &[(String, String)], remove_source: 
         }
     }
 }
+
+/// Go's `strings.ToUpper`: a **simple** per-rune case mapping, where every
+/// rune maps to exactly one rune (Unicode's `Simple_Uppercase_Mapping`).
+///
+/// Rust's `char::to_uppercase` implements the *full* mapping instead, so a few
+/// runes expand into several characters (`ß` -> `SS`, `ﬁ` -> `FI`, `ᾀ` ->
+/// `ἈΙ`). Where Go has no simple mapping it leaves those runes unchanged
+/// (`ToUpper("ß")` is still `"ß"`), or picks a single precomposed rune
+/// (`ᾀ` -> `ᾈ`). Only the runes that expand under the full mapping can
+/// disagree, so this consults `GO_UPPER_EXPANSIONS` for those and otherwise
+/// takes the single-rune full mapping, which matches Go. Remaining
+/// differences are Unicode-version drift (Rust's tables are newer), not a
+/// mapping-rule difference.
+fn go_to_upper(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            let mut full = c.to_uppercase();
+            let first = full.next().unwrap_or(c);
+            if full.next().is_some() {
+                if let Ok(index) =
+                    GO_UPPER_EXPANSIONS.binary_search_by_key(&(c as u32), |&(from, _)| from)
+                {
+                    return char::from_u32(GO_UPPER_EXPANSIONS[index].1).unwrap_or(c);
+                }
+                return c;
+            }
+            first
+        })
+        .collect()
+}
+
+/// Go's `strings.ToLower`, the simple-mapping counterpart of `go_to_upper`.
+/// Only `İ` (U+0130) expands under Rust's full mapping; Go's simple mapping
+/// gives plain `i` (U+0069).
+fn go_to_lower(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            let mut full = c.to_lowercase();
+            let first = full.next().unwrap_or(c);
+            if full.next().is_some() {
+                if let Ok(index) =
+                    GO_LOWER_EXPANSIONS.binary_search_by_key(&(c as u32), |&(from, _)| from)
+                {
+                    return char::from_u32(GO_LOWER_EXPANSIONS[index].1).unwrap_or(c);
+                }
+                return c;
+            }
+            first
+        })
+        .collect()
+}
+
+/// Runes whose Rust full uppercase mapping expands to more than one char, with
+/// Go's simple uppercase mapping (identity when Go has none). Sorted by source
+/// rune for `binary_search_by_key`.
+const GO_UPPER_EXPANSIONS: &[(u32, u32)] = &[
+    (0x00DF, 0x00DF),
+    (0x0149, 0x0149),
+    (0x01F0, 0x01F0),
+    (0x0390, 0x0390),
+    (0x03B0, 0x03B0),
+    (0x0587, 0x0587),
+    (0x1E96, 0x1E96),
+    (0x1E97, 0x1E97),
+    (0x1E98, 0x1E98),
+    (0x1E99, 0x1E99),
+    (0x1E9A, 0x1E9A),
+    (0x1F50, 0x1F50),
+    (0x1F52, 0x1F52),
+    (0x1F54, 0x1F54),
+    (0x1F56, 0x1F56),
+    (0x1F80, 0x1F88),
+    (0x1F81, 0x1F89),
+    (0x1F82, 0x1F8A),
+    (0x1F83, 0x1F8B),
+    (0x1F84, 0x1F8C),
+    (0x1F85, 0x1F8D),
+    (0x1F86, 0x1F8E),
+    (0x1F87, 0x1F8F),
+    (0x1F88, 0x1F88),
+    (0x1F89, 0x1F89),
+    (0x1F8A, 0x1F8A),
+    (0x1F8B, 0x1F8B),
+    (0x1F8C, 0x1F8C),
+    (0x1F8D, 0x1F8D),
+    (0x1F8E, 0x1F8E),
+    (0x1F8F, 0x1F8F),
+    (0x1F90, 0x1F98),
+    (0x1F91, 0x1F99),
+    (0x1F92, 0x1F9A),
+    (0x1F93, 0x1F9B),
+    (0x1F94, 0x1F9C),
+    (0x1F95, 0x1F9D),
+    (0x1F96, 0x1F9E),
+    (0x1F97, 0x1F9F),
+    (0x1F98, 0x1F98),
+    (0x1F99, 0x1F99),
+    (0x1F9A, 0x1F9A),
+    (0x1F9B, 0x1F9B),
+    (0x1F9C, 0x1F9C),
+    (0x1F9D, 0x1F9D),
+    (0x1F9E, 0x1F9E),
+    (0x1F9F, 0x1F9F),
+    (0x1FA0, 0x1FA8),
+    (0x1FA1, 0x1FA9),
+    (0x1FA2, 0x1FAA),
+    (0x1FA3, 0x1FAB),
+    (0x1FA4, 0x1FAC),
+    (0x1FA5, 0x1FAD),
+    (0x1FA6, 0x1FAE),
+    (0x1FA7, 0x1FAF),
+    (0x1FA8, 0x1FA8),
+    (0x1FA9, 0x1FA9),
+    (0x1FAA, 0x1FAA),
+    (0x1FAB, 0x1FAB),
+    (0x1FAC, 0x1FAC),
+    (0x1FAD, 0x1FAD),
+    (0x1FAE, 0x1FAE),
+    (0x1FAF, 0x1FAF),
+    (0x1FB2, 0x1FB2),
+    (0x1FB3, 0x1FBC),
+    (0x1FB4, 0x1FB4),
+    (0x1FB6, 0x1FB6),
+    (0x1FB7, 0x1FB7),
+    (0x1FBC, 0x1FBC),
+    (0x1FC2, 0x1FC2),
+    (0x1FC3, 0x1FCC),
+    (0x1FC4, 0x1FC4),
+    (0x1FC6, 0x1FC6),
+    (0x1FC7, 0x1FC7),
+    (0x1FCC, 0x1FCC),
+    (0x1FD2, 0x1FD2),
+    (0x1FD3, 0x1FD3),
+    (0x1FD6, 0x1FD6),
+    (0x1FD7, 0x1FD7),
+    (0x1FE2, 0x1FE2),
+    (0x1FE3, 0x1FE3),
+    (0x1FE4, 0x1FE4),
+    (0x1FE6, 0x1FE6),
+    (0x1FE7, 0x1FE7),
+    (0x1FF2, 0x1FF2),
+    (0x1FF3, 0x1FFC),
+    (0x1FF4, 0x1FF4),
+    (0x1FF6, 0x1FF6),
+    (0x1FF7, 0x1FF7),
+    (0x1FFC, 0x1FFC),
+    (0xFB00, 0xFB00),
+    (0xFB01, 0xFB01),
+    (0xFB02, 0xFB02),
+    (0xFB03, 0xFB03),
+    (0xFB04, 0xFB04),
+    (0xFB05, 0xFB05),
+    (0xFB06, 0xFB06),
+    (0xFB13, 0xFB13),
+    (0xFB14, 0xFB14),
+    (0xFB15, 0xFB15),
+    (0xFB16, 0xFB16),
+    (0xFB17, 0xFB17),
+    (0x1DF95, 0x1DF95),
+];
+
+/// Runes whose Rust full lowercase mapping expands to more than one char, with
+/// Go's simple lowercase mapping. Sorted by source rune.
+const GO_LOWER_EXPANSIONS: &[(u32, u32)] = &[(0x0130, 0x0069)];
 
 /// `drop_common_labels`: VM counts every label value across the merged series
 /// and removes a label name as soon as one of its values covers *all* of them
@@ -14083,6 +14263,62 @@ mod tests {
         assert!(value_of(numeric(), r#"label_value(http_requests, "zone")"#).is_nan());
         let gappy = synthetic_labeled("http_requests", &[("port", "9090")], &[(0, f64::NAN)]);
         assert!(value_of(gappy, r#"label_value(http_requests, "port")"#).is_nan());
+    }
+
+    /// VM's `label_uppercase` / `label_lowercase` call Go's
+    /// `strings.ToUpper` / `ToLower`, which use the **simple** per-rune case
+    /// mapping. Rust's `to_uppercase` / `to_lowercase` are the full mapping, so
+    /// `ß` would become `SS` where Go keeps `ß`, and `ﬁ` would become `FI`
+    /// where Go keeps `ﬁ`. Goldens from a Go run of `strings.ToUpper` /
+    /// `ToLower`; the two implementations must agree on the mapping *rule*
+    /// (Unicode version drift on newly added code points is out of scope).
+    #[test]
+    fn test_metricsql_label_case_uses_go_simple_mapping() {
+        assert_eq!(go_to_upper("straße"), "STRAßE");
+        assert_eq!(go_to_lower("STRASSE"), "strasse");
+        assert_eq!(go_to_upper("ﬁle"), "ﬁLE");
+        assert_eq!(go_to_upper("ᾀ"), "ᾈ");
+        assert_eq!(go_to_upper("ŉ"), "ŉ");
+        assert_eq!(go_to_upper("ǰ"), "ǰ");
+        assert_eq!(go_to_lower("İstanbul"), "istanbul");
+        // Ordinary text is unaffected, including non-Latin scripts.
+        assert_eq!(go_to_upper("hello world"), "HELLO WORLD");
+        assert_eq!(go_to_upper("привет"), "ПРИВЕТ");
+        assert_eq!(go_to_lower("ПРИВЕТ"), "привет");
+        assert_eq!(go_to_upper("ǅ"), "Ǆ");
+        assert_eq!(go_to_lower("Ǆ"), "ǆ");
+
+        // End to end: the label rewrite sees the same values.
+        let series =
+            || synthetic_labeled("m", &[("job", "straße"), ("zone", "İstanbul")], &[(0, 1.0)]);
+        let rendered = |query: &str| {
+            eval_synthetic(series(), "m", query, 0)
+                .into_iter()
+                .map(|(labels, _)| labels)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rendered(r#"label_uppercase(m, "job")"#),
+            vec!["{__name__=\"m\",job=\"STRAßE\",zone=\"İstanbul\"}".to_string()]
+        );
+        assert_eq!(
+            rendered(r#"label_lowercase(m, "zone")"#),
+            vec!["{__name__=\"m\",job=\"straße\",zone=\"istanbul\"}".to_string()]
+        );
+
+        // VM reads through `getDstValue`, so an empty label is the empty
+        // string, stays empty under `f`, and is then removed; a label that is
+        // missing altogether is never created.
+        let with_empty = || synthetic_labeled("m", &[("job", ""), ("zone", "EU")], &[(0, 1.0)]);
+        assert_eq!(
+            eval_synthetic(
+                with_empty(),
+                "m",
+                r#"label_uppercase(m, "job", "missing")"#,
+                0
+            ),
+            vec![("{__name__=\"m\",zone=\"EU\"}".to_string(), 1.0)]
+        );
     }
 
     #[test]

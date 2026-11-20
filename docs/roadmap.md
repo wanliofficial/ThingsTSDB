@@ -1214,6 +1214,36 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     五个样本值的全部日期分量，以及 `-500` / `-1500` / `-60001` / `0` ms 的
     无参数形式；两条修复分别回退后对应断言会失败（已逐条验证）。
   - `CivilDate.year` 保持 `i64`（前一轮为避免 `i32` 截断而放宽），与本次无关。
+- 已完成（2026-11-20）：`label_uppercase` / `label_lowercase` 改用 Go 的**简单大小写
+  映射**（simple case mapping），并修正空标签的处理。这是逐函数核对 MetricsQL 标签
+  变换时发现的两处真实差异：
+  - **Rust 的 `to_uppercase` / `to_lowercase` 是 full mapping，Go 的
+  `strings.ToUpper` / `ToLower` 是 simple mapping**。两者对绝大多数文字一致，但
+  full mapping 会把少数 rune 展开成多个字符，而 Go 只产出一个 rune：`ß` 在 Go 里
+  仍是 `ß`（`STRASSE` 是错的，应为 `STRAßE`）、连字 `ﬁ` 仍是 `ﬁ`（不是 `FI`）、
+  希腊 `ᾀ` 映射到单字符 `ᾈ`（不是 `ἈΙ`）、土耳其 `İ` 小写成 `i`（不是 `i̇`）。
+  实现新增 `go_to_upper` / `go_to_lower`：对「Rust full mapping 展开成多字符」的
+  rune（扫描全部码点，共 103 个 upper + 1 个 lower）查 `GO_UPPER_EXPANSIONS` /
+  `GO_LOWER_EXPANSIONS` 小表取 Go 的 simple 结果，其余直接取 Rust 单字符 full
+  mapping（与 Go 一致）。表的金值由 Go 1.26 的 `unicode.ToUpper` / `ToLower` 全码点
+  扫描生成。残余的 75 + 75 个差异全部是 **Unicode 版本漂移**（Rust 的 Unicode 表
+  更新，含 Go 尚未收录的新码点映射，如 U+A7CB、U+10D70、U+16EB0 等），属于双向
+  版本差异，不是映射规则差异；
+  - **空标签会被删除**。VM 的 `transformLabelValueFunc` 走 `getDstValue`：缺失标签
+  读成空串，应用 `f` 后仍空则 `RemoveTag`。所以 `job=""` 在
+  `label_uppercase(m, "job")` 之后**消失**，而缺失的标签保持缺失。旧实现用
+  `get_mut` 只改已存在的标签，会把 `job=""` 原样留下。
+  - 测试：新增 `test_metricsql_label_case_uses_go_simple_mapping`，金值取自 Go 的
+  `strings.ToUpper` / `ToLower`（`straße` / `ﬁle` / `ᾀ` / `ŉ` / `ǰ` / `İstanbul`
+  / `ǅ` / 俄文 / 全角），并覆盖端到端标签改写与「空标签删除、缺失标签不创建」。
+  - 同批核对确认一致的标签变换（无需改动）：`label_set`（空值删除、重复键后者胜）、
+  `label_del` / `label_keep`（`RemoveTagsIgnoring` / `RemoveTagsOn`，`__name__`
+  同普通标签）、`label_copy` / `label_move`（空源跳过且不删目标、`src == dst` 不删）、
+  `label_value`（丢 `__name__`、解析失败为 NaN、NaN 样本保持且全 NaN 系列不删）、
+  `alias`（= `label_set(q, "__name__", name)`）、`label_map`（Go map 后者胜、
+  缺失标签按空串查表可创建、映射到空串删除）、`label_transform`（非锚定
+  `replace_all`）、`label_match` / `label_mismatch`（`^(?:re)$` 锚定）、
+  `label_join`（无条件插分隔符、空结果删标签）、`drop_common_labels`。
 - 已完成（2026-11-19）：`topk` / `bottomk` 的 `k` 参数边界对齐 Prometheus。核对聚合时
   发现一个保真度缺口：上游 `aggregationK` 先 `k = min(int64(fParam),
   len(inputMatrix))`，再 `if k < 1 { return nil }`，所以 `topk(0, m)` /
