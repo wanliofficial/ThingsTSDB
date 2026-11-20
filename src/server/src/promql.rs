@@ -1734,6 +1734,10 @@ pub enum Expr {
         quantiles: Vec<Expr>,
         expr: Box<Expr>,
         grouping: Option<Grouping>,
+        /// MetricsQL's optional `limit N` suffix, capping the number of groups
+        /// before the quantiles are computed (VM treats `quantiles` as an
+        /// `AggrFuncExpr`, so it shares `aggrPrepareSeries`).
+        limit: Option<i64>,
     },
     /// `max_of(a, b)` / `min_of(a, b)` — two scalars, one scalar result
     /// (Prometheus' duration-expression helpers, also usable on plain
@@ -1756,6 +1760,9 @@ pub enum Expr {
     Histogram {
         expr: Box<Expr>,
         grouping: Option<Grouping>,
+        /// MetricsQL's optional `limit N` suffix. VM's `histogram` is an
+        /// `AggrFuncExpr`, so `limit` caps the group count before bucketing.
+        limit: Option<i64>,
     },
     /// `start()` / `end()` / `range()` / `step()` — the query's own time range
     /// and step, as seconds. Prometheus folds them into number literals before
@@ -2550,11 +2557,13 @@ impl Parser {
                     let grouping = self.grouping()?;
                     self.expect(Token::LParen)?;
                     let (label, quantiles, expr) = self.quantiles_arguments()?;
+                    let limit = self.aggregation_limit()?;
                     Ok(Expr::Quantiles {
                         label,
                         quantiles,
                         expr: Box::new(expr),
                         grouping,
+                        limit,
                     })
                 } else if name == "histogram" && matches!(self.peek(), Some(Token::Ident(_))) {
                     // The prefix form: `histogram by (job) (v)`.
@@ -2562,9 +2571,11 @@ impl Parser {
                     self.expect(Token::LParen)?;
                     let expr = self.expression(0)?;
                     self.expect(Token::RParen)?;
+                    let limit = self.aggregation_limit()?;
                     Ok(Expr::Histogram {
                         expr: Box::new(expr),
                         grouping,
+                        limit,
                     })
                 } else {
                     Ok(Expr::Selector {
@@ -3166,11 +3177,13 @@ impl Parser {
             "quantiles" => {
                 let (label, quantiles, expr) = self.quantiles_arguments()?;
                 let grouping = self.grouping()?;
+                let limit = self.aggregation_limit()?;
                 Ok(Expr::Quantiles {
                     label,
                     quantiles,
                     expr: Box::new(expr),
                     grouping,
+                    limit,
                 })
             }
             "scalar" => {
@@ -3287,9 +3300,11 @@ impl Parser {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
                 let grouping = self.grouping()?;
+                let limit = self.aggregation_limit()?;
                 Ok(Expr::Histogram {
                     expr: Box::new(expr),
                     grouping,
+                    limit,
                 })
             }
             "start" | "end" | "range" | "step" => {
@@ -3824,7 +3839,11 @@ impl<'a> Evaluator<'a> {
                 bad("a string literal is only valid as the label argument of count_values")
             }
             Expr::Time => Ok(Instant::scalar(at_ms as f64 / 1_000.0)),
-            Expr::Histogram { expr, grouping } => {
+            Expr::Histogram {
+                expr,
+                grouping,
+                limit,
+            } => {
                 let instant = self.eval(expr, at_ms)?;
                 let values = if let Some(scalar) = instant.scalar {
                     let mut vector = Vector::default();
@@ -3833,6 +3852,7 @@ impl<'a> Evaluator<'a> {
                 } else {
                     instant.vector
                 };
+                let values = limit_groups(values, grouping.as_ref(), *limit);
                 Ok(Instant {
                     vector: histogram_agg(&values, grouping.as_ref()),
                     scalar: None,
@@ -4155,6 +4175,7 @@ impl<'a> Evaluator<'a> {
                 quantiles,
                 expr,
                 grouping,
+                limit,
             } => {
                 let instant = self.eval(expr, at_ms)?;
                 let values = if let Some(scalar) = instant.scalar {
@@ -4170,6 +4191,7 @@ impl<'a> Evaluator<'a> {
                 for quantile in quantiles {
                     phis.push(self.scalar_of(quantile, at_ms)?);
                 }
+                let values = limit_groups(values, grouping.as_ref(), *limit);
                 Ok(Instant {
                     vector: quantiles_agg(&values, label, &phis, grouping.as_ref()),
                     scalar: None,
@@ -12100,9 +12122,45 @@ mod tests {
     }
 
     #[test]
+    fn test_metricsql_quantiles_limit_modifier() {
+        // `quantiles` is an AggrFuncExpr in VM, so `limit N` caps the number of
+        // groups before the quantiles are computed.
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("job", "web")], &[(0, 3.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        // All three groups without a limit.
+        assert_eq!(
+            run(r#"quantiles("q", 0.5, m) by (job)"#),
+            vec![
+                (r#"{job="api",q="0.5"}"#.to_string(), 1.0),
+                (r#"{job="db",q="0.5"}"#.to_string(), 2.0),
+                (r#"{job="web",q="0.5"}"#.to_string(), 3.0),
+            ]
+        );
+        // `limit 2` keeps the first two groups in input order.
+        assert_eq!(
+            run(r#"quantiles("q", 0.5, m) by (job) limit 2"#),
+            vec![
+                (r#"{job="api",q="0.5"}"#.to_string(), 1.0),
+                (r#"{job="db",q="0.5"}"#.to_string(), 2.0),
+            ]
+        );
+        // Prefix form: `quantiles by (job) ("q", 0.5, m) limit 1`.
+        assert_eq!(
+            run(r#"quantiles by (job) ("q", 0.5, m) limit 1"#),
+            vec![(r#"{job="api",q="0.5"}"#.to_string(), 1.0)]
+        );
+    }
+
+    #[test]
     fn test_metricsql_quantiles_parse_errors() {
         assert!(parse_err(r#"quantiles("q", m)"#).contains("at least one quantile"));
         assert!(parse_err(r#"quantiles(0.5, m)"#).contains("needs a quoted string"));
+        // The `limit` suffix follows the same strict-integer rule.
+        assert!(parse_err(r#"quantiles("q", 0.5, m) limit 2.5"#).contains("cannot parse limit"));
     }
 
     /// Reference values from a Go port of VM's `metrics.Histogram` +
@@ -12249,6 +12307,19 @@ mod tests {
         );
         // The suffix spelling puts the same histogram out.
         assert_eq!(run("histogram(m) by (job)"), run("histogram by (job) (m)"));
+        // `histogram` is an AggrFuncExpr in VM, so `limit N` caps the number of
+        // groups before bucketing: with `limit 1` only the first group (`api`)
+        // survives.
+        assert_eq!(
+            run("histogram(m) by (job) limit 1"),
+            vec![
+                ("{job=\"api\",le=\"+Inf\"}".to_string(), 2.0),
+                ("{job=\"api\",le=\"1.000e+00\"}".to_string(), 1.0),
+                ("{job=\"api\",le=\"1.896e+00\"}".to_string(), 1.0),
+                ("{job=\"api\",le=\"2.154e+00\"}".to_string(), 2.0),
+                ("{job=\"api\",le=\"8.799e-01\"}".to_string(), 0.0),
+            ]
+        );
         // A scalar is one unlabelled observation.
         let scalar = eval_series(Vec::new(), "m", "histogram(1)", 0);
         assert_eq!(

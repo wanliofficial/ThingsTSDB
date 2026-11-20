@@ -1238,12 +1238,20 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   - **适用聚合**：所有聚合（`sum` / `avg` / `count` / `min` / `max` / `stddev` /
     `stdvar` / `topk` / `bottomk` / `quantile` / `count_values` / `limitk` /
     `outliers_mad` / `outliersk` / `any` / `share` / `zscore` / `outliers_iqr`
-    等），统一在求值前按分组截断；
+    等），统一在求值前按分组截断；`quantiles` 与 `histogram` 在 VM 里同样是
+    `AggrFuncExpr`（`aggrFuncQuantiles` / `newAggrFunc(aggrFuncHistogram)` 都传给
+    `aggrFuncExt` 的是 `afa.ae.Limit`），所以也支持 `limit N`（前缀/后缀两种写法），
+    `limit` 在求分位数 / 分桶之前按分组生效；而 `histogram_quantiles` /
+    `histogram_fraction` / `histogram_share` / `histogram_stddev` /
+    `histogram_stdvar` 在 VM 里是 **transform**（`transform.go` 的 transform 表）
+    而非 `AggrFuncExpr`，不接受 `limit`；
   - 测试：`test_metricsql_aggregation_limit_modifier`（`limit 0/1/2/100`、
     `sum by (job)` 分组级限制、`count_values` 值级限制、`any` 的 `min(limit,1)` 怪癖、
-    `sum(m)` 无修饰符合并为单组）、`test_metricsql_aggregation_limit_parse_errors`
-    （`limit` / `limit abc` / `limit 2.5` / `limit -1.5` 均报 `cannot parse limit`）、
-    以及既有聚合解析测试补充 `limit` 语法断言。
+    `sum(m)` 无修饰符合并为单组）、`test_metricsql_quantiles_limit_modifier`
+    （`quantiles` 分组级限制、前缀/后缀写法）、`test_metricsql_histogram_aggregation`
+    追加 `limit 1` 断言、`test_metricsql_aggregation_limit_parse_errors` 与
+    `test_metricsql_quantiles_parse_errors`（非整数报错）、以及既有聚合解析测试
+    补充 `limit` 语法断言。
 - 已完成（2026-11-20）：`label_uppercase` / `label_lowercase` 改用 Go 的**简单大小写
   映射**（simple case mapping），并修正空标签的处理。这是逐函数核对 MetricsQL 标签
   变换时发现的两处真实差异：
