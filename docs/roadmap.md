@@ -1214,6 +1214,36 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     五个样本值的全部日期分量，以及 `-500` / `-1500` / `-60001` / `0` ms 的
     无参数形式；两条修复分别回退后对应断言会失败（已逐条验证）。
   - `CivilDate.year` 保持 `i64`（前一轮为避免 `i32` 截断而放宽），与本次无关。
+- 已完成（2026-11-20）：MetricsQL 聚合的 `limit N` 修饰符
+  （`app/vmselect/promql/parser.go` 的 `parseAggrFuncExpr` 尾部，
+  `app/vmselect/promql/aggr.go` 的 `aggrPrepareSeries`）：
+  - **语法**：聚合调用（含可选 `by` / `without` 修饰符）之后可跟 `limit <整数>`，
+    大小写不敏感（`sum(x) limit 10` / `sum by (job) (x) limit 10` / `SUM(x) LIMIT 3`），
+    前缀式与后缀式都支持。`limit` 后面必须是整数，非数字 / 缺失值 / 小数 / 科学计数法
+    一律报 `cannot parse limit ...: not an integer`，照抄 VM 的 `strconv.Atoi`
+    严格整数解析（拒绝 `2.5`、`abc`、`-1.5`）。**负数 limit 不可解析**：lexer 把 `-`
+    当二元运算符（`binary_op.go` 的 `binaryOps` 表，`scanBinaryOpPrefix` 只认数字 /
+    `.数字` 开头的数 token），所以 `limit -1` 走的是「`-` 之后缺操作数」路径，
+    `Atoi("-")` 失败——`limit -1` 是**解析错误**而非「不限制」，只有 `limit 0`
+    才关闭上限（已记入决策）；
+  - **语义**：`aggrPrepareSeries` 的 `maxSeries > 0` 守卫——在**聚合之前**限制
+    **分组数**（不是截断输出行）。保留输入顺序前 `limit` 个不同组键，已有组继续
+    追加成员；`limit <= 0` 视为不限制。VM 用 Go map 迭代，溢出时具体保留哪几组
+    在**上游本身不确定**（Go map 迭代顺序随机），本服务用确定性的输入顺序前 N 组，
+    与 VM 的「最多 N 组」语义一致（已记入决策）。NaN 样本不占组（VM 先跑
+    `removeEmptySeries`）。`count_values` 的分组键含 value label（VM 在
+    `aggrFuncCountValues` 里先改写 modifier 追加 `dstLabel`），故 `limit` 限制的是
+    「不同的 (分组 + 值) 组合」数；`any` 走 `aggrFuncExt(..., min(limit, 1), ...)`，
+    显式正 limit 会把结果压到**单个组**（上游怪癖，忠实复刻）；
+  - **适用聚合**：所有聚合（`sum` / `avg` / `count` / `min` / `max` / `stddev` /
+    `stdvar` / `topk` / `bottomk` / `quantile` / `count_values` / `limitk` /
+    `outliers_mad` / `outliersk` / `any` / `share` / `zscore` / `outliers_iqr`
+    等），统一在求值前按分组截断；
+  - 测试：`test_metricsql_aggregation_limit_modifier`（`limit 0/1/2/100`、
+    `sum by (job)` 分组级限制、`count_values` 值级限制、`any` 的 `min(limit,1)` 怪癖、
+    `sum(m)` 无修饰符合并为单组）、`test_metricsql_aggregation_limit_parse_errors`
+    （`limit` / `limit abc` / `limit 2.5` / `limit -1.5` 均报 `cannot parse limit`）、
+    以及既有聚合解析测试补充 `limit` 语法断言。
 - 已完成（2026-11-20）：`label_uppercase` / `label_lowercase` 改用 Go 的**简单大小写
   映射**（simple case mapping），并修正空标签的处理。这是逐函数核对 MetricsQL 标签
   变换时发现的两处真实差异：

@@ -1556,6 +1556,9 @@ pub enum Expr {
         expr: Box<Expr>,
         param: Option<Box<Expr>>,
         grouping: Option<Grouping>,
+        /// MetricsQL's optional `limit N` suffix (e.g. `sum(x) limit 10`),
+        /// which caps the number of output groups at evaluation time.
+        limit: Option<i64>,
     },
     /// A function over a range vector. `expr` is an `Expr::Range` or an
     /// `Expr::Subquery`; the range is carried by that node so `rate(a[5m])` and
@@ -2534,11 +2537,13 @@ impl Parser {
                     };
                     let expr = self.expression(0)?;
                     self.expect(Token::RParen)?;
+                    let limit = self.aggregation_limit()?;
                     Ok(Expr::Aggregation {
                         op,
                         expr: Box::new(expr),
                         param,
                         grouping: Some(grouping),
+                        limit,
                     })
                 } else if name == "quantiles" && matches!(self.peek(), Some(Token::Ident(_))) {
                     // The prefix form: `quantiles by (job) ("q", 0.5, v)`.
@@ -2610,6 +2615,38 @@ impl Parser {
         }
         let expr = args.pop().expect("checked above");
         Ok((label, args, expr))
+    }
+
+    /// Parses the optional `limit N` suffix of a MetricsQL aggregation, e.g.
+    /// `sum(x) limit 10`. Following `parseAggrFuncExpr` in `parser.go`, the
+    /// `limit` keyword is case-insensitive and must be followed immediately by
+    /// an integer literal (`strconv.Atoi` rejects floats and exponents). A
+    /// negative limit is **not** parseable there either: the lexer emits `-` as
+    /// a binary operator, so `Atoi("-")` fails — `limit -1` is a parse error,
+    /// not "no limit". Only `limit 0` disables the cap.
+    fn aggregation_limit(&mut self) -> Result<Option<i64>> {
+        let Some(Token::Ident(word)) = self.peek() else {
+            return Ok(None);
+        };
+        if !word.eq_ignore_ascii_case("limit") {
+            return Ok(None);
+        }
+        self.pos += 1;
+        match self.next() {
+            Some(Token::Number(value)) => {
+                if value.is_finite() && value.fract() == 0.0 && value <= i64::MAX as f64 {
+                    Ok(Some(value as i64))
+                } else {
+                    bad(format!("cannot parse limit {value}: not an integer"))
+                }
+            }
+            other => bad(format!(
+                "cannot parse limit {}: not an integer",
+                other
+                    .map(|t| t.describe())
+                    .unwrap_or_else(|| "end of query".to_string())
+            )),
+        }
     }
 
     /// Parses `by (a, b)` / `without (a)` if present.
@@ -2897,21 +2934,25 @@ impl Parser {
                 let expr = self.expression(0)?;
                 self.expect(Token::RParen)?;
                 let grouping = self.grouping()?;
+                let limit = self.aggregation_limit()?;
                 return Ok(Expr::Aggregation {
                     op,
                     expr: Box::new(expr),
                     param: Some(Box::new(param)),
                     grouping,
+                    limit,
                 });
             }
             let expr = self.expression(0)?;
             self.expect(Token::RParen)?;
             let grouping = self.grouping()?;
+            let limit = self.aggregation_limit()?;
             return Ok(Expr::Aggregation {
                 op,
                 expr: Box::new(expr),
                 param: None,
                 grouping,
+                limit,
             });
         }
         if let Some(func) = RangeFunc::parse(name) {
@@ -3863,7 +3904,15 @@ impl<'a> Evaluator<'a> {
                 expr,
                 param,
                 grouping,
-            } => self.aggregate(*op, expr, param.as_deref(), grouping.as_ref(), at_ms),
+                limit,
+            } => self.aggregate(
+                *op,
+                expr,
+                param.as_deref(),
+                grouping.as_ref(),
+                *limit,
+                at_ms,
+            ),
             Expr::RangeFunc {
                 func,
                 expr,
@@ -4802,6 +4851,7 @@ impl<'a> Evaluator<'a> {
         expr: &Expr,
         param: Option<&Expr>,
         grouping: Option<&Grouping>,
+        limit: Option<i64>,
         at_ms: i64,
     ) -> Result<Instant> {
         let instant = self.eval(expr, at_ms)?;
@@ -4819,7 +4869,7 @@ impl<'a> Evaluator<'a> {
                 return bad("count_values needs a quoted label name");
             };
             return Ok(Instant {
-                vector: count_values(&values, label, grouping),
+                vector: count_values(&values, label, grouping, limit),
                 scalar: None,
             });
         }
@@ -4828,6 +4878,7 @@ impl<'a> Evaluator<'a> {
                 Some(param) => self.scalar_of(param, at_ms)?,
                 None => return bad(format!("{} needs a parameter", op.name())),
             };
+            let values = limit_groups(values, grouping, limit);
             if op == AggOp::Quantile {
                 return Ok(Instant {
                     vector: quantile_agg(&values, param, grouping),
@@ -4875,12 +4926,20 @@ impl<'a> Evaluator<'a> {
             op,
             AggOp::Share | AggOp::ZScore | AggOp::Any | AggOp::OutliersIqr
         ) {
+            // `any` collapses to a single group, not to `limit` groups.
+            let limit = if op == AggOp::Any {
+                any_limit(limit)
+            } else {
+                limit
+            };
+            let values = limit_groups(values, grouping, limit);
             return Ok(Instant {
                 vector: vector_agg(op, &values, grouping),
                 scalar: None,
             });
         }
 
+        let values = limit_groups(values, grouping, limit);
         let mut groups: BTreeMap<Vec<(String, String)>, Vec<f64>> = BTreeMap::new();
         for point in &values.0 {
             groups
@@ -5429,6 +5488,53 @@ fn group_key(
     }
 }
 
+/// Applies MetricsQL's `limit N` aggregation suffix the way VM's
+/// `aggrPrepareSeries` does: it caps the number of **groups**, not the number
+/// of output series. Groups are taken in input order — the first `limit`
+/// distinct grouping keys survive and later keys are dropped entirely; members
+/// of an already-seen group are kept. `limit <= 0` (or `None`) means no cap,
+/// matching the Go side's `maxSeries > 0` guard.
+///
+/// VM iterates a Go map, so *which* groups survive is only guaranteed to be "at
+/// most `limit`". Picking the first ones in input order is the deterministic
+/// interpretation of that contract.
+///
+/// NaN samples do not open a group: VM runs `removeEmptySeries` before
+/// grouping, so a series with no value at this step is not a member of any
+/// group.
+fn limit_groups(mut vector: Vector, grouping: Option<&Grouping>, limit: Option<i64>) -> Vector {
+    let Some(limit) = limit.filter(|limit| *limit > 0) else {
+        return vector;
+    };
+    let limit = limit as usize;
+    vector.0.retain({
+        let mut seen: Vec<Vec<(String, String)>> = Vec::new();
+        move |point| {
+            if point.value.is_nan() {
+                return false;
+            }
+            let key = group_key(&point.labels, grouping);
+            if seen.contains(&key) {
+                return true;
+            }
+            if seen.len() >= limit {
+                return false;
+            }
+            seen.push(key);
+            true
+        }
+    });
+    vector
+}
+
+/// VM's `aggrFuncAny` calls `aggrFuncExt` with `min(ae.Limit, 1)`, so an
+/// explicit positive `limit` collapses the result to **one** group while
+/// `limit 0` stays unlimited. Faithfully reproduced (it is an upstream quirk,
+/// not a typo here).
+fn any_limit(limit: Option<i64>) -> Option<i64> {
+    limit.filter(|limit| *limit > 0).map(|_| 1)
+}
+
 fn aggregate_values(op: AggOp, values: &[f64]) -> f64 {
     if values.is_empty() {
         return f64::NAN;
@@ -5674,7 +5780,12 @@ fn quantiles_agg(
 /// - `by (...)` → the value label is appended to the `by` list;
 /// - `without (...)` → the value label is already part of the metric, so it
 ///   survives unless it was named in the `without` list.
-fn count_values(values: &Vector, label: &str, grouping: Option<&Grouping>) -> Vector {
+fn count_values(
+    values: &Vector,
+    label: &str,
+    grouping: Option<&Grouping>,
+    limit: Option<i64>,
+) -> Vector {
     let grouped = match grouping {
         Some(Grouping::Without(names)) => Grouping::Without(names.clone()),
         Some(Grouping::By(names)) => {
@@ -5684,12 +5795,27 @@ fn count_values(values: &Vector, label: &str, grouping: Option<&Grouping>) -> Ve
         }
         None => Grouping::By(vec![label.to_string()]),
     };
+    // VM edits the modifier (appending the value label to the grouping) before
+    // `aggrPrepareSeries`, so `limit` caps the number of distinct
+    // (grouping + value) combinations, not the number of output rows.
     let mut counts: BTreeMap<Vec<(String, String)>, usize> = BTreeMap::new();
     for point in &values.0 {
+        // `removeEmptySeries` runs first, so a NaN sample opens no group.
+        if point.value.is_nan() {
+            continue;
+        }
         let mut labels = point.labels.clone();
         labels.insert(label.to_string(), format_float_g(point.value));
+        let key = group_key(&labels, Some(&grouped));
+        // Keep only the first `limit` distinct groups in input order; members
+        // of an already-seen group still count.
+        if let Some(limit) = limit.filter(|limit| *limit > 0) {
+            if !counts.contains_key(&key) && counts.len() >= limit as usize {
+                continue;
+            }
+        }
         counts
-            .entry(group_key(&labels, Some(&grouped)))
+            .entry(key)
             .and_modify(|count| *count += 1)
             .or_insert(1);
     }
@@ -11760,6 +11886,97 @@ mod tests {
         assert!(run("limitk(0, m)").is_empty());
     }
 
+    #[test]
+    fn test_metricsql_aggregation_limit_modifier() {
+        // Three series with distinct `job` labels and values 1, 2, 3.
+        let series = vec![
+            synthetic_labeled("m", &[("job", "api")], &[(0, 1.0)]),
+            synthetic_labeled("m", &[("job", "db")], &[(0, 2.0)]),
+            synthetic_labeled("m", &[("job", "web")], &[(0, 3.0)]),
+        ];
+        let run = |query: &str| rendered(&eval_series(series.clone(), "m", query, 0).vector);
+        // No `limit` suffix keeps all three `by (job)` groups. `by` drops
+        // `__name__`, so the output carries only `job`.
+        assert_eq!(
+            run("sum by (job) (m)"),
+            vec![
+                (r#"{job="api"}"#.to_string(), 1.0),
+                (r#"{job="db"}"#.to_string(), 2.0),
+                (r#"{job="web"}"#.to_string(), 3.0),
+            ]
+        );
+        // `limit N` caps the number of *groups* (not output rows): the first
+        // two groups in input order survive. This is VM's `aggrPrepareSeries`
+        // guard.
+        assert_eq!(
+            run("sum by (job) (m) limit 2"),
+            vec![
+                (r#"{job="api"}"#.to_string(), 1.0),
+                (r#"{job="db"}"#.to_string(), 2.0),
+            ]
+        );
+        assert_eq!(
+            run("sum by (job) (m) limit 1"),
+            vec![(r#"{job="api"}"#.to_string(), 1.0)]
+        );
+        // Postfix form: `sum by (job) (m) limit 2` above already exercises it;
+        // the bare postfix form without a modifier collapses to one group, so
+        // `limit` is a no-op there.
+        assert_eq!(run("sum(m)"), vec![("{}".to_string(), 6.0)]);
+        assert_eq!(run("sum(m) limit 2"), vec![("{}".to_string(), 6.0)]);
+        // `limit 0` means "no restriction".
+        assert_eq!(
+            run("sum by (job) (m) limit 0"),
+            vec![
+                (r#"{job="api"}"#.to_string(), 1.0),
+                (r#"{job="db"}"#.to_string(), 2.0),
+                (r#"{job="web"}"#.to_string(), 3.0),
+            ]
+        );
+        // `limit` larger than the number of groups is a no-op.
+        assert_eq!(
+            run("sum by (job) (m) limit 100"),
+            vec![
+                (r#"{job="api"}"#.to_string(), 1.0),
+                (r#"{job="db"}"#.to_string(), 2.0),
+                (r#"{job="web"}"#.to_string(), 3.0),
+            ]
+        );
+        // Case-insensitive keyword.
+        assert!(matches!(
+            parse_ok("sum(m) LIMIT 2"),
+            Expr::Aggregation { limit: Some(2), .. }
+        ));
+        // `count_values` groups by the value label too, so `limit` caps the
+        // number of distinct values (VM edits the modifier before
+        // `aggrPrepareSeries`).
+        assert_eq!(
+            run(r#"count_values("v", m) limit 2"#),
+            vec![
+                (r#"{v="1"}"#.to_string(), 1.0),
+                (r#"{v="2"}"#.to_string(), 1.0),
+            ]
+        );
+        // `any` is special: VM calls `aggrFuncExt` with `min(limit, 1)`, so an
+        // explicit positive limit collapses the result to a *single* group.
+        assert_eq!(run("any by (job) (m)").len(), 3);
+        assert_eq!(run("any by (job) (m) limit 5").len(), 1);
+    }
+
+    #[test]
+    fn test_metricsql_aggregation_limit_parse_errors() {
+        // The `limit` keyword is case-insensitive (checked in the modifier
+        // test). A negative limit is not parseable: the lexer emits `-` as a
+        // binary operator, so `Atoi("-")` fails — only `limit 0` disables the
+        // cap.
+        assert!(parse_err("sum(m) limit").contains("cannot parse limit"));
+        assert!(parse_err("sum(m) limit abc").contains("cannot parse limit"));
+        assert!(parse_err("sum(m) limit 2.5").contains("cannot parse limit 2.5"));
+        // `-` lexes as a binary operator, so the offending token is `-`, not
+        // the full `-1.5`.
+        assert!(parse_err("sum(m) limit -1.5").contains("cannot parse limit"));
+    }
+
     /// The expected `limitk` answer: point labels in xxhash order.
     fn hash_sorted_prefix(series: &[SeriesSamples], limit: usize) -> Vec<(String, f64)> {
         let mut hashed: Vec<(u64, String, f64)> = series
@@ -13615,13 +13832,26 @@ mod tests {
             vec!["a:b".to_string()]
         );
         match parse_ok("sum by (a:b) (a)") {
-            Expr::Aggregation { grouping, .. } => {
+            Expr::Aggregation {
+                grouping, limit, ..
+            } => {
                 let Some(Grouping::By(labels)) = grouping else {
                     panic!("expected `by`");
                 };
                 assert_eq!(labels, vec!["a:b".to_string()]);
+                assert_eq!(limit, None);
             }
             other => panic!("sum by (a:b) parsed as {other:?}"),
+        }
+
+        // MetricsQL's `limit N` suffix parses on both prefix and postfix forms.
+        match parse_ok("sum(x) limit 10") {
+            Expr::Aggregation { limit, .. } => assert_eq!(limit, Some(10)),
+            other => panic!("sum(x) limit 10 parsed as {other:?}"),
+        }
+        match parse_ok("sum by (job) (x) limit 3") {
+            Expr::Aggregation { limit, .. } => assert_eq!(limit, Some(3)),
+            other => panic!("sum by (job) (x) limit 3 parsed as {other:?}"),
         }
 
         // Errors name the problem.
