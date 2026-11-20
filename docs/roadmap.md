@@ -1382,6 +1382,12 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `smooth_exponential` / `remove_resets`：都修正**整段序列**（跨 step 才有意义），
     逐 `Instant` 求值时每个 step 只有一个样本，会退化成恒等或空结果，与已明确不做的
     跨 step 变换同类。
+   - `topk_avg` / `topk_max` / `topk_min` / `topk_median` / `topk_last` /
+    `bottomk_avg` / `bottomk_max` / `bottomk_min` / `bottomk_median` /
+    `bottomk_last`：是 `getRangeTopKTimeseries` 家族的**整段序列**聚合——先对每个序列
+    在其时间窗 `ts.Values` 上算 `f(values)`（均值 / 极值 / 中位数 / 末值），再按该标量
+    取 top / bottom-k。与 `range_*` 同属跨 step 变换，逐 `Instant` 模型下每个 step 只有
+    一个样本，`f` 退化为该样本本身，无法忠实复刻，故一并归入「明确不做」。
   这些要么是 wall-clock / 外部库依赖，要么需要 VM 的整段序列求值模型，本服务的逐
   `Instant` 架构无法忠实支持。
 
