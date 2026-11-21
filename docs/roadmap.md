@@ -728,8 +728,11 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     不构成名字的 `$`（行尾 `$`、`${` 未闭合、空 `${}`）按字面复制；
   - `label_join(v, dst, separator, src...)`：把源标签按顺序用分隔符连接，缺失的源
     标签按空串参与（分隔符仍出现），结果为空同样删除目标标签；
-  - 目标标签名（以及 `label_join` 的源标签名）在解析期按
-    `[A-Za-z_][A-Za-z0-9_]*` 校验；pattern 也在解析期编译，非法正则、非字符串参数、
+  - 目标标签名（以及 `label_join` 的源标签名）在解析期按 Prometheus 现用的
+    `UTF8Validation` 校验——`cmd/prometheus/main.go` 的 `init()` 把
+    `model.NameValidationScheme` 设为 `model.UTF8Validation`，`IsValidLabelName`
+    此时只要求「非空且合法 UTF-8」，所以 `1bad`、`b c`、`a.b`、`指标` 都是合法名，
+    只有空串被拒绝（`label_names` 是 Rust `String`，UTF-8 由类型保证）；pattern 也在解析期编译，非法正则、非字符串参数、
     `label_join` 没有源标签都返回 `bad_data` 并点名；标量作第一参数在求值期报
     「expects an instant vector」；
   - 写 `__name__` 即重命名指标，其余情况保留 `__name__`；两个序列改写后标签相同时
@@ -875,8 +878,9 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     数字相等的块两个方向都返回 true），直接塞进 Rust 的排序比较器会让顺序依赖
     输入顺序甚至触发 panic。这里的实现两个方向都问一次，只在结论一致时采用，
     否则退回完整标签集比较，保证确定的全序；
-  - 标签参数必填且须是带引号、合法的标签名；缺失、未加引号、非法名称都在解析期
-    报错。只改变顺序，样本值与标签原样保留。
+  - 标签参数必填且须是带引号字符串；缺失或未加引号在解析期报错。名称本身不校验
+    ——Prometheus 的 `funcSortByLabel` 与 VM 的 `newTransformFuncSortByLabel`
+    都直接查表（`Metric.Get`），接受任意名字如 `a.b`。只改变顺序，样本值与标签原样保留。
   - 测试：用 `facette/natsort` README 的整份样例与它文档给出的排序结果逐项对照、
     `node1/node2/node10` 的自然序与倒序、多标签与平局下的确定性，以及三种解析期
     错误。
@@ -1396,7 +1400,9 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
   `go_format_g`（不补 `.0`），`{:e}` 在 Rust 里给出与 Go 相同的最短数字与指数，
   所以只需按 Go 的规则摆放小数点。
   - 分位数标签是 `labels.Builder.Set` 语义：分组里已有同名标签时**覆盖**；
-    标签名按本仓库既有约定校验（`count_values`/`label_replace` 同样在解析期校验）。
+    标签名不做校验——Prometheus 的 `histogram_quantiles` 是 VM 专有（Prometheus 侧
+    用 `getOrCreateLblsWithQuantile` 同样不校验），本实现对齐 VM，任何非空字符串都
+    直接作为标签名；
   - 参数个数照 Prometheus 的 `ArgTypes`/`Variadic` 折算：至少 1 个、最多 10 个
     分位数（`na = 4-1 = 3`，`na + Variadic(9) = 12` 个参数）。
   - 越界分位数（`q<0`/`q>1`/NaN）**不是错误**：Prometheus 只发 warning，照样输出

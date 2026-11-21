@@ -85,7 +85,10 @@
 //! evaluation. `label_replace` anchors its pattern the way Prometheus does
 //! (`^(?s:...)$`) and expands `$1` / `${name}` / `$$` exactly like Go's
 //! `ExpandString`; a series whose source value does not match passes through
-//! unchanged, and an empty result deletes the destination label.
+//! unchanged, and an empty result deletes the destination label. Their label
+//! names are checked with `UTF8Validation.IsValidLabelName`, which (since the
+//! server switched to `model.UTF8Validation` by default) only rejects the empty
+//! string, so `1bad` and `指标` are legal names here.
 //!
 //! `absent(v)` answers `1` labelled with `v`'s equality matchers when `v` is
 //! empty, exactly as Prometheus' `createLabelsForAbsentFunction` builds them:
@@ -192,24 +195,21 @@ impl PartialEq for Pattern {
     }
 }
 
-/// `[A-Za-z_][A-Za-z0-9_]*`, the label names Prometheus accepts for the
-/// labels `label_replace` / `label_join` write.
+/// Rejects the one label name both upstreams refuse: the empty string.
+///
+/// Prometheus used to require `[A-Za-z_][A-Za-z0-9_]*`, but since PR #20169
+/// the server sets `model.NameValidationScheme = model.UTF8Validation`
+/// (`cmd/prometheus/main.go`'s `init()`), where `IsValidLabelName` is exactly
+/// "non-empty and valid UTF-8". Rust `String`s are UTF-8 by construction, so
+/// only emptiness is left to check. VictoriaMetrics does not validate at all,
+/// which is why the VM-only call sites below skip this helper entirely.
 fn validate_label_name(name: &str, function: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let valid = match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        bad(format!(
-            "invalid label name {name:?} in {function}: label names are \
-             [A-Za-z_][A-Za-z0-9_]*"
-        ))
+    if !name.is_empty() {
+        return Ok(());
     }
+    bad(format!(
+        "invalid label name {name:?} in {function}: label names must not be empty"
+    ))
 }
 
 /// Go's `regexp.ExpandString`: `$1` and `${name}` insert a capture, `$$` is a
@@ -3092,8 +3092,11 @@ impl Parser {
                 // VM's signature is histogram_quantiles("phiLabel", phi1, ...,
                 // phiN, buckets): the label is the first argument, the buckets
                 // series the last, and the quantiles fill the middle.
+                // `transformHistogramQuantiles` reads the label with
+                // `getString` and writes it with `AddTag`, so it validates
+                // nothing — a name like `a.b` is a perfectly good tag key in
+                // VM.
                 let label = self.string_argument(name)?;
-                validate_label_name(&label, name)?;
                 self.expect(Token::Comma)?;
                 // Read the remaining comma-separated expressions; the last is
                 // the buckets series, everything before it a quantile.
@@ -3227,9 +3230,10 @@ impl Parser {
                 let expr = self.expression(0)?;
                 let mut labels = Vec::new();
                 while self.eat(&Token::Comma) {
-                    let label = self.string_argument(name)?;
-                    validate_label_name(&label, name)?;
-                    labels.push(label);
+                    // Prometheus' `funcSortByLabel` takes the label names as
+                    // written and only looks them up; it validates nothing, so
+                    // a name like `a.b` sorts on whatever tag has that key.
+                    labels.push(self.string_argument(name)?);
                 }
                 self.expect(Token::RParen)?;
                 if labels.is_empty() {
@@ -9421,10 +9425,20 @@ mod tests {
                 .map(|point| point.value)
                 .collect();
         assert_eq!(values, vec![3.0, 2.0, 1.0]);
-        // The label argument is required and must be a valid name.
+        // The label argument is required. Neither Prometheus' `funcSortByLabel`
+        // nor VM's `newTransformFuncSortByLabel` validates the name — both just
+        // look it up — so `1x` and `a.b` parse fine.
         assert!(parse_err("sort_by_label(m)").contains("at least one label name"));
         assert!(parse_err("sort_by_label(m, instance)").contains("quoted string"));
-        assert!(parse_err("sort_by_label(m, \"1x\")").contains("invalid label name"));
+        for label in ["1x", "a.b", "指标"] {
+            assert!(
+                matches!(
+                    parse_ok(&format!(r#"sort_by_label(m, "{label}")"#)),
+                    Expr::SortByLabel { .. }
+                ),
+                "{label} should be accepted"
+            );
+        }
     }
 
     #[test]
@@ -11696,9 +11710,15 @@ mod tests {
                 ("{v=\"2\"}".to_string(), 1.0)
             ]
         );
-        // The value label must be a quoted string and a valid label name.
+        // The value label must be a quoted string. Prometheus checks it with
+        // `UTF8Validation.IsValidLabelName`, which only rejects an empty name;
+        // `1v` is therefore legal (it is a fine tag key at the storage layer).
         assert!(parse_err("count_values(v, m)").contains("quoted string"));
-        assert!(parse_err("count_values(\"1v\", m)").contains("invalid label name"));
+        assert!(parse_err("count_values(\"\", m)").contains("invalid label name"));
+        assert!(matches!(
+            parse_ok("count_values(\"1v\", m)"),
+            Expr::Aggregation { .. }
+        ));
         // A string literal is not an expression on its own.
         assert!(parse_err("\"v\"").contains("expected a metric name"));
     }
@@ -13551,8 +13571,9 @@ mod tests {
                 ("{quantile=\"1\"}".to_string(), 1.0),
             ]
         );
-        // Bad arguments: no quantile, too many quantiles, and an invalid label
-        // name.
+        // Bad arguments: no quantile and too many quantiles. The label name is
+        // not validated, matching VM's `transformHistogramQuantiles` (it just
+        // writes the tag), so `"q x"` and `"a.b"` are accepted.
         assert!(parse_err("histogram_quantiles(\"q\", latency_bucket)")
             .contains("at least one quantile"));
         let too_many = format!(
@@ -13560,10 +13581,17 @@ mod tests {
             "0.5, ".repeat(10) + "0.5"
         );
         assert!(parse_err(&too_many).contains("at most ten quantiles"));
-        assert!(
-            parse_err("histogram_quantiles(\"q x\", 0.5, latency_bucket)")
-                .contains("invalid label name")
-        );
+        for label in ["q x", "a.b"] {
+            assert!(
+                matches!(
+                    parse_ok(&format!(
+                        r#"histogram_quantiles("{label}", 0.5, latency_bucket)"#
+                    )),
+                    Expr::HistogramQuantiles { .. }
+                ),
+                "{label} should be accepted"
+            );
+        }
         // An input with no usable `le` bound is skipped rather than refused, so
         // the answer is simply empty (VM's `groupLeTimeseries`).
         let empty = eval_series(
@@ -15160,12 +15188,26 @@ mod tests {
         // function that carried it.
         assert!(parse_err(r#"label_replace(m, "a", "$1", "b", "(")"#)
             .contains("invalid regular expression in label_replace"));
-        // Label names are validated where Prometheus validates them: the
-        // destination of both functions and the sources of `label_join`.
-        assert!(parse_err(r#"label_replace(m, "1bad", "", "b", ".*")"#)
-            .contains("invalid label name \"1bad\" in label_replace"));
-        assert!(parse_err(r#"label_join(m, "a", "-", "b c")"#)
-            .contains("invalid label name \"b c\" in label_join"));
+        // Label names are checked where upstream checks them: the destination
+        // of both functions and the sources of `label_join`. Prometheus'
+        // current `UTF8Validation` rejects only an empty name (Rust strings are
+        // always valid UTF-8), so `1bad` and `b c` are accepted; an empty one
+        // is not.
+        assert!(parse_err(r#"label_replace(m, "", "", "b", ".*")"#)
+            .contains("invalid label name \"\" in label_replace"));
+        assert!(parse_err(r#"label_join(m, "a", "-", "")"#)
+            .contains("invalid label name \"\" in label_join"));
+        // Any non-empty name is a legal label name now, including ones the old
+        // `[A-Za-z_][A-Za-z0-9_]*` rule refused.
+        for dst in ["1bad", "b c", "a.b", "指标"] {
+            assert!(
+                matches!(
+                    parse_ok(&format!(r#"label_replace(m, "{dst}", "", "b", ".*")"#)),
+                    Expr::LabelReplace { .. }
+                ),
+                "{dst} should be a valid label name"
+            );
+        }
         // Non-string arguments and missing labels are refused with a message
         // about the shape of the call.
         assert!(parse_err(r#"label_replace(m, 5, "", "b", ".*")"#).contains("quoted string"));
