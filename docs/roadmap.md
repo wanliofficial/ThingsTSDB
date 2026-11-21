@@ -325,7 +325,15 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     拟合斜率而非取端点差；原点也必须与上游相同，否则最后采样点不在求值时刻时结果
     会整体偏移）；
   - `default(v, x)`——结果为空时补一条无标签的 `x`，已有样本中的 `NaN` 也换成 `x`
-    （MetricsQL 把 NaN 当缺失值）。
+    （MetricsQL 把 NaN 当缺失值）。这是本项目有意扩展的函数形式（MetricsQL 的
+    `default` 只是二元运算符 `a default b`，无函数形式）；两处语义细节：
+    - 标量分支同样做 NaN 替换——`default(NaN, x)` 即 `NaN default x`，VM 的
+      `binaryop.Default` 返回 `x`；
+    - 空向量补一条无标签 `x` 是**有意偏离 VM**：VM 的 `execBinaryOp` 在
+      `len(tssFirst) == 0 && op != "or"` 时快速返回空（`default` 不在例外内），
+      所以 VM 的 `空向量 default 标量` 返回空，本实现返回单条无标签 `x`（这是
+      `default` 在本服务的主要用途，端到端测试 `default(不存在的指标, 7)`=7
+      依赖它）。
   - `*_over_time` 家族（2026-11-13 补齐）：`range_over_time`（max-min）、
     `median_over_time`（VM 的 `quantile(0.5, …)`，先丢 NaN 再排序，因此与
     Prometheus 的 `quantile_over_time(0.5, …)` 在含 NaN 时结果不同）、

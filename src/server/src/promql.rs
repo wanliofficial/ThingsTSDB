@@ -5175,7 +5175,11 @@ impl<'a> Evaluator<'a> {
                 };
                 let mut vector = Vector::default();
                 if let Some(scalar) = instant.scalar {
-                    vector.push(BTreeMap::new(), scalar);
+                    // The scalar branch must apply the same NaN replacement as
+                    // the vector one: `default(NaN, x)` is `NaN default x`,
+                    // which VM answers with `x` (`binaryop.Default`).
+                    let value = if scalar.is_nan() { fallback } else { scalar };
+                    vector.push(BTreeMap::new(), value);
                 } else {
                     for point in &instant.vector.0 {
                         // Prometheus treats NaN as missing here too, so an
@@ -11542,6 +11546,32 @@ mod tests {
                 ("{job=\"api\"}".to_string(), 2.0),
                 ("{job=\"db\"}".to_string(), 10.0)
             ]
+        );
+    }
+
+    #[test]
+    fn test_default_fills_missing_and_nan() {
+        // `default(v, x)` is the function form of MetricsQL's `a default b`:
+        // a NaN sample (or an absent one) is replaced by `x`. This project
+        // additionally fills an empty result with a single label-less `x`,
+        // which VM's `default` binary op does not do (see the roadmap note).
+        let present = synthetic_labeled("m", &[("job", "api")], &[(0, 5.0)]);
+        assert_eq!(
+            eval_synthetic(present, "m", "default(m, 9)", 0),
+            vec![("{__name__=\"m\",job=\"api\"}".to_string(), 5.0)]
+        );
+        // A NaN sample is replaced by the fallback. Here `m` is a vector, so
+        // the sample keeps its labels (including the metric name).
+        let nan = synthetic("m", &[(0, f64::NAN)]);
+        assert_eq!(
+            eval_synthetic(nan.clone(), "m", "default(m, 9)", 0),
+            vec![("{__name__=\"m\"}".to_string(), 9.0)]
+        );
+        // `default(NaN, x)` is `NaN default x`, which VM answers with `x`. The
+        // left side is a scalar, so the result is one label-less sample.
+        assert_eq!(
+            eval_synthetic(nan, "m", "default(NaN, 5)", 0),
+            vec![("{}".to_string(), 5.0)]
         );
     }
 
