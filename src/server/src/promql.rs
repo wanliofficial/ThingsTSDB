@@ -4116,6 +4116,18 @@ impl<'a> Evaluator<'a> {
                         "histogram_fraction needs an instant vector of `le` buckets, not a scalar",
                     );
                 }
+                // VM rejects an inverted or degenerate range outright, before
+                // it ever looks at the buckets: `transformHistogramFraction`
+                // returns "lower le cannot be greater than upper le" when
+                // `lowerles[0] >= upperles[0]` (the two bounds are scalars
+                // here, so it is a single upfront comparison). Equal bounds
+                // are rejected too, matching VM's `>=`.
+                if lower >= upper {
+                    return bad(format!(
+                        "lower le cannot be greater than upper le; got lower le: {lower}, \
+                         upper le: {upper}"
+                    ));
+                }
                 Ok(Instant {
                     vector: histogram_fraction(lower, upper, &instant.vector)?,
                     scalar: None,
@@ -7967,7 +7979,8 @@ fn bucket_quantile(quantile: f64, buckets: &mut [(f64, f64)]) -> f64 {
 /// monotonicity clamp: Prometheus' `BucketFraction` does not force it either.
 /// Special cases, kept as Prometheus has them: no buckets, no `+Inf` bucket or
 /// zero observations answer NaN; a NaN bound answers NaN; `lower >= upper`
-/// answers 0.
+/// answers 0 (the `histogram_fraction` function rejects that range before
+/// reaching here, so the guard only covers direct callers).
 ///
 /// `lower` is exclusive for positive values and inclusive for negative ones,
 /// `upper` the other way round — that follows from interpolating only when a
@@ -7992,6 +8005,9 @@ fn bucket_fraction(lower: f64, upper: f64, buckets: &mut [(f64, f64)]) -> f64 {
     if observations == 0.0 || lower.is_nan() || upper.is_nan() {
         return f64::NAN;
     }
+    // Degenerate ranges answer 0, matching Prometheus' `BucketFraction`. The
+    // `histogram_fraction` function rejects `lower >= upper` before calling
+    // here (see the evaluator), so this branch only guards direct callers.
     if lower >= upper {
         return 0.0;
     }
@@ -12805,6 +12821,24 @@ mod tests {
             0,
         );
         assert_eq!(rendered(&instant.vector), vec![("{}".to_string(), 1.0)]);
+        // VM rejects an inverted or degenerate range before it looks at the
+        // buckets, so the same call is a parse/eval error here, not 0.
+        let one = synthetic_labeled("latency_bucket", &[("le", "0.5")], &[(0, 4.0)]);
+        assert!(eval_err(
+            one.clone(),
+            "latency_bucket",
+            "histogram_fraction(1, 0.5, latency_bucket)",
+            0
+        )
+        .contains("lower le cannot be greater than upper le"));
+        // Equal bounds are rejected too: VM uses `>=`, not `>`.
+        assert!(eval_err(
+            one,
+            "latency_bucket",
+            "histogram_fraction(0.5, 0.5, latency_bucket)",
+            0
+        )
+        .contains("lower le cannot be greater than upper le"));
     }
 
     #[test]

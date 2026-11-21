@@ -830,11 +830,17 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     所以只保留「跳过」这一半行为，不报错。唯一有意偏差是 VM 对 `le="NaN"`
     会保留（`ParseFloat("NaN")` 成功），但 `NaN` 在 `sort.Slice` 里位置不确定，
     这里统一跳过；
-  - 特殊值：无桶/无 `+Inf` 桶/观测数为 0 返回 NaN，NaN 界返回 NaN，`lower >= upper`
-    返回 0（相等与倒置都为 0）。
+  - 特殊值：无桶/无 `+Inf` 桶/观测数为 0 返回 NaN，NaN 界返回 NaN。`lower >= upper`
+    （相等与倒置）**报错**：`histogram_fraction` 是 VM 专有函数，VM 的
+    `transformHistogramFraction` 在 `lowerles[0] >= upperles[0]` 时直接返回
+    `lower le cannot be greater than upper le`（`bucket_fraction` 的数值内核
+    照抄 Prometheus 的 `BucketFraction`——后者对 `lower >= upper` 返回 0——
+    但函数整体的前置校验按 VM，相等也拒）。
   - 测试：`bucket_fraction` 的插值/`+Inf`/NaN/`-Inf` 隐式下界/重复边界/递减/无桶，
-    按直方图分组与标签裁剪、缺 `le` 的跳过（只有坏 `le` 时结果为空），以及经求值器
-    写出四个桶后断言 `histogram_fraction(0.5, 1, ...)`=0.25、`(-Inf, +Inf)`=1。
+    按直方图分组与标签裁剪、缺 `le` 的跳过（只有坏 `le` 时结果为空），经求值器
+    写出四个桶后断言 `histogram_fraction(0.5, 1, ...)`=0.25、`(-Inf, +Inf)`=1，
+    以及倒置/相等区间（`1,0.5` 与 `0.5,0.5`）报 `lower le cannot be greater
+    than upper le`。
   - 顺带补上 PromQL 的 `Inf`/`NaN` 浮点字面量：此前 `-Inf` 会被词法分析当成
     名为 `Inf` 的指标（再与 `-` 组成一元负号），`histogram_fraction(-Inf, +Inf, ...)`
     因此悄悄算出 NaN。现在 `Inf`/`NaN`（大小写不敏感，`Infinity` 之类仍是标识符）
