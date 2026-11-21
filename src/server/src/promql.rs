@@ -12567,6 +12567,39 @@ mod tests {
         assert_eq!(run(RangeFunc::Delta, &[(0, 1.0)], minute), None);
     }
 
+    #[test]
+    fn test_range_window_is_lower_open_upper_closed() {
+        // Prometheus selects samples in `(Ts - Range, Ts]`: the lower bound is
+        // exclusive (matrixIterSlice keeps buffer points with `t > mint`), the
+        // upper bound is inclusive (the sought sample at `t == maxt` is added
+        // after the buffer loop). At `at = 60s` with a 60s range the window is
+        // `(0, 60000]`: a sample at exactly 0 is dropped, one at 60000 is kept.
+        // `count_over_time` reports how many samples survive the window.
+        let count = |samples: &[(i64, f64)], at: i64| -> Option<f64> {
+            eval_synthetic(synthetic("m", samples), "m", "count_over_time(m[60s])", at)
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+        };
+        // Three interior samples all count.
+        assert_eq!(
+            count(&[(10_000, 1.0), (30_000, 1.0), (50_000, 1.0)], 60_000),
+            Some(3.0)
+        );
+        // A sample exactly at the lower bound (Ts - Range = 0) is excluded;
+        // the one at 60000 (Ts) is included, so two survive.
+        assert_eq!(
+            count(&[(0, 1.0), (30_000, 1.0), (60_000, 1.0)], 60_000),
+            Some(2.0)
+        );
+        // With only the lower-bound sample present, the series is dropped
+        // entirely (no in-window sample), so nothing is emitted — matching
+        // Prometheus, whose matrix simply lacks the series.
+        assert_eq!(count(&[(0, 1.0)], 60_000), None);
+        // A sample exactly at the upper bound (Ts = 60s) is included.
+        assert_eq!(count(&[(60_000, 1.0)], 60_000), Some(1.0));
+    }
+
     /// `min_over_time` / `max_over_time` seed with the first sample and also
     /// restart when the running extreme is NaN (`(cur > max) || IsNaN(max)`).
     /// The old `fold(INFINITY, f64::min)` answered `+Inf` for an all-NaN

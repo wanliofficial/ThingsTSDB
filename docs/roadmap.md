@@ -231,6 +231,11 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     `*_over_time`（`avg/min/max/sum/count/last/stddev/stdvar/quantile`）。
     `rate`/`increase` 按 Prometheus 规则处理计数器回绕（下降视为归零后继续累加），
     单位是「每秒」；`deriv` 是最小二乘斜率（每秒），只有 1 个样本时该序列不出现；
+    采样窗口是**左开右闭** `(Ts - Range, Ts]`——`Ts - Range` 处（恰在下界）的样本
+    被排除，`Ts` 处（恰在上界）的样本被包含（对齐 Prometheus `matrixIterSlice`：
+    缓冲样本取 `t > mint`，被 seek 到 `maxt` 的样本在缓冲循环后单独补入）。窗口内
+    无样本时该序列整个不出现在结果里（不是输出 0）；`count_over_time(m[60s])`
+    经端到端用例固定这一边界。
   - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp/clamp_min/
     clamp_max/timestamp/scalar`，三角函数与双曲函数
     `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/deg/rad`，
