@@ -236,6 +236,12 @@ TSID 分配 + IndexDB（mergeset LSM）── 标签过滤（Eq/Neq/Regex）→ 
     缓冲样本取 `t > mint`，被 seek 到 `maxt` 的样本在缓冲循环后单独补入）。窗口内
     无样本时该序列整个不出现在结果里（不是输出 0）；`count_over_time(m[60s])`
     经端到端用例固定这一边界。
+  - `irate`/`idelta` 只看窗口里**最后两个样本**（Prometheus 的 `instantValue`）：
+    `irate` 在 `last < previous`（严格小于，即计数器回绕）时返回后者自身除以
+    间隔，否则返回 `last - previous`；`idelta` 是原始差。比较方向对 NaN 敏感
+    ——`last < previous` 对 NaN 恒为假，所以任一侧是 NaN 时走减法分支、结果
+    为 NaN（曾误写成 `last >= previous` 会把 NaN 误判成回绕、返回 `last`，
+    已修正）。两样本时间戳相同时（间隔 0）该序列被丢弃。
   - **即时函数**：`abs/ceil/floor/sqrt/exp/ln/log2/log10/sgn/round/clamp/clamp_min/
     clamp_max/timestamp/scalar`，三角函数与双曲函数
     `sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/asinh/acosh/atanh/deg/rad`，

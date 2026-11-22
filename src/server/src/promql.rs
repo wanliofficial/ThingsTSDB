@@ -6403,13 +6403,22 @@ fn apply_range_func_in(
                 return None;
             }
             let previous = &samples[samples.len() - 2];
-            let delta = if last.value >= previous.value {
-                last.value - previous.value
-            } else {
+            // Prometheus' `instantValue`: a counter reset (`last < previous`,
+            // strictly) answers the later sample's value itself; every other
+            // case answers `last - previous`. The direction of the comparison
+            // matters for NaN: `NaN < x` and `x < NaN` are both false, so with
+            // a NaN on either side Prometheus takes the subtraction branch and
+            // the rate is NaN. Testing `last >= previous` instead would read
+            // that NaN case as a reset and wrongly return `last`.
+            let delta = if last.value < previous.value {
                 last.value
+            } else {
+                last.value - previous.value
             };
             let span_ms = last.timestamp - previous.timestamp;
-            if span_ms <= 0 {
+            // Prometheus drops the series only when the two samples share a
+            // timestamp (`sampledInterval == 0`).
+            if span_ms == 0 {
                 return None;
             }
             Some(delta * 1_000.0 / span_ms as f64)
@@ -12598,6 +12607,41 @@ mod tests {
         assert_eq!(count(&[(0, 1.0)], 60_000), None);
         // A sample exactly at the upper bound (Ts = 60s) is included.
         assert_eq!(count(&[(60_000, 1.0)], 60_000), Some(1.0));
+    }
+
+    #[test]
+    fn test_irate_and_idelta_match_instant_value() {
+        // Prometheus' `instantValue` looks only at the last two samples of the
+        // window. `irate` answers `(last - previous) / seconds` unless the
+        // counter reset (`last < previous`, strictly), in which case the later
+        // value itself is divided; `idelta` is the raw difference.
+        let make = |values: &[(i64, f64)]| -> Vec<SamplePoint> {
+            values
+                .iter()
+                .map(|&(timestamp, value)| SamplePoint { timestamp, value })
+                .collect()
+        };
+        let irate = |values: &[(i64, f64)]| {
+            apply_range_func(RangeFunc::Irate, &make(values), 60_000, None, None)
+        };
+        let idelta = |values: &[(i64, f64)]| {
+            apply_range_func(RangeFunc::Idelta, &make(values), 60_000, None, None)
+        };
+        // Monotonic: (10 - 4) over the last 20 s.
+        assert_eq!(irate(&[(0, 1.0), (20_000, 4.0), (40_000, 10.0)]), Some(0.3));
+        assert_eq!(idelta(&[(0, 1.0), (40_000, 10.0)]), Some(9.0));
+        // Counter reset: the drop is read as "started over", so the answer is
+        // the later value divided by the interval, not a negative rate.
+        assert_eq!(irate(&[(0, 10.0), (20_000, 3.0)]), Some(0.15));
+        // Fewer than two samples: nothing.
+        assert_eq!(irate(&[(0, 5.0)]), None);
+        // NaN on either side: Prometheus' `last < previous` is false for NaN,
+        // so it takes the subtraction branch and the rate is NaN. Testing
+        // `last >= previous` instead would wrongly report a reset.
+        assert!(irate(&[(0, f64::NAN), (20_000, 5.0)]).unwrap().is_nan());
+        assert!(irate(&[(0, 5.0), (20_000, f64::NAN)]).unwrap().is_nan());
+        // Equal timestamps divide by zero, so the series is dropped.
+        assert_eq!(irate(&[(20_000, 1.0), (20_000, 5.0)]), None);
     }
 
     /// `min_over_time` / `max_over_time` seed with the first sample and also
